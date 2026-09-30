@@ -5,9 +5,11 @@ import {
   entryAt,
   keepsKeyword,
   MAX_SUGGESTION_QUERIES,
+  MAX_WAVES,
   PLAN_LOCALES,
   planSize,
   suggestPrefixes,
+  WAVE_QUERIES_PER_WAVE,
 } from "@/lib/playstore/queryPlan";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import { createInitialCursor } from "@/lib/playstore/crawler";
@@ -105,6 +107,33 @@ describe("storefront sweep plan", () => {
     expect(keepsKeyword(KEYWORD, "crypto wallet beta")).toBe(true);
     expect(keepsKeyword(KEYWORD, "bitcoin price tracker")).toBe(false);
   });
+
+  it("appends each wave without moving earlier plan entries", () => {
+    const suggestions = ["crypto wallet app", "old crypto wallet"];
+    const wave0 = buildPlanQueries(KEYWORD, suggestions);
+    const wave1 = buildPlanQueries(KEYWORD, suggestions, 1);
+    const wave2 = buildPlanQueries(KEYWORD, suggestions, 2);
+
+    expect(wave1.length).toBe(wave0.length + WAVE_QUERIES_PER_WAVE);
+    expect(wave2.length).toBe(wave1.length + WAVE_QUERIES_PER_WAVE);
+    expect(wave1.slice(0, wave0.length)).toEqual(wave0);
+    expect(wave2.slice(0, wave1.length)).toEqual(wave1);
+
+    // A planIndex minted in wave 0 must still resolve to the same storefront
+    // request after later waves are appended — that is what keeps resumes safe.
+    for (let index = 0; index < planSize(wave0); index += 1) {
+      expect(entryAt(wave2, index)).toEqual(entryAt(wave0, index));
+    }
+    expect(entryAt(wave2, planSize(wave2) - 1)).not.toBeNull();
+    expect(entryAt(wave2, planSize(wave2))).toBeNull();
+  });
+
+  it("stops growing waves at the wave cap", () => {
+    const capped = buildPlanQueries(KEYWORD, [], MAX_WAVES);
+    const beyond = buildPlanQueries(KEYWORD, [], MAX_WAVES + 5);
+    expect(beyond.length).toBe(capped.length);
+    expect(beyond.length).toBeGreaterThan(buildPlanQueries(KEYWORD).length);
+  });
 });
 
 describe("resume cursor", () => {
@@ -131,6 +160,30 @@ describe("resume cursor", () => {
     expect(sanitizeCursor({ ...cursor, planIndex: total }, KEYWORD)).not.toBeNull();
     expect(sanitizeCursor({ ...cursor, planIndex: total + 1 }, KEYWORD)).toBeNull();
     expect(sanitizeCursor({ ...cursor, planIndex: -1 }, KEYWORD)).toBeNull();
+  });
+
+  it("rebuilds the plan for the cursor's wave and rejects impossible waves", () => {
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "search";
+    cursor.wave = 2;
+    cursor.planIndex = planSize(buildPlanQueries(KEYWORD, [], 2));
+
+    const restored = sanitizeCursor(JSON.parse(JSON.stringify(cursor)), KEYWORD);
+    expect(restored?.wave).toBe(2);
+    expect(restored?.planIndex).toBe(cursor.planIndex);
+
+    expect(sanitizeCursor({ ...cursor, wave: MAX_WAVES + 1 }, KEYWORD)).toBeNull();
+    expect(sanitizeCursor({ ...cursor, wave: -1 }, KEYWORD)).toBeNull();
+    expect(sanitizeCursor({ ...cursor, wave: 1.5 }, KEYWORD)).toBeNull();
+  });
+
+  it("defaults wave fields for cursors saved before waves existed", () => {
+    const legacy = createInitialCursor(KEYWORD) as unknown as Record<string, unknown>;
+    delete legacy.wave;
+    delete legacy.waveDiscovered;
+
+    const restored = sanitizeCursor(legacy, KEYWORD);
+    expect(restored).toMatchObject({ wave: 0, waveDiscovered: 0 });
   });
 
   it("trims oversized suggestion payloads instead of trusting them", () => {

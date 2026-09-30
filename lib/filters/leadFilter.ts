@@ -47,7 +47,9 @@ export function toLead(app: StoreApp, filters: LeadFilters): Lead {
   return {
     ...app,
     rating: roundRating(app.rating),
-    playStoreUrl: buildPlayStoreUrl(app.packageName),
+    // `gl` pins the link to the country whose ratings the run filtered on, so
+    // opening the lead shows the same numbers the table printed.
+    playStoreUrl: buildPlayStoreUrl(app.packageName, "en", filters.country),
     keyword: filters.keyword,
     relevanceScore: relevance.score,
     relevanceTerms: relevance.matchedTerms,
@@ -155,13 +157,17 @@ export function filterLeads(leads: Lead[], filters: LeadFilters): Lead[] {
  *
  * The detail page reports the precise rating behind the rounded search-card
  * value, so a merge can otherwise push a lead over the rating ceiling (4.03
- * behind a printed "4.0"). Only the ceilings are re-checked here: whether the
- * listing still carries the keyword is decided on the merged record, which
+ * behind a printed "4.0"). A missing rating no longer qualifies: the card value
+ * came from whichever storefront first surfaced the app, and without a rating
+ * from the run's own country there is nothing to prove the row matches what the
+ * user sees on the Play Store. Only the ceilings are re-checked here: whether
+ * the listing still carries the keyword is decided on the merged record, which
  * combines the search snippet that qualified the lead with the detail page's
  * own description — {@link leadPassesFilters} does that on the client.
  */
 export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean {
-  if (app.rating !== null && roundRating(app.rating) > filters.maxRating) return false;
+  if (app.rating === null) return false;
+  if (roundRating(app.rating) > filters.maxRating) return false;
   if (app.installs !== null && app.installs > filters.maxInstalls) return false;
   return true;
 }

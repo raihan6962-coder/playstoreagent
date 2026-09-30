@@ -30,6 +30,14 @@ export interface LeadFilters {
   maxRating: number;
   maxInstalls: number;
   limit: number;
+  /**
+   * Two-letter Play Store country whose ratings, links and detail pages the
+   * run must use. The same app carries different ratings per storefront
+   * (measured: 2.1 US / 2.2 BD / 4.5 KR for one app), so every number the
+   * table shows has to come from this one country to match what the user
+   * sees on play.google.com.
+   */
+  country: string;
 }
 
 export type SessionPhase = "suggest" | "search" | "expand" | "enrich" | "done";
@@ -77,6 +85,8 @@ export interface GenerationStats extends SessionCounters {
   queriesTotal: number;
   currentQuery: string | null;
   phase: SessionPhase;
+  /** Extra query waves appended so far (0 = the base plan). */
+  wave: number;
   elapsedMs: number;
 }
 
@@ -93,6 +103,15 @@ export interface SessionCursor {
   suggestIndex: number;
   /** Index into the query × storefront cross product (see queryPlan.ts). */
   planIndex: number;
+  /**
+   * How many extra query waves have been appended to the plan. The session
+   * keeps generating until the lead limit is hit: when the base plan runs
+   * out, the next wave appends fresh long-tail queries (appended, never
+   * reordered, so `planIndex` stays valid across resumes).
+   */
+  wave: number;
+  /** `discovered` count when the current wave started (stagnation guard). */
+  waveDiscovered: number;
   phase: SessionPhase;
   /** Package names already evaluated (dedupe + resume bookkeeping). */
   seen: string[];
@@ -136,5 +155,7 @@ export interface GenerateRequest {
   maxRating: number;
   maxInstalls: number;
   limit: number;
+  /** Two-letter Play Store country; defaults to the requester's region. */
+  country?: string;
   cursor?: SessionCursor | null;
 }

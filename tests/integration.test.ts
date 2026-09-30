@@ -70,7 +70,7 @@ liveDescribe("live Play Store", () => {
       const events: GenerationEvent[] = [];
 
       const result = await runGenerationStep({
-        filters: { keyword: "budget tracker", maxRating, maxInstalls, limit },
+        filters: { keyword: "budget tracker", maxRating, maxInstalls, limit, country: "US" },
         cursor: createInitialCursor("budget tracker"),
         budgetMs: 75_000,
         emit: (event) => {

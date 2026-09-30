@@ -4,13 +4,14 @@ import {
   runGenerationStep,
 } from "@/lib/playstore/crawler";
 import { buildPlanQueries, keepsKeyword, planSize } from "@/lib/playstore/queryPlan";
+import { PlayHttpError } from "@/lib/playstore/client";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
 
 const KEYWORD = "budget tracker";
 
 function filters(overrides: Partial<LeadFilters> = {}): LeadFilters {
-  return { keyword: KEYWORD, maxRating: 3, maxInstalls: 100_000, limit: 2, ...overrides };
+  return { keyword: KEYWORD, maxRating: 3, maxInstalls: 100_000, limit: 2, country: "US", ...overrides };
 }
 
 const GOOD = {
@@ -336,5 +337,95 @@ describe("runGenerationStep", () => {
     const messages = harness.messages();
     expect(messages.some((message) => message.includes("Searching Play Store"))).toBe(true);
     expect(messages.some((message) => message.includes("Fetching details"))).toBe(true);
+  });
+
+  it("keeps generating through fresh query waves when the base plan runs dry", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
+    const cursor = createInitialCursor(KEYWORD);
+    // A run that already walked the whole base plan but is far below the limit.
+    cursor.phase = "search";
+    cursor.planIndex = planSize(buildPlanQueries(KEYWORD));
+    cursor.counters.discovered = 5;
+    cursor.counters.evaluated = 5;
+    cursor.seen = [
+      "com.example.budget",
+      "com.example.budget.mini",
+      "com.example.famous",
+      "com.example.huge",
+      "com.example.zombie",
+    ];
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 100 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(cursor.wave).toBe(1);
+    expect(harness.messages().some((message) => message.includes("extending the query plan"))).toBe(true);
+    expect(result.reason).toBe("plan-exhausted");
+    expect(result.message).toContain("2 query waves");
+    expect(result.message).toContain("Only 0 matching apps were found");
+  });
+
+  it("stops honestly when an extra wave finds nothing new", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "search";
+    cursor.planIndex = planSize(buildPlanQueries(KEYWORD));
+    cursor.counters.discovered = 5;
+    cursor.counters.evaluated = 5;
+    cursor.waveDiscovered = 5; // the last wave already ran with this many discoveries
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 100 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(cursor.wave).toBe(0);
+    expect(harness.messages().some((message) => message.includes("extending the query plan"))).toBe(false);
+    expect(result.reason).toBe("plan-exhausted");
+    expect(result.message).not.toContain("query waves");
+  });
+
+  it("removes a lead whose detail page now returns 404", async () => {
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName) => {
+        if (packageName === "com.example.budget") {
+          throw new PlayHttpError("Play Store responded with 404.", 404, false);
+        }
+        return detailRoute(packageName);
+      },
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 10 }),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    const removes = harness.events.filter(
+      (event): event is Extract<GenerationEvent, { type: "lead-remove" }> =>
+        event.type === "lead-remove",
+    );
+    expect(removes.map((event) => event.packageName)).toEqual(["com.example.budget"]);
+    expect(
+      harness.events.some(
+        (event) => event.type === "warning" && event.message.includes("no longer lists"),
+      ),
+    ).toBe(true);
+    expect(result.stats.matched).toBe(1);
+    expect(result.reason).toBe("plan-exhausted");
   });
 });

@@ -1,6 +1,7 @@
 import {
   buildPlanQueries,
   MAX_SUGGESTION_QUERIES,
+  MAX_WAVES,
   planSize,
   suggestPrefixes,
 } from "@/lib/playstore/queryPlan";
@@ -13,7 +14,7 @@ const MAX_SEEN = 40_000;
 const MAX_EMITTED = 1_000;
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
-const MAX_ENRICH_QUEUE = 200;
+const MAX_ENRICH_QUEUE = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -88,7 +89,19 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
   const suggestions = asStringArray(input.suggestions, MAX_SUGGESTION_QUERIES, MAX_SUGGESTION_LENGTH);
   if (!suggestions) return null;
 
-  const queries = buildPlanQueries(keyword, suggestions);
+  // Waves appended so far. Optional so cursors minted before this field
+  // existed still resume (they resume at wave 0 = the base plan).
+  const wave = input.wave === undefined || input.wave === null
+    ? 0
+    : asIndex(input.wave, MAX_WAVES);
+  if (wave === null) return null;
+  const waveDiscoveredRaw = input.waveDiscovered;
+  const waveDiscovered = waveDiscoveredRaw === undefined || waveDiscoveredRaw === null
+    ? 0
+    : asIndex(waveDiscoveredRaw, Number.MAX_SAFE_INTEGER);
+  if (waveDiscovered === null) return null;
+
+  const queries = buildPlanQueries(keyword, suggestions, wave);
   const total = planSize(queries);
 
   const suggestIndex = asIndex(input.suggestIndex, suggestPrefixes(keyword).length);
@@ -109,6 +122,8 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     suggestions,
     suggestIndex,
     planIndex,
+    wave,
+    waveDiscovered,
     phase: input.phase as SessionCursor["phase"],
     seen,
     emitted,

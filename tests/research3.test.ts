@@ -9,8 +9,8 @@ const live = process.env.PLAY_LIVE === "1";
 
 const KEYWORD = "budget tracker";
 const PROFILES: LeadFilters[] = [
-  { keyword: KEYWORD, maxRating: 4, maxInstalls: 500_000, limit: 1_000 },
-  { keyword: KEYWORD, maxRating: 4.5, maxInstalls: 5_000_000, limit: 1_000 },
+  { keyword: KEYWORD, maxRating: 4, maxInstalls: 500_000, limit: 1_000, country: "US" },
+  { keyword: KEYWORD, maxRating: 4.5, maxInstalls: 5_000_000, limit: 1_000, country: "US" },
 ];
 
 describe.skipIf(!live)("research 3", () => {

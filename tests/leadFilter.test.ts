@@ -7,6 +7,7 @@ const filters: LeadFilters = {
   maxRating: 3,
   maxInstalls: 100_000,
   limit: 10,
+  country: "US",
 };
 
 function app(overrides: Partial<StoreApp> = {}): StoreApp {
@@ -88,5 +89,11 @@ describe("toLead", () => {
     expect(toLead(app({ installsRaw: "10000", installs: 10_000 }), filters).installCertainty).toBe(
       "exact",
     );
+  });
+
+  it("links to the storefront the run filtered on", () => {
+    const lead = toLead(app(), { ...filters, country: "BD" });
+    expect(lead.playStoreUrl).toContain("gl=BD");
+    expect(toLead(app(), filters).playStoreUrl).toContain("gl=US");
   });
 });

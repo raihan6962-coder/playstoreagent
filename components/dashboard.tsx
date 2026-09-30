@@ -6,6 +6,7 @@ import { csvFilename, leadsToCsv } from "@/lib/csv/export";
 import { leadPassesFilters } from "@/lib/filters/leadFilter";
 import {
   parseInstallInput,
+  validateCountry,
   validateKeyword,
   validateLimit,
   validateMaxRating,
@@ -22,16 +23,22 @@ import { LeadTable } from "./lead-table";
 import { ProgressPanel } from "./progress-panel";
 import { SearchForm, type SearchValues } from "./search-form";
 
-/** Each step streams for up to ~4 minutes server-side; this bounds a full run. */
-const MAX_AUTO_RESUMES = 24;
-const MAX_AUTO_MS = 45 * 60_000;
+/**
+ * Each step streams for up to ~4 minutes server-side; these bound a full run.
+ * The server keeps appending query waves until the lead limit or the supply
+ * runs out, so the client budget has to comfortably cover the whole run —
+ * 48 passes × ~4 min ≈ 3 hours of continuous generation.
+ */
+const MAX_AUTO_RESUMES = 48;
+const MAX_AUTO_MS = 180 * 60_000;
 
 function sameFilters(a: LeadFilters, b: LeadFilters): boolean {
   return (
     a.keyword === b.keyword &&
     a.maxRating === b.maxRating &&
     a.maxInstalls === b.maxInstalls &&
-    a.limit === b.limit
+    a.limit === b.limit &&
+    a.country === b.country
   );
 }
 
@@ -40,6 +47,7 @@ export function Dashboard() {
     keyword: "",
     maxRating: "3",
     maxInstalls: "100000",
+    country: "BD",
     limit: "1000",
   });
   const [errors, setErrors] = useState<Partial<Record<keyof SearchValues, string>>>({});
@@ -61,13 +69,15 @@ export function Dashboard() {
     const keyword = validateKeyword(values.keyword);
     const maxRating = validateMaxRating(values.maxRating);
     const maxInstalls = parseInstallInput(values.maxInstalls);
+    const country = validateCountry(values.country);
     const limit = validateLimit(values.limit);
 
-    if (!keyword.ok || !maxRating.ok || !maxInstalls.ok || !limit.ok) {
+    if (!keyword.ok || !maxRating.ok || !maxInstalls.ok || !country.ok || !limit.ok) {
       const next: Partial<Record<keyof SearchValues, string>> = {};
       if (!keyword.ok) next.keyword = keyword.error;
       if (!maxRating.ok) next.maxRating = maxRating.error;
       if (!maxInstalls.ok) next.maxInstalls = maxInstalls.error;
+      if (!country.ok) next.country = country.error;
       if (!limit.ok) next.limit = limit.error;
       setErrors(next);
       return null;
@@ -78,6 +88,7 @@ export function Dashboard() {
       keyword: keyword.value,
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
+      country: country.value,
       limit: limit.value,
     };
   }

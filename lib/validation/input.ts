@@ -8,6 +8,30 @@ export const MAX_LEADS = 1_000;
 export const MIN_RATING = 0.5;
 export const MAX_RATING = 5;
 export const MAX_INSTALLS = 1_000_000_000;
+/** Ratings/links default to the storefront most of this app's users open. */
+export const DEFAULT_COUNTRY = "BD";
+
+/**
+ * Play Store country code (ISO 3166-1 alpha-2). Ratings differ per storefront
+ * for the same app, so this pins every displayed number — and the link the
+ * table opens — to one country.
+ */
+export function validateCountry(input: unknown): ValidationResult<string> {
+  if (input === undefined || input === null || input === "") {
+    return { ok: true, value: DEFAULT_COUNTRY };
+  }
+  if (typeof input !== "string") {
+    return { ok: false, error: "Country must be a two-letter Play Store code." };
+  }
+  const code = input.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) {
+    return {
+      ok: false,
+      error: "Country must be a two-letter code like BD, US or GB.",
+    };
+  }
+  return { ok: true, value: code };
+}
 
 export function validateKeyword(input: unknown): ValidationResult<string> {
   if (typeof input !== "string") {

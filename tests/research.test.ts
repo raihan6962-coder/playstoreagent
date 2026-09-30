@@ -14,6 +14,7 @@ const FILTERS = {
   maxRating: 3,
   maxInstalls: 100_000,
   limit: 1000,
+  country: "US",
 };
 const SUFFIXES = "abcdefghijklmnopqrstuvwxyz".split("");
 
@@ -210,7 +211,7 @@ describe.skipIf(!live)("research yield matrix", () => {
     console.log(`[R5] done requests=${requests} unique=${apps.length} ms=${Date.now() - started}`);
 
     for (const profile of profiles) {
-      const filters = { keyword: KEYWORD, ...profile, limit: 1000 };
+      const filters = { keyword: KEYWORD, ...profile, limit: 1000, country: "US" };
       const seen = new Set<string>();
       const reasonCounts = new Map<string, number>();
       let matches = 0;

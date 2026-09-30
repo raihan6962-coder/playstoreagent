@@ -48,7 +48,10 @@ export function ProgressPanel({
   const target = stats?.target ?? 0;
   const matched = stats?.matched ?? 0;
   const percent = target > 0 ? Math.min(100, Math.round((matched / target) * 100)) : 0;
-  const queries = stats ? `${stats.queriesRun}/${stats.queriesTotal}` : "0/0";
+  const queries = stats
+    ? `${stats.queriesRun}/${stats.queriesTotal}` +
+      (stats.wave > 0 ? ` · wave ${stats.wave + 1}` : "")
+    : "0/0";
   const showPanel = running || Boolean(done) || Boolean(error) || warnings.length > 0;
   if (!showPanel) return null;
 

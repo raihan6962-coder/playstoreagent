@@ -58,6 +58,7 @@ describe("strict qualification rules", () => {
     maxRating: 3,
     maxInstalls: 100_000,
     limit: 1_000,
+    country: "US",
     ...overrides,
   });
 
@@ -147,6 +148,7 @@ describe("guards for leads that are already on screen", () => {
     maxRating: 3.5,
     maxInstalls: 100_000,
     limit: 1_000,
+    country: "US",
   };
 
   function qualifiedLead(overrides: Partial<Lead> = {}): Lead {
@@ -234,8 +236,12 @@ describe("guards for leads that are already on screen", () => {
     ).toBe(true);
   });
 
-  it("detailAppQualifies keeps the search values when the detail page lacks them", () => {
-    const partial = makeApp({
+  it("detailAppQualifies drops a row whose detail page has no rating to compare", () => {
+    // The search card's rating came from whichever storefront first surfaced
+    // the app; without a rating from the run's own country there is nothing to
+    // prove the row matches what the user sees on Play, so the lead is removed
+    // instead of keeping a number we cannot stand behind.
+    const noRating = makeApp({
       title: "Crypto Wallet",
       rating: null,
       installs: null,
@@ -243,7 +249,19 @@ describe("guards for leads that are already on screen", () => {
       summary: "Store your cryptocurrency wallet.",
       description: null,
     });
-    expect(detailAppQualifies(partial, filters)).toBe(true);
+    expect(detailAppQualifies(noRating, filters)).toBe(false);
+  });
+
+  it("detailAppQualifies keeps search installs when the detail page lacks them", () => {
+    const noInstalls = makeApp({
+      title: "Crypto Wallet",
+      rating: 2.5,
+      installs: null,
+      installsRaw: null,
+      summary: "Store your cryptocurrency wallet.",
+      description: null,
+    });
+    expect(detailAppQualifies(noInstalls, filters)).toBe(true);
   });
 
   it("detailAppQualifies only judges the numeric ceilings", () => {

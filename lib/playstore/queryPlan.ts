@@ -5,6 +5,15 @@ import type { PriceFilter, QueryKind, QueryPlanEntry } from "@/types/lead";
 export const MAX_PLAN_SIZE = 48;
 /** Cap on Play-sourced suggestion queries carried in the cursor. */
 export const MAX_SUGGESTION_QUERIES = 400;
+/**
+ * Extra query waves appended when the base plan runs out of targets. Each wave
+ * adds this many long-tail queries (× the core storefronts in requests); the
+ * session stops early if a wave finds nothing new, otherwise it keeps going up
+ * to {@link MAX_WAVES} so the run continues until the lead limit or real
+ * supply exhaustion.
+ */
+export const WAVE_QUERIES_PER_WAVE = 60;
+export const MAX_WAVES = 8;
 
 const VARIANT_SUFFIXES = [
   "app",
@@ -228,10 +237,16 @@ export function keepsKeyword(keyword: string, suggestion: string): boolean {
 
 /**
  * Ordered query list: deterministic base queries first, then Play suggestions
- * appended in discovery order. Appending is what makes `planIndex` stable
- * across resumes — earlier entries never move.
+ * appended in discovery order, then (when `wave > 0`) the deterministic
+ * long-tail wave batch. Appending is what makes `planIndex` stable across
+ * resumes and across waves — earlier entries never move, so wave K's queries
+ * are always the first K × {@link WAVE_QUERIES_PER_WAVE} candidates.
  */
-export function buildPlanQueries(keyword: string, suggestions: string[] = []): PlanQuery[] {
+export function buildPlanQueries(
+  keyword: string,
+  suggestions: string[] = [],
+  wave = 0,
+): PlanQuery[] {
   const base = baseQuerySpecs(keyword);
   const out = [...base];
   const seen = new Set(out.map((item) => item.query.toLowerCase()));
@@ -245,7 +260,63 @@ export function buildPlanQueries(keyword: string, suggestions: string[] = []): P
     seen.add(key);
     out.push({ query: suggestion.trim(), kind: "suggestion" });
   }
+
+  const targetWave = Math.min(wave, MAX_WAVES);
+  if (targetWave > 0) {
+    const limit = targetWave * WAVE_QUERIES_PER_WAVE;
+    let added = 0;
+    for (const spec of waveCandidates(keyword, suggestions)) {
+      if (added >= limit) break;
+      const key = spec.query.trim().toLowerCase();
+      if (key.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      out.push(spec);
+      added += 1;
+    }
+  }
+
   return out;
+}
+
+/**
+ * Deterministic long-tail candidates for the wave batches. Distinct from the
+ * base plan (suggestion × modifier, keyword × two modifiers, quoted
+ * suggestions…) and ordered so every wave covers a fresh slice of the space.
+ */
+function waveCandidates(keyword: string, suggestions: string[]): PlanQuery[] {
+  const tokens = tokenizeKeyword(keyword).significant;
+  const specs: PlanQuery[] = [];
+  const seen = new Set<string>();
+  const push = (query: string, kind: QueryKind): void => {
+    const trimmed = query.trim();
+    const key = trimmed.toLowerCase();
+    if (key.length === 0 || seen.has(key)) return;
+    seen.add(key);
+    specs.push({ query: trimmed, kind });
+  };
+
+  suggestions.forEach((label, index) => {
+    push(`${label} ${TAIL_MODIFIERS[index % TAIL_MODIFIERS.length]}`, "modifier");
+  });
+  for (const label of suggestions) {
+    for (const suffix of ["apk", "premium", "pro", "old version", "review"]) {
+      push(`${label} ${suffix}`, "modifier");
+    }
+  }
+  for (const first of TAIL_MODIFIERS) {
+    for (const second of TAIL_MODIFIERS) {
+      push(`${keyword} ${first} ${second}`, "modifier");
+    }
+  }
+  for (const token of tokens.slice(0, 4)) {
+    for (const label of suggestions) {
+      push(`${token} ${label}`, "variant");
+    }
+  }
+  for (const label of suggestions) {
+    push(`"${label}"`, "suggestion");
+  }
+  return specs;
 }
 
 /** Total number of search requests the plan can issue. */

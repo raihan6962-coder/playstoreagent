@@ -11,18 +11,27 @@ to the browser in real time and exports them as CSV.
 ## What it does
 
 1. Enter a keyword, a maximum rating (e.g. `3.0`), a maximum install count
-   (e.g. `100K`) and how many leads you want (1–1,000).
+   (e.g. `100K`), your Play Store country (two-letter code, default `BD`) and
+   how many leads you want (1–1,000).
 2. The server searches the Play Store, starting with your keyword and then a
    plan of related queries (suggestions, variants, long-tail modifiers,
-   40+ storefront locales, free/paid filters).
+   40+ storefront locales, free/paid filters). When the base plan runs out
+   before your lead limit, the run appends fresh query waves and keeps going —
+   it only stops at your limit or when another wave finds nothing new.
 3. Every app card is scored for keyword relevance and qualified against your
    rating and install ceilings. Matches stream to the table immediately.
-4. Confirmed leads are enriched from their detail page — the ratings count, the
-   precise rating and the install bucket are re-checked there, and a lead that
-   would break a ceiling is removed again (`lead-remove`) — and relevant
-   results seed a "similar apps" expansion pass so the search can reach apps
-   the keyword plan alone would miss.
-5. Generation stops as soon as the requested number of leads is found.
+4. Confirmed leads are enriched from their detail page — fetched **from your
+   selected country's storefront**, so the rating in the table is the number
+   your Play Store shows (the same app can rate 2.2 in one country and 4.5 in
+   another). The ratings count and install bucket are re-checked there too: a
+   lead that would break a ceiling, has no rating to compare, or whose page
+   now 404s is removed again (`lead-remove`) — and relevant results seed a
+   "similar apps" expansion pass so the search can reach apps the keyword plan
+   alone would miss.
+5. Generation stops as soon as the requested number of leads is found, or —
+   if the strict ceilings leave fewer apps than requested — after the query
+   waves are exhausted, reported honestly as `plan-exhausted` with the count
+   that was actually found.
 6. Export the results to CSV (RFC 4180, Excel-friendly BOM).
 
 ## Running locally
@@ -84,10 +93,18 @@ settings instead of keeping rows that no longer match.
 The Play Store has no working pagination for search results, so depth comes from
 running a plan of queries. Each invocation works under a time budget
 (`GENERATION_BUDGET_MS`, default 240 s) and, when the budget runs out, returns
-the `done` event with a **cursor** (query plan position, dedupe set, expansion
-and enrichment queues, counters). The client replays that cursor on the next
-request and the session continues exactly where it stopped. Cursors are fully
-validated server-side; anything malformed is discarded and the session restarts.
+the `done` event with a **cursor** (query plan position and wave, dedupe set,
+expansion and enrichment queues, counters). The client replays that cursor on
+the next request and the session continues exactly where it stopped. Cursors
+are fully validated server-side; anything malformed is discarded and the
+session restarts.
+
+If the whole base plan runs out before the lead limit, the crawler appends a
+**query wave** (a fresh deterministic batch of long-tail queries — appended
+only, so the plan position stays valid across resumes) and continues. A wave
+that discovers nothing new means the reachable supply under the given ceilings
+is genuinely exhausted; only then does the run end, with an honest
+`plan-exhausted` summary naming how many waves were searched.
 
 ### Qualification rules
 
@@ -96,7 +113,7 @@ An app becomes a lead only when **all** of these hold:
 | Rule | Behaviour |
 | --- | --- |
 | Keyword relevance | **every** significant word of the keyword must appear in the listing (title / developer / category / description); weighted score is kept for ranking |
-| Rating | present and `rating <= maxRating`, compared and stored at the one-decimal precision Play prints |
+| Rating | present and `rating <= maxRating`, compared and stored at the one-decimal precision Play prints, always read from the run's selected country storefront |
 | Installs | parseable and `installs <= maxInstalls` |
 | Duplicate | seen earlier in the session |
 
@@ -107,8 +124,11 @@ bounds and flagged with `installCertainty: "bucket"`.
 
 Detail pages are authoritative: after enrichment a lead is re-checked against
 the ceilings (and re-matched against the keyword on the combined search +
-detail text). A lead that no longer qualifies is removed from the table rather
+detail text). A lead that no longer qualifies — or whose detail page cannot
+confirm a rating from the run's country — is removed from the table rather
 than left on screen with numbers that break the rules it was collected with.
+Every row's link carries the same country (`&gl=…`), so opening it shows the
+same numbers the table printed.
 
 ## Configuration
 

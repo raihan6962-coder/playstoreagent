@@ -13,6 +13,7 @@ import type {
 } from "@/types/lead";
 import {
   PlayClient,
+  PlayHttpError,
   PlayParseError,
   PlayRateLimitError,
 } from "./client";
@@ -22,6 +23,7 @@ import {
   entryAt,
   keepsKeyword,
   MAX_SUGGESTION_QUERIES,
+  MAX_WAVES,
   planSize,
   suggestPrefixes,
 } from "./queryPlan";
@@ -50,7 +52,13 @@ const SUGGESTS_PER_PREFIX = 10;
 const MAX_EXPAND_REQUESTS = 500;
 /** Stop queueing expansion seeds beyond this size. */
 const MAX_SIMILAR_QUEUE = 2_000;
-const MAX_ENRICH_QUEUE = 200;
+/**
+ * Leads waiting for their canonical detail page. Every emitted lead is queued;
+ * the search window pulls these first (see `pullSearchTask`) so the rating the
+ * table shows is refreshed from the run's own country within seconds instead
+ * of waiting for a phase that may never run within the time budget.
+ */
+const MAX_ENRICH_QUEUE = 1_000;
 /** Enriched detail pages per step before the step reports back to the caller. */
 const MAX_ENRICH_PER_STEP = 200;
 /**
@@ -171,6 +179,8 @@ export function createInitialCursor(keyword: string): SessionCursor {
     suggestions: [],
     suggestIndex: 0,
     planIndex: 0,
+    wave: 0,
+    waveDiscovered: 0,
     phase: "suggest",
     seen: [],
     emitted: [],
@@ -212,6 +222,7 @@ function buildStats(
     queriesTotal,
     currentQuery,
     phase: cursor.phase,
+    wave: cursor.wave,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -246,8 +257,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let suggestFailed = false;
   let currentQuery: string | null = null;
 
-  const queries = buildPlanQueries(cursor.keyword, suggestions);
-  const totalPlan = planSize(queries);
+  // `let` because the search loop appends a new query wave when the plan runs
+  // out before the lead limit is reached (see below).
+  let queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave);
+  let totalPlan = planSize(queries);
 
   const stats = () =>
     buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
@@ -359,17 +372,37 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   /**
+   * Removes a lead the store can no longer back: a detail page that stopped
+   * qualifying (ceiling breach, or no rating from this run's country) or an
+   * app whose page now 404s. Carries the counters with it so the reported
+   * total always matches what the table and the CSV show.
+   */
+  function dropLead(pkg: string): boolean {
+    if (!emitted.has(pkg)) return false;
+    emitted.delete(pkg);
+    if (queuedEnrich.delete(pkg)) {
+      cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
+    }
+    if (cursor.counters.matched > 0) cursor.counters.matched -= 1;
+    emit({ type: "lead-remove", packageName: pkg });
+    return true;
+  }
+
+  /**
    * Applies an authoritative detail page to a lead the user may already be
    * looking at.
    *
    * The detail page reports the precise rating behind the rounded search-card
    * value (3.54 behind a printed "3.5"), so a merge can push a lead over the
    * rating ceiling the user set. When the detail data no longer qualifies the
-   * lead it is removed again — with its counters, so the reported total always
-   * matches what the table and the CSV show.
+   * lead — or cannot confirm a rating from this run's country at all — it is
+   * removed again.
    */
   function applyDetail(pkg: string, app: StoreApp | null): void {
-    if (!app || app.packageName !== pkg) return;
+    if (!app || app.packageName !== pkg) {
+      dropLead(pkg);
+      return;
+    }
 
     const qualifies = detailAppQualifies(app, filters);
     if (qualifies) {
@@ -379,13 +412,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       return;
     }
 
-    if (!emitted.has(pkg)) return;
-    emitted.delete(pkg);
-    if (queuedEnrich.delete(pkg)) {
-      cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
-    }
-    if (cursor.counters.matched > 0) cursor.counters.matched -= 1;
-    emit({ type: "lead-remove", packageName: pkg });
+    dropLead(pkg);
   }
 
   async function runSearchTask(entry: QueryPlanEntry): Promise<TaskOutcome> {
@@ -438,7 +465,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     });
 
     try {
-      const detail = await fetchAppDetail(client, seed.p);
+      const detail = await fetchAppDetail(client, seed.p, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       parseFailures = 0;
       transportFailures = 0;
@@ -456,6 +483,17 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (error instanceof PlayParseError) {
         parseFailures += 1;
         return "parse-failure";
+      }
+      // Definitive answer, not a transport failure: the app is gone. Drop the
+      // row instead of keeping a lead whose link no longer opens.
+      if (error instanceof PlayHttpError && error.status === 404) {
+        if (dropLead(seed.p)) {
+          emit({
+            type: "warning",
+            message: `Play Store no longer lists “${seed.p}” — removed it from the leads.`,
+          });
+        }
+        return "ok";
       }
       transportFailures += 1;
       emit({
@@ -476,7 +514,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     });
 
     try {
-      const detail = await fetchAppDetail(client, pkg);
+      const detail = await fetchAppDetail(client, pkg, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       enrichRequests += 1;
       parseFailures = 0;
@@ -500,6 +538,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (error instanceof PlayParseError) {
         parseFailures += 1;
         return "parse-failure";
+      }
+      if (error instanceof PlayHttpError && error.status === 404) {
+        if (dropLead(pkg)) {
+          emit({
+            type: "warning",
+            message: `Play Store no longer lists “${pkg}” — removed it from the leads.`,
+          });
+        }
+        return "ok";
       }
 
       transportFailures += 1;
@@ -597,7 +644,22 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
 
     let expandCredit = 0;
+    const enrichFlight = new Set<string>();
     const pullSearchTask = (): Promise<TaskOutcome> | null => {
+      // Canonical detail pages for leads already on screen come first: the
+      // table must show this run's country rating, and the search phase is the
+      // only phase guaranteed to execute before the step's budget runs out.
+      if (enrichRequests + enrichFlight.size < MAX_ENRICH_PER_STEP) {
+        for (const pkg of cursor.enrichQueue) {
+          if (enrichFlight.has(pkg)) continue;
+          enrichFlight.add(pkg);
+          return runEnrichTask(pkg).then((outcome) => {
+            enrichFlight.delete(pkg);
+            return outcome;
+          });
+        }
+      }
+
       const seedsAvailable =
         cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
       if (seedsAvailable) {
@@ -646,6 +708,23 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       break;
     }
     if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex) === null) {
+      // The plan ran out before the lead limit: keep generating. Each wave
+      // appends a fresh deterministic batch of long-tail queries (appended
+      // only, so `planIndex` stays valid). A wave that finds no new app means
+      // the reachable supply under these ceilings is genuinely exhausted —
+      // then (and only then) the search phase ends honestly.
+      if (cursor.wave < MAX_WAVES && cursor.counters.discovered > cursor.waveDiscovered) {
+        cursor.wave += 1;
+        cursor.waveDiscovered = cursor.counters.discovered;
+        queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave);
+        totalPlan = planSize(queries);
+        emit({
+          type: "progress",
+          stats: stats(),
+          message: `Lead limit not reached yet — extending the query plan (wave ${cursor.wave} of ${MAX_WAVES}).`,
+        });
+        continue;
+      }
       cursor.phase = "expand";
       break;
     }
@@ -769,7 +848,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
   return finish(
     "plan-exhausted",
-    `Only ${cursor.counters.matched} matching app${cursor.counters.matched === 1 ? " was" : "s were"} found before the available results were exhausted.`,
+    `Only ${cursor.counters.matched} matching app${cursor.counters.matched === 1 ? " was" : "s were"} found before the available results were exhausted.` +
+      (cursor.wave > 0
+        ? ` Searched through ${cursor.wave + 1} query waves — no further apps under the given rating/install limits exist in the reachable results.`
+        : ""),
     false,
   );
 }

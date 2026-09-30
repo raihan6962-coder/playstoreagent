@@ -4,6 +4,7 @@ import { leadsToCsv, csvFilename, leadRow } from "@/lib/csv/export";
 import {
   MAX_LEADS,
   parseInstallInput,
+  validateCountry,
   validateKeyword,
   validateLimit,
   validateMaxRating,
@@ -51,6 +52,17 @@ describe("input validation", () => {
     expect(parseInstallInput("lots").ok).toBe(false);
     expect(validateLimit(String(MAX_LEADS + 1)).ok).toBe(false);
     expect(validateLimit(0).ok).toBe(false);
+  });
+
+  it("normalizes the Play Store country code", () => {
+    expect(validateCountry("bd")).toEqual({ ok: true, value: "BD" });
+    expect(validateCountry(" us ")).toEqual({ ok: true, value: "US" });
+    expect(validateCountry(undefined)).toEqual({ ok: true, value: "BD" });
+    expect(validateCountry("")).toEqual({ ok: true, value: "BD" });
+    expect(validateCountry("USA").ok).toBe(false);
+    expect(validateCountry("B").ok).toBe(false);
+    expect(validateCountry("12").ok).toBe(false);
+    expect(validateCountry(21).ok).toBe(false);
   });
 });
 

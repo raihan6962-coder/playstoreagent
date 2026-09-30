@@ -19,6 +19,7 @@ const FILTERS: LeadFilters = {
   maxRating: 4,
   maxInstalls: 500_000,
   limit: 1_000,
+  country: "US",
 };
 
 describe.skipIf(!live)("live scale run", () => {

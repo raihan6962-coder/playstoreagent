@@ -81,6 +81,22 @@ describe("parseDetailPage", () => {
     expect(result.app?.packageName).toBe("com.example.bare");
     expect(result.app?.ratingsCount).toBeNull();
   });
+
+  it("falls back to the visible star rating when JSON-LD has no aggregate", () => {
+    // Play serves detail pages without aggregateRating to some storefronts;
+    // the aria label is the exact number printed next to the stars, i.e. what
+    // the user sees on the store.
+    const html = `<html><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Town Wallet","author":{"@type":"Person","name":"Town Dev"}}</script>
+</head><body>
+<div aria-label="Rated 4.5 stars">4.5</div>
+<div class="WsMG1c">10,000+</div><div class="ClM7O">Downloads</div>
+</body></html>`;
+
+    const result = parseDetailPage(html, "com.example.townwallet");
+    expect(result.app?.packageName).toBe("com.example.townwallet");
+    expect(result.app?.rating).toBe(4.5);
+  });
 });
 
 describe("html helpers", () => {

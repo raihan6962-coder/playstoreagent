@@ -3,6 +3,7 @@ import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
   parseInstallInput,
+  validateCountry,
   validateKeyword,
   validateLimit,
   validateMaxRating,
@@ -69,7 +70,7 @@ type ParsedRequest =
   | { ok: true; filters: LeadFilters; cursor: SessionCursor | null }
   | { ok: false; error: string };
 
-function parseRequest(input: unknown): ParsedRequest {
+function parseRequest(input: unknown, fallbackCountry: string | null): ParsedRequest {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return { ok: false, error: "Request body must be a JSON object." };
   }
@@ -87,6 +88,11 @@ function parseRequest(input: unknown): ParsedRequest {
   const limit = validateLimit(body.limit);
   if (!limit.ok) return { ok: false, error: limit.error };
 
+  // The country decides which storefront's ratings the table shows. Prefer the
+  // form value, then Vercel's geo header, then the default.
+  const country = validateCountry(body.country ?? fallbackCountry ?? undefined);
+  if (!country.ok) return { ok: false, error: country.error };
+
   return {
     ok: true,
     filters: {
@@ -94,6 +100,7 @@ function parseRequest(input: unknown): ParsedRequest {
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
       limit: limit.value,
+      country: country.value,
     },
     cursor: sanitizeCursor(body.cursor, keyword.value),
   };
@@ -104,9 +111,10 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     ...cursor.counters,
     keyword: filters.keyword,
     target: filters.limit,
-    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions)),
+    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.wave)),
     currentQuery: null,
     phase: cursor.phase,
+    wave: cursor.wave,
     elapsedMs: 0,
   };
 }
@@ -123,7 +131,9 @@ export async function POST(request: Request): Promise<Response> {
     return jsonError(400, "Request body must be valid JSON.");
   }
 
-  const parsed = parseRequest(raw);
+  // Country the requester is browsing from (Vercel sets this per request).
+  const geoCountry = request.headers.get("x-vercel-ip-country");
+  const parsed = parseRequest(raw, geoCountry);
   if (!parsed.ok) return jsonError(400, parsed.error);
 
   const { filters } = parsed;

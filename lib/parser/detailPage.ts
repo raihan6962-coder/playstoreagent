@@ -2,6 +2,7 @@ import { extractAfScripts } from "./afData";
 import { collectStoreApps, looksLikePackageId } from "./appEntries";
 import { extractSoftwareApplication } from "./jsonLd";
 import { parseInstallCount } from "./installs";
+import { parseRating } from "./rating";
 import { stripHtml, truncate } from "./html";
 import type { StoreApp } from "@/types/lead";
 
@@ -15,6 +16,29 @@ const DOWNLOADS_PATTERN =
   />([0-9][0-9.,\s\u00a0\u202f]*\s*[KMB]?\+?)<\s*\/div\s*><\s*div[^>]*>\s*Downloads\s*</i;
 
 const PACKAGE_IN_URL = /[?&]id=([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+)/;
+
+/**
+ * Visible rating markup used when the JSON-LD block has no aggregate rating
+ * (Play serves that to some storefronts). The aria label is the same number
+ * the page prints next to the stars — i.e. exactly what the user sees.
+ */
+const VISIBLE_RATING_PATTERNS = [
+  /Rated\s+([\d.,]+)\s+stars/i,
+  /itemprop="ratingValue"[^>]*content="([\d.,]+)"/i,
+  /content="([\d.,]+)"[^>]*itemprop="ratingValue"/i,
+  /itemprop="ratingValue"[^>]*>\s*([\d.,]+)/i,
+];
+
+function readVisibleRating(html: string): { rating: number; raw: string } | null {
+  for (const pattern of VISIBLE_RATING_PATTERNS) {
+    const match = pattern.exec(html);
+    if (!match) continue;
+    const raw = match[1].trim();
+    const rating = parseRating(raw);
+    if (rating !== null) return { rating, raw };
+  }
+  return null;
+}
 
 function readInstallsFromHtml(html: string): string | null {
   const match = DOWNLOADS_PATTERN.exec(html);
@@ -46,6 +70,7 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
   const packageName = findPackageName(html, requestedPackage);
   const appsFromAf = collectAllApps(html);
   const fromAf = packageName ? appsFromAf.find((app) => app.packageName === packageName) : undefined;
+  const visible = jsonLd?.rating === null || jsonLd?.rating === undefined ? readVisibleRating(html) : null;
 
   const installsRaw = readInstallsFromHtml(html) ?? fromAf?.installsRaw ?? null;
   const installs = parseInstallCount(installsRaw);
@@ -58,8 +83,12 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
         packageName,
         title,
         developer: jsonLd?.author ?? fromAf?.developer ?? null,
-        rating: jsonLd?.rating ?? fromAf?.rating ?? null,
-        ratingRaw: fromAf?.ratingRaw ?? (jsonLd?.rating !== null && jsonLd?.rating !== undefined ? String(jsonLd.rating) : null),
+        rating: jsonLd?.rating ?? visible?.rating ?? fromAf?.rating ?? null,
+        ratingRaw:
+          fromAf?.ratingRaw ??
+          (jsonLd?.rating !== null && jsonLd?.rating !== undefined
+            ? String(jsonLd.rating)
+            : visible?.raw ?? null),
         ratingsCount: jsonLd?.ratingsCount ?? null,
         installsRaw: installs.ok ? installs.raw : null,
         installs: installs.value,

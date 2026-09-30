@@ -166,6 +166,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let enrichRequests = 0;
   let parseFailures = 0;
   let transportFailures = 0;
+  let suggestFailed = false;
   let currentQuery: string | null = null;
 
   const queries = buildPlanQueries(cursor.keyword, suggestions);
@@ -451,8 +452,16 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           for (const label of found) {
             if (keepsKeyword(cursor.keyword, label)) collected.push(label);
           }
-        } catch {
-          // Suggestions are optional; the deterministic plan still runs.
+        } catch (error) {
+          if (!suggestFailed) {
+            suggestFailed = true;
+            emit({
+              type: "warning",
+              message:
+                `Play's suggest endpoint is unavailable (${error instanceof Error ? error.message : "unknown error"}). ` +
+                "Continuing with the built-in query plan.",
+            });
+          }
         }
       }),
     );

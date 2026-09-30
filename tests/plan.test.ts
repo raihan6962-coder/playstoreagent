@@ -34,7 +34,7 @@ describe("storefront sweep plan", () => {
 
   it("gives the head queries the full sweep and the rest the core sweep", () => {
     const queries = buildPlanQueries(KEYWORD, ["crypto wallet app", "old crypto wallet"]);
-    expect(queries.length).toBe(26);
+    expect(queries.length).toBe(66);
 
     const headBlock = 2 * PLAN_LOCALES.length;
     expect(planSize(queries)).toBe(headBlock + (queries.length - 2) * CORE_LOCALES.length);

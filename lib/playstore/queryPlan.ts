@@ -187,6 +187,18 @@ function baseQuerySpecs(keyword: string): PlanQuery[] {
     specs.push({ query: `${keyword} ${modifier}`, kind: "modifier" });
   }
 
+  // Long tails built from a single keyword word: they surface the small,
+  // low rated apps that head-term searches never rank, and they keep the plan
+  // productive even when Play's suggest endpoint is unreachable.
+  for (const token of tokens.significant.slice(0, 4)) {
+    for (const suffix of VARIANT_SUFFIXES) {
+      specs.push({ query: `${token} ${suffix}`, kind: "variant" });
+    }
+    for (const modifier of TAIL_MODIFIERS) {
+      specs.push({ query: `${token} ${modifier}`, kind: "modifier" });
+    }
+  }
+
   return specs;
 }
 
@@ -271,25 +283,25 @@ export function suggestPrefixes(keyword: string): string[] {
 }
 
 /** Deterministic plan used when the suggest endpoint is unavailable. */
-export function buildBasePlan(keyword: string): QueryPlanEntry[] {
-  const plan: QueryPlanEntry[] = [];
-  for (const spec of baseQuerySpecs(keyword)) {
-    plan.push(entry(spec.query, spec.kind));
-  }
+export function buildBasePlan(keyword: string, cap = MAX_PLAN_SIZE): QueryPlanEntry[] {
+  const specs = baseQuerySpecs(keyword);
+  // Keep room for the storefront and price entries inside the legacy cap.
+  const headroom = Math.max(1, cap - LOCALES.length - 2);
+  const plan: QueryPlanEntry[] = specs
+    .slice(0, headroom)
+    .map((spec) => entry(spec.query, spec.kind));
   for (const locale of LOCALES) {
     plan.push(entry(keyword, "locale", locale));
   }
   plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "free"));
   plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "paid"));
-  return dedupePlan(plan);
+  return dedupePlan(plan, cap);
 }
 
 export function buildPlan(keyword: string, suggestions: string[] = []): QueryPlanEntry[] {
-  const base = buildBasePlan(keyword);
-  const plan: QueryPlanEntry[] = [base[0]];
-  for (const suggestion of suggestions) {
-    if (keepsKeyword(keyword, suggestion)) plan.push(entry(suggestion, "suggestion"));
-  }
+  const kept = suggestions.filter((suggestion) => keepsKeyword(keyword, suggestion));
+  const base = buildBasePlan(keyword, Math.max(1, MAX_PLAN_SIZE - kept.length));
+  const plan: QueryPlanEntry[] = [base[0], ...kept.map((label) => entry(label, "suggestion"))];
   plan.push(...base.slice(1));
-  return dedupePlan(plan, MAX_PLAN_SIZE * 4);
+  return dedupePlan(plan, MAX_PLAN_SIZE);
 }

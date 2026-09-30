@@ -95,6 +95,17 @@ const LANGUAGE_STOREFRONTS: Array<{ hl: string; gl: string }> = [
   { hl: "id", gl: "ID" },
   { hl: "fr", gl: "FR" },
   { hl: "ja", gl: "JP" },
+  { hl: "ru", gl: "RU" },
+  { hl: "ar", gl: "EG" },
+  { hl: "th", gl: "TH" },
+  { hl: "vi", gl: "VN" },
+  { hl: "tr", gl: "TR" },
+  { hl: "it", gl: "IT" },
+  { hl: "nl", gl: "NL" },
+  { hl: "pl", gl: "PL" },
+  { hl: "ko", gl: "KR" },
+  { hl: "zh-TW", gl: "TW" },
+  { hl: "sv", gl: "SE" },
 ];
 
 /**
@@ -111,10 +122,11 @@ export const PLAN_LOCALES: PlanLocale[] = [
 
 /**
  * Storefronts swept for every query after the head ones. Measured on 175
- * requests (research2.test.ts R6): these 20 storefronts cover ~97% of the
- * unique apps the full 35-storefront sweep finds, at 57% of the request cost —
- * the paid storefront and the non-English storefronts are the ones that keep
- * returning apps the en-US/GB results never surface.
+ * requests (research2.test.ts R6): a dozen en-country storefronts plus the paid
+ * storefront and the non-English storefronts cover ~97% of the unique apps a
+ * full sweep finds, at a fraction of the request cost — the paid and
+ * non-English storefronts are the ones that keep returning apps the en-US/GB
+ * results never surface.
  */
 export const CORE_LOCALES: PlanLocale[] = [
   ...["US", "GB", "CA", "AU", "IN", "PK", "ID", "BR", "NG", "DE", "JP", "FR"].map(

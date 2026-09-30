@@ -36,7 +36,7 @@ const ENRICH_CONCURRENCY = 6;
 /** Suggest prefixes processed per step (the rest resume later). */
 const SUGGESTS_PER_PREFIX = 10;
 /** How many "similar apps" detail pages one step may fetch. */
-const MAX_EXPAND_REQUESTS = 300;
+const MAX_EXPAND_REQUESTS = 500;
 /** Stop queueing expansion seeds beyond this size. */
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_ENRICH_QUEUE = 200;

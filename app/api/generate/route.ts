@@ -1,4 +1,5 @@
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
+import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
   parseInstallInput,
@@ -15,7 +16,7 @@ import type {
 
 export const maxDuration = 300;
 
-const DEFAULT_BUDGET_MS = 25_000;
+const DEFAULT_BUDGET_MS = 180_000;
 const MIN_BUDGET_MS = 5_000;
 const MAX_BUDGET_MS = 240_000;
 
@@ -102,7 +103,7 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     ...cursor.counters,
     keyword: filters.keyword,
     target: filters.limit,
-    queriesTotal: cursor.plan.length,
+    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions)),
     currentQuery: null,
     phase: cursor.phase,
     elapsedMs: 0,

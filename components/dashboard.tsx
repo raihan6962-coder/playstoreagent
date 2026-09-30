@@ -21,14 +21,16 @@ import { LeadTable } from "./lead-table";
 import { ProgressPanel } from "./progress-panel";
 import { SearchForm, type SearchValues } from "./search-form";
 
-const MAX_AUTO_RESUMES = 12;
+/** Each step streams for up to ~3 minutes server-side; this bounds a full run. */
+const MAX_AUTO_RESUMES = 24;
+const MAX_AUTO_MS = 45 * 60_000;
 
 export function Dashboard() {
   const [values, setValues] = useState<SearchValues>({
     keyword: "",
     maxRating: "3",
     maxInstalls: "100000",
-    limit: "10",
+    limit: "1000",
   });
   const [errors, setErrors] = useState<Partial<Record<keyof SearchValues, string>>>({});
   const [running, setRunning] = useState(false);
@@ -124,6 +126,8 @@ export function Dashboard() {
     abortRef.current = controller;
     let activeCursor = resume ? cursorRef.current : null;
     let autoResumes = 0;
+    let droppedWithoutDone = 0;
+    const startedAt = Date.now();
 
     try {
       for (;;) {
@@ -136,19 +140,53 @@ export function Dashboard() {
           signal: controller.signal,
         });
 
-        if (!terminal || terminal.type !== "done") break;
         if (controller.signal.aborted) break;
 
-        activeCursor = terminal.cursor;
-        const canContinue =
-          terminal.reason === "budget-exhausted" &&
-          terminal.cursor !== null &&
-          autoResumes < MAX_AUTO_RESUMES;
+        if (terminal && terminal.type === "error") break;
 
-        if (!canContinue) break;
+        if (terminal && terminal.type === "done") {
+          droppedWithoutDone = 0;
+          activeCursor = terminal.cursor;
+          const withinTime = Date.now() - startedAt < MAX_AUTO_MS;
+          const canContinue =
+            terminal.reason === "budget-exhausted" &&
+            terminal.cursor !== null &&
+            autoResumes < MAX_AUTO_RESUMES &&
+            withinTime;
 
-        autoResumes += 1;
-        setDone(null);
+          if (!canContinue) break;
+
+          autoResumes += 1;
+          setDone(null);
+          setMessage(`Continuing automatically (pass ${autoResumes + 1})…`);
+          continue;
+        }
+
+        // The stream closed without a terminal event: a network drop or a
+        // platform timeout. One retry keeps a long run alive without risking
+        // an endless loop of steps that never make progress.
+        droppedWithoutDone += 1;
+        const nextCursor = cursorRef.current ?? activeCursor;
+        const withinTime = Date.now() - startedAt < MAX_AUTO_MS;
+        if (
+          nextCursor &&
+          droppedWithoutDone < 2 &&
+          autoResumes < MAX_AUTO_RESUMES &&
+          withinTime
+        ) {
+          autoResumes += 1;
+          activeCursor = nextCursor;
+          setDone(null);
+          setMessage(`Connection dropped — resuming (pass ${autoResumes + 1})…`);
+          continue;
+        }
+
+        const text = nextCursor
+          ? "The connection dropped before the step finished. Resume to pick up from the last checkpoint."
+          : "The connection dropped before the search finished. Please try again.";
+        setError(text);
+        setMessage(text);
+        break;
       }
     } catch (caught) {
       const text = caught instanceof Error ? caught.message : "Unexpected client error.";

@@ -36,6 +36,8 @@ export interface PlayClientOptions {
   retries?: number;
   /** Minimum delay between outgoing request starts. */
   intervalMs?: number;
+  /** How many requests may be in flight at the same time. */
+  concurrency?: number;
   userAgent?: string;
 }
 
@@ -58,8 +60,14 @@ function sleep(ms: number): Promise<void> {
 class RateGate {
   private chain: Promise<void> = Promise.resolve();
   private nextStartAt = 0;
+  private readonly baseIntervalMs: number;
+  private intervalMs: number;
+  private rewarded = 0;
 
-  constructor(private readonly intervalMs: number) {}
+  constructor(intervalMs: number) {
+    this.baseIntervalMs = intervalMs;
+    this.intervalMs = intervalMs;
+  }
 
   async wait(): Promise<void> {
     const run = this.chain.then(async () => {
@@ -69,6 +77,42 @@ class RateGate {
     });
     this.chain = run.catch(() => undefined);
     return run;
+  }
+
+  /** Play pushed back: slow down, up to a ceiling. */
+  penalize(): void {
+    this.intervalMs = Math.min(Math.max(this.intervalMs * 2, 400), 4_000);
+    this.rewarded = 0;
+  }
+
+  /** Steady success: creep back towards the configured pace. */
+  reward(): void {
+    this.rewarded += 1;
+    if (this.rewarded < 10 || this.intervalMs <= this.baseIntervalMs) return;
+    this.intervalMs = Math.max(this.baseIntervalMs, Math.round(this.intervalMs / 2));
+    this.rewarded = 0;
+  }
+}
+
+/** Bounds how many requests run simultaneously across all concurrent workers. */
+class Semaphore {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
+  }
+
+  release(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.active -= 1;
   }
 }
 
@@ -91,6 +135,7 @@ export class PlayClient {
   private readonly retries: number;
   private readonly userAgent: string;
   private readonly gate: RateGate;
+  private readonly semaphore: Semaphore;
   private requestCount = 0;
 
   constructor(options: PlayClientOptions = {}) {
@@ -98,6 +143,7 @@ export class PlayClient {
     this.retries = options.retries ?? 2;
     this.userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
     this.gate = new RateGate(options.intervalMs ?? 300);
+    this.semaphore = new Semaphore(Math.max(1, options.concurrency ?? 1));
   }
 
   get requests(): number {
@@ -136,35 +182,50 @@ export class PlayClient {
         await sleep(Math.min(backoff, 8_000));
       }
 
-      await this.gate.wait();
-      this.requestCount += 1;
-
+      await this.semaphore.acquire();
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+        await this.gate.wait();
+        this.requestCount += 1;
+
         let response: Response;
+        let text: string;
         try {
-          response = await fetch(url, {
-            method,
-            redirect: "follow",
-            signal: controller.signal,
-            body,
-            headers: {
-              "user-agent": this.userAgent,
-              "accept-language": "en-US,en;q=0.9",
-              accept:
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              ...extraHeaders,
-            },
-          });
-        } finally {
-          clearTimeout(timer);
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+          try {
+            response = await fetch(url, {
+              method,
+              redirect: "follow",
+              signal: controller.signal,
+              body,
+              headers: {
+                "user-agent": this.userAgent,
+                "accept-language": "en-US,en;q=0.9",
+                accept:
+                  "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ...extraHeaders,
+              },
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+          text = await response.text();
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") {
+            lastError = new PlayTimeoutError("Timed out while contacting the Play Store.");
+            continue;
+          }
+          lastError =
+            error instanceof Error
+              ? new PlayHttpError(error.message, 0, true)
+              : new PlayHttpError("Unknown network error.", 0, true);
+          continue;
         }
 
         const status = response.status;
-        const text = await response.text();
 
         if (status === 429 || looksBlocked(text, status)) {
+          this.gate.penalize();
           lastError = new PlayRateLimitError();
           continue;
         }
@@ -183,19 +244,17 @@ export class PlayClient {
           continue;
         }
 
+        this.gate.reward();
         return { status, body: text, url };
       } catch (error) {
         if (error instanceof PlayHttpError && !error.retryable) throw error;
-
-        if (error instanceof Error && error.name === "AbortError") {
-          lastError = new PlayTimeoutError("Timed out while contacting the Play Store.");
-          continue;
-        }
 
         lastError =
           error instanceof Error
             ? new PlayHttpError(error.message, 0, true)
             : new PlayHttpError("Unknown network error.", 0, true);
+      } finally {
+        this.semaphore.release();
       }
     }
 

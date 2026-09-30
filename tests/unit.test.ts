@@ -68,7 +68,7 @@ describe("sanitizeCursor", () => {
   it("discards malformed cursors", () => {
     expect(sanitizeCursor(null, "budget tracker")).toBeNull();
     expect(sanitizeCursor({ keyword: "budget tracker" }, "budget tracker")).toBeNull();
-    expect(sanitizeCursor({ ...createInitialCursor("budget tracker"), plan: [] }, "budget tracker")).toBeNull();
+    expect(sanitizeCursor({ ...createInitialCursor("budget tracker"), suggestions: "nope" }, "budget tracker")).toBeNull();
     expect(
       sanitizeCursor({ ...createInitialCursor("budget tracker"), phase: "done" }, "budget tracker"),
     ).toBeNull();

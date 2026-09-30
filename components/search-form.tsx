@@ -102,7 +102,7 @@ export function SearchForm({
           />
         </Field>
 
-        <Field label="Number of leads" error={errors.limit} hint="1 – 100, generation stops early once reached">
+        <Field label="Number of leads" error={errors.limit} hint="1 – 1,000, generation stops early once reached">
           <input
             className={fieldClass}
             value={values.limit}

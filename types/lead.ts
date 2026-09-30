@@ -32,7 +32,7 @@ export interface LeadFilters {
   limit: number;
 }
 
-export type SessionPhase = "search" | "expand" | "enrich" | "done";
+export type SessionPhase = "suggest" | "search" | "expand" | "enrich" | "done";
 
 export type PriceFilter = "all" | "free" | "paid";
 
@@ -81,11 +81,21 @@ export interface GenerationStats extends SessionCounters {
 export interface SessionCursor {
   /** Keyword the session was started for; guards against mismatched resumes. */
   keyword: string;
-  plan: QueryPlanEntry[];
+  /**
+   * Play suggest queries discovered so far. The full search plan is rebuilt
+   * from these on every step, which keeps the cursor small enough to round
+   * trip through the browser on every resume.
+   */
+  suggestions: string[];
+  /** Position in the deterministic suggest-prefix queue. */
+  suggestIndex: number;
+  /** Index into the query × storefront cross product (see queryPlan.ts). */
   planIndex: number;
   phase: SessionPhase;
   /** Package names already evaluated (dedupe + resume bookkeeping). */
   seen: string[];
+  /** Leads already counted towards the target (guards against double counting). */
+  emitted: string[];
   /** Relevant apps whose "similar apps" have not been expanded yet. */
   similarQueue: SimilarSeed[];
   /** Packages whose detail page has already been used for expansion. */

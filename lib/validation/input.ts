@@ -4,7 +4,7 @@ export type ValidationResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: string };
 
-export const MAX_LEADS = 100;
+export const MAX_LEADS = 1_000;
 export const MIN_RATING = 0.5;
 export const MAX_RATING = 5;
 export const MAX_INSTALLS = 1_000_000_000;

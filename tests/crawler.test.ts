@@ -3,6 +3,7 @@ import {
   createInitialCursor,
   runGenerationStep,
 } from "@/lib/playstore/crawler";
+import { buildPlanQueries, keepsKeyword, planSize } from "@/lib/playstore/queryPlan";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
 
@@ -142,8 +143,8 @@ describe("runGenerationStep", () => {
     });
 
     expect(harness.leads()).toHaveLength(1);
-    expect(cursor.planIndex).toBeLessThan(cursor.plan.length);
-    expect(harness.messages()[0]).toContain("Searching Play Store");
+    expect(cursor.planIndex).toBeLessThan(planSize(buildPlanQueries(KEYWORD, cursor.suggestions)));
+    expect(harness.messages().some((message) => message.includes("Searching Play Store"))).toBe(true);
   });
 
   it("enriches confirmed leads with the ratings count from their detail page", async () => {
@@ -178,7 +179,7 @@ describe("runGenerationStep", () => {
 
     expect(result.reason).toBe("budget-exhausted");
     expect(result.cursor).not.toBeNull();
-    expect(result.cursor?.phase).toBe("search");
+    expect(result.cursor?.phase).toBe("suggest");
     expect(harness.leads()).toHaveLength(0);
 
     const resumed = await runGenerationStep({
@@ -192,7 +193,7 @@ describe("runGenerationStep", () => {
     expect(harness.leads()).toHaveLength(2);
   });
 
-  it("adds related suggestions to the plan after the first query", async () => {
+  it("collects keyword-preserving suggestions before searching", async () => {
     const harness = collect();
     const client = makeFakeClient({
       search: () => searchRoutes(),
@@ -209,8 +210,13 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    expect(cursor.plan.some((entry) => entry.kind === "suggestion")).toBe(true);
-    expect(cursor.plan.length).toBeLessThanOrEqual(48);
+    expect(cursor.suggestions).toEqual(
+      expect.arrayContaining(["family budget tracker", "budget ledger tracker"]),
+    );
+    expect(cursor.suggestions.every((label) => keepsKeyword(KEYWORD, label))).toBe(true);
+    const queries = buildPlanQueries(KEYWORD, cursor.suggestions);
+    expect(queries.some((item) => item.kind === "suggestion")).toBe(true);
+    expect(queries.length).toBeLessThanOrEqual(48 + 400);
   });
 
   it("wraps up early when the caller aborts", async () => {

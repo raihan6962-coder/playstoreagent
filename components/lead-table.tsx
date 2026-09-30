@@ -15,11 +15,14 @@ function formatInstalls(lead: Lead): string {
   return lead.installs.toLocaleString("en-US");
 }
 
+const PAGE_SIZE = 100;
+
 export function LeadTable({ leads }: LeadTableProps) {
   const [sort, setSort] = useState<{ key: SortKey; direction: "asc" | "desc" }>({
     key: "rating",
     direction: "asc",
   });
+  const [visible, setVisible] = useState(PAGE_SIZE);
 
   const rows = useMemo(() => {
     const copy = [...leads];
@@ -69,6 +72,8 @@ export function LeadTable({ leads }: LeadTableProps) {
     </th>
   );
 
+  const shown = rows.slice(0, visible);
+
   if (rows.length === 0) {
     return (
       <div className="rounded-2xl border border-dashed border-zinc-800 px-6 py-12 text-center">
@@ -102,7 +107,7 @@ export function LeadTable({ leads }: LeadTableProps) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((lead) => (
+          {shown.map((lead) => (
             <tr
               key={lead.packageName}
               className="border-b border-zinc-800/70 last:border-0 hover:bg-zinc-800/40"
@@ -172,6 +177,20 @@ export function LeadTable({ leads }: LeadTableProps) {
           ))}
         </tbody>
       </table>
+      {rows.length > shown.length && (
+        <div className="flex flex-col items-center gap-1.5 border-t border-zinc-800 px-3 py-3 text-center">
+          <button
+            type="button"
+            onClick={() => setVisible((current) => current + 200)}
+            className="rounded-lg border border-zinc-700 px-4 py-2 text-xs font-medium text-zinc-200 transition hover:border-emerald-500 hover:text-emerald-400"
+          >
+            Show {Math.min(200, rows.length - shown.length)} more
+          </button>
+          <p className="text-[11px] text-zinc-500">
+            Showing {shown.length} of {rows.length} leads — CSV export always includes every lead.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

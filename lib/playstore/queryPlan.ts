@@ -1,7 +1,10 @@
 import { tokenizeKeyword } from "@/lib/filters/relevance";
-import type { PriceFilter, QueryPlanEntry } from "@/types/lead";
+import type { PriceFilter, QueryKind, QueryPlanEntry } from "@/types/lead";
 
+/** Cap on the legacy single-locale plan helpers. */
 export const MAX_PLAN_SIZE = 48;
+/** Cap on Play-sourced suggestion queries carried in the cursor. */
+export const MAX_SUGGESTION_QUERIES = 400;
 
 const VARIANT_SUFFIXES = [
   "app",
@@ -43,9 +46,95 @@ const LOCALES: Array<{ hl: string; gl: string }> = [
   { hl: "hi", gl: "IN" },
 ];
 
+/**
+ * Storefronts the cross-product plan sweeps. Every entry is one Play search
+ * request when combined with a query. Measured (see research.test.ts): the
+ * same query returns largely *different* app sets per storefront, so countries
+ * multiply unique discovery instead of repeating it.
+ */
+export interface PlanLocale {
+  hl: string;
+  gl: string;
+  price?: PriceFilter;
+}
+
+const SWEEP_COUNTRIES = [
+  "US",
+  "GB",
+  "CA",
+  "AU",
+  "IN",
+  "PK",
+  "BD",
+  "ID",
+  "PH",
+  "VN",
+  "TH",
+  "BR",
+  "MX",
+  "CO",
+  "NG",
+  "KE",
+  "ZA",
+  "TR",
+  "DE",
+  "FR",
+  "ES",
+  "IT",
+  "PL",
+  "JP",
+  "KR",
+  "AR",
+];
+
+const LANGUAGE_STOREFRONTS: Array<{ hl: string; gl: string }> = [
+  { hl: "es", gl: "MX" },
+  { hl: "pt", gl: "BR" },
+  { hl: "de", gl: "DE" },
+  { hl: "hi", gl: "IN" },
+  { hl: "id", gl: "ID" },
+  { hl: "fr", gl: "FR" },
+  { hl: "ja", gl: "JP" },
+];
+
+/**
+ * Storefronts swept for the two head queries (the keyword itself and its
+ * quoted form): the widest coverage we buy. Measured (research2.test.ts R6):
+ * the en-countries mostly overlap, so later queries use {@link CORE_LOCALES}.
+ */
+export const PLAN_LOCALES: PlanLocale[] = [
+  ...SWEEP_COUNTRIES.map((gl) => ({ hl: "en", gl })),
+  { hl: "en", gl: "US", price: "free" },
+  { hl: "en", gl: "US", price: "paid" },
+  ...LANGUAGE_STOREFRONTS,
+];
+
+/**
+ * Storefronts swept for every query after the head ones. Measured on 175
+ * requests (research2.test.ts R6): these 20 storefronts cover ~97% of the
+ * unique apps the full 35-storefront sweep finds, at 57% of the request cost —
+ * the paid storefront and the non-English storefronts are the ones that keep
+ * returning apps the en-US/GB results never surface.
+ */
+export const CORE_LOCALES: PlanLocale[] = [
+  ...["US", "GB", "CA", "AU", "IN", "PK", "ID", "BR", "NG", "DE", "JP", "FR"].map(
+    (gl) => ({ hl: "en", gl }),
+  ),
+  { hl: "en", gl: "US", price: "paid" },
+  ...LANGUAGE_STOREFRONTS,
+];
+
+/** Head queries that receive the full storefront sweep. */
+const FULL_SWEEP_QUERIES = 2;
+
+function storefrontCount(queryCount: number): number {
+  const head = Math.min(queryCount, FULL_SWEEP_QUERIES);
+  return head * PLAN_LOCALES.length + Math.max(0, queryCount - head) * CORE_LOCALES.length;
+}
+
 function entry(
   query: string,
-  kind: QueryPlanEntry["kind"],
+  kind: QueryKind,
   locale: { hl: string; gl: string } = { hl: "en", gl: "US" },
   price?: PriceFilter,
 ): QueryPlanEntry {
@@ -69,70 +158,138 @@ export function dedupePlan(plan: QueryPlanEntry[], limit = MAX_PLAN_SIZE): Query
   return output;
 }
 
-/** Deterministic plan used when the suggest endpoint is unavailable. */
-export function buildBasePlan(keyword: string): QueryPlanEntry[] {
-  const tokens = tokenizeKeyword(keyword);
-  const plan: QueryPlanEntry[] = [];
+export interface PlanQuery {
+  query: string;
+  kind: QueryKind;
+}
 
-  plan.push(entry(keyword, "primary"));
-  plan.push(entry(`"${keyword}"`, "primary"));
+/** Deterministic queries used when the suggest endpoint is unavailable. */
+function baseQuerySpecs(keyword: string): PlanQuery[] {
+  const tokens = tokenizeKeyword(keyword);
+  const specs: PlanQuery[] = [];
+
+  specs.push({ query: keyword, kind: "primary" });
+  specs.push({ query: `"${keyword}"`, kind: "primary" });
 
   for (const token of tokens.significant.slice(0, 4)) {
-    plan.push(entry(token, "token"));
+    specs.push({ query: token, kind: "token" });
   }
 
   if (tokens.significant.length > 1) {
-    plan.push(entry([...tokens.significant].reverse().join(" "), "variant"));
+    specs.push({ query: [...tokens.significant].reverse().join(" "), kind: "variant" });
   }
 
   for (const suffix of VARIANT_SUFFIXES) {
-    plan.push(entry(`${keyword} ${suffix}`, "variant"));
+    specs.push({ query: `${keyword} ${suffix}`, kind: "variant" });
   }
 
   for (const modifier of TAIL_MODIFIERS) {
-    plan.push(entry(`${keyword} ${modifier}`, "modifier"));
+    specs.push({ query: `${keyword} ${modifier}`, kind: "modifier" });
   }
 
+  return specs;
+}
+
+/**
+ * A suggestion only earns a slot when it still mentions every significant
+ * keyword token: long-tail queries that drop the keyword waste requests
+ * against results the relevance filter would reject anyway.
+ */
+export function keepsKeyword(keyword: string, suggestion: string): boolean {
+  const tokens = tokenizeKeyword(keyword);
+  const haystack = suggestion.toLowerCase();
+  if (tokens.significant.length === 0) return false;
+  return tokens.significant.every((token) => haystack.includes(token));
+}
+
+/**
+ * Ordered query list: deterministic base queries first, then Play suggestions
+ * appended in discovery order. Appending is what makes `planIndex` stable
+ * across resumes — earlier entries never move.
+ */
+export function buildPlanQueries(keyword: string, suggestions: string[] = []): PlanQuery[] {
+  const base = baseQuerySpecs(keyword);
+  const out = [...base];
+  const seen = new Set(out.map((item) => item.query.toLowerCase()));
+  const budget = base.length + MAX_SUGGESTION_QUERIES;
+
+  for (const suggestion of suggestions) {
+    if (out.length >= budget) break;
+    const key = suggestion.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    if (!keepsKeyword(keyword, key)) continue;
+    seen.add(key);
+    out.push({ query: suggestion.trim(), kind: "suggestion" });
+  }
+  return out;
+}
+
+/** Total number of search requests the plan can issue. */
+export function planSize(queries: PlanQuery[]): number {
+  return storefrontCount(queries.length);
+}
+
+/** Resolves one index of the query × storefront cross product. */
+export function entryAt(queries: PlanQuery[], index: number): QueryPlanEntry | null {
+  if (index < 0 || queries.length === 0) return null;
+
+  const headBlock = Math.min(queries.length, FULL_SWEEP_QUERIES) * PLAN_LOCALES.length;
+  let queryIndex: number;
+  let locale: PlanLocale;
+
+  if (index < headBlock) {
+    queryIndex = Math.floor(index / PLAN_LOCALES.length);
+    locale = PLAN_LOCALES[index % PLAN_LOCALES.length];
+  } else {
+    const offset = index - headBlock;
+    queryIndex = FULL_SWEEP_QUERIES + Math.floor(offset / CORE_LOCALES.length);
+    locale = CORE_LOCALES[offset % CORE_LOCALES.length];
+  }
+
+  const query = queries[queryIndex];
+  if (!query) return null;
+
+  const kind: QueryKind = locale.price
+    ? "price"
+    : locale.hl !== "en"
+      ? "locale"
+      : query.kind;
+  return entry(query.query, kind, { hl: locale.hl, gl: locale.gl }, locale.price);
+}
+
+/**
+ * Prefixes fed to Play's suggest endpoint. Each prefix returns ~10 queries, so
+ * the 37 prefixes below are what turns a 25-query plan into a ~400-query plan
+ * of keyword-preserving long tails.
+ */
+export function suggestPrefixes(keyword: string): string[] {
+  const base = keyword.trim().replace(/\s+/g, " ");
+  const out = [base];
+  for (const letter of "abcdefghijklmnopqrstuvwxyz") out.push(`${base} ${letter}`);
+  for (const digit of "0123456789") out.push(`${base} ${digit}`);
+  return out;
+}
+
+/** Deterministic plan used when the suggest endpoint is unavailable. */
+export function buildBasePlan(keyword: string): QueryPlanEntry[] {
+  const plan: QueryPlanEntry[] = [];
+  for (const spec of baseQuerySpecs(keyword)) {
+    plan.push(entry(spec.query, spec.kind));
+  }
   for (const locale of LOCALES) {
     plan.push(entry(keyword, "locale", locale));
   }
-
   plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "free"));
   plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "paid"));
-
   return dedupePlan(plan);
 }
 
 export function buildPlan(keyword: string, suggestions: string[] = []): QueryPlanEntry[] {
-  const tokens = tokenizeKeyword(keyword);
-  const plan: QueryPlanEntry[] = [];
-
-  plan.push(entry(keyword, "primary"));
-
+  const base = buildBasePlan(keyword);
+  const plan: QueryPlanEntry[] = [base[0]];
   for (const suggestion of suggestions) {
-    plan.push(entry(suggestion, "suggestion"));
+    if (keepsKeyword(keyword, suggestion)) plan.push(entry(suggestion, "suggestion"));
   }
-
-  plan.push(entry(`"${keyword}"`, "primary"));
-
-  for (const suffix of VARIANT_SUFFIXES) {
-    plan.push(entry(`${keyword} ${suffix}`, "variant"));
-  }
-
-  for (const token of tokens.significant.slice(0, 4)) {
-    plan.push(entry(token, "token"));
-  }
-
-  for (const modifier of TAIL_MODIFIERS) {
-    plan.push(entry(`${keyword} ${modifier}`, "modifier"));
-  }
-
-  for (const locale of LOCALES) {
-    plan.push(entry(keyword, "locale", locale));
-  }
-
-  plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "free"));
-  plan.push(entry(keyword, "price", { hl: "en", gl: "US" }, "paid"));
-
-  return dedupePlan(plan);
+  plan.push(...base.slice(1));
+  return dedupePlan(plan, MAX_PLAN_SIZE * 4);
 }

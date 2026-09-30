@@ -16,21 +16,64 @@ import {
   PlayRateLimitError,
 } from "./client";
 import { fetchAppDetail } from "./detail";
-import { buildPlan, MAX_PLAN_SIZE } from "./queryPlan";
+import {
+  buildPlanQueries,
+  entryAt,
+  keepsKeyword,
+  MAX_SUGGESTION_QUERIES,
+  planSize,
+  suggestPrefixes,
+} from "./queryPlan";
 import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
-/** How many "similar apps" detail pages one session may fetch. */
-const MAX_EXPAND_REQUESTS = 12;
+/** Requests issued in parallel inside one batch (search, expand or enrich). */
+const SEARCH_CONCURRENCY = 6;
+/** Suggest lookups issued in parallel inside one step. */
+const SUGGEST_CONCURRENCY = 6;
+/** Detail pages fetched per step to backfill lead metadata. */
+const ENRICH_CONCURRENCY = 6;
+/** Suggest prefixes processed per step (the rest resume later). */
+const SUGGESTS_PER_PREFIX = 10;
+/** How many "similar apps" detail pages one step may fetch. */
+const MAX_EXPAND_REQUESTS = 300;
 /** Stop queueing expansion seeds beyond this size. */
-const MAX_SIMILAR_QUEUE = 300;
+const MAX_SIMILAR_QUEUE = 2_000;
+const MAX_ENRICH_QUEUE = 200;
+/** Enriched detail pages per step before the step reports back to the caller. */
+const MAX_ENRICH_PER_STEP = 200;
+/**
+ * Package names kept for dedupe. Past this point repeats may be re-evaluated;
+ * `emitted` still guarantees a lead is only counted once. The cap also keeps
+ * the resume cursor small enough to round trip through the browser.
+ */
+const MAX_SEEN_PACKAGES = 10_000;
 /** Consecutive malformed pages before we assume Play changed its markup. */
-const MAX_PARSE_FAILURES = 3;
+const MAX_PARSE_FAILURES = 6;
 /** Consecutive transport failures before we give up. */
-const MAX_TRANSPORT_FAILURES = 4;
+const MAX_TRANSPORT_FAILURES = 8;
 /** Remaining time (ms) below which we no longer start a new request. */
 const REQUEST_HEADROOM_MS = 1_500;
-const MAX_SUGGESTIONS = 12;
+/** A parallel batch needs more slack than a single request. */
+const BATCH_HEADROOM_MS = 5_000;
+/**
+ * Detail pages and searches share every batch: walking "similar apps" measured
+ * ~6x the qualified leads per request of a fresh search (see research3.test.ts),
+ * so a healthy seed queue keeps half of the batch busy with expansion.
+ */
+const EXPAND_SLOTS_FULL = 3;
+const EXPAND_SLOTS_SPARSE = 1;
+/** Seed queue size considered "healthy" for a full expansion slot share. */
+const EXPAND_QUEUE_HEALTHY = 12;
+
+type TaskOutcome = "ok" | "target" | "rate-limited" | "parse-failure" | "transport-failure";
+
+const RATE_LIMITED_MESSAGE =
+  "Play Store temporarily rejected requests. Please try again in a few minutes.";
+const STRUCTURE_MESSAGE =
+  "Play Store changed its page structure and results could no longer be read.";
+const NETWORK_MESSAGE =
+  "Could not reach the Play Store after several attempts. Please try again later.";
 
 function emptyCounters(): SessionCounters {
   return {
@@ -48,10 +91,12 @@ function emptyCounters(): SessionCounters {
 export function createInitialCursor(keyword: string): SessionCursor {
   return {
     keyword,
-    plan: buildPlan(keyword),
+    suggestions: [],
+    suggestIndex: 0,
     planIndex: 0,
-    phase: "search",
+    phase: "suggest",
     seen: [],
+    emitted: [],
     similarQueue: [],
     expanded: [],
     enrichQueue: [],
@@ -81,12 +126,13 @@ function buildStats(
   filters: LeadFilters,
   startedAt: number,
   currentQuery: string | null,
+  queriesTotal: number,
 ): GenerationStats {
   return {
     ...cursor.counters,
     keyword: filters.keyword,
     target: filters.limit,
-    queriesTotal: cursor.plan.length,
+    queriesTotal,
     currentQuery,
     phase: cursor.phase,
     elapsedMs: Date.now() - startedAt,
@@ -96,38 +142,49 @@ function buildStats(
 /**
  * Runs one bounded slice of the lead-generation session.
  *
- * The session is fully resumable: the cursor carries the query plan position,
- * the dedupe set and the counters, so a serverless invocation can stop on its
- * time budget and the next invocation continues exactly where it left off.
+ * The session is fully resumable: the cursor carries the storefront sweep
+ * position, the suggestion list and the dedupe set, so a serverless invocation
+ * can stop on its time budget and the next invocation continues exactly where
+ * it left off.
  */
 export async function runGenerationStep(options: StepOptions): Promise<StepResult> {
   const { filters, budgetMs, emit } = options;
   const cursor = options.cursor;
-  const client = options.client ?? new PlayClient();
+  const client =
+    options.client ??
+    new PlayClient({ concurrency: SEARCH_CONCURRENCY, intervalMs: 180 });
   const startedAt = Date.now();
   const deadline = startedAt + budgetMs;
 
   const seen = new Set(cursor.seen);
+  const emitted = new Set(cursor.emitted);
   const expanded = new Set(cursor.expanded);
   const queuedSeeds = new Set(cursor.similarQueue.map((seed) => seed.p));
   const queuedEnrich = new Set(cursor.enrichQueue);
+  const suggestions = [...cursor.suggestions];
   let expandRequests = 0;
+  let enrichRequests = 0;
   let parseFailures = 0;
   let transportFailures = 0;
   let currentQuery: string | null = null;
-  let suggestionsAdded = cursor.plan.some((item) => item.kind === "suggestion");
 
-  const stats = () => buildStats(cursor, filters, startedAt, currentQuery);
-  const hasTimeForRequest = () =>
-    options.aborted?.() !== true && Date.now() + REQUEST_HEADROOM_MS < deadline;
+  const queries = buildPlanQueries(cursor.keyword, suggestions);
+  const totalPlan = planSize(queries);
+
+  const stats = () =>
+    buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
+  const hasTimeForRequest = (headroom = REQUEST_HEADROOM_MS) =>
+    options.aborted?.() !== true && Date.now() + headroom < deadline;
 
   const finish = (reason: DoneReason, message: string, attachCursor: boolean): StepResult => {
-    cursor.seen = Array.from(seen);
+    cursor.seen = Array.from(seen).slice(-MAX_SEEN_PACKAGES);
+    cursor.emitted = Array.from(emitted);
+    cursor.suggestions = suggestions.slice(0, MAX_SUGGESTION_QUERIES);
     cursor.counters.requests += client.requests;
     if (reason !== "budget-exhausted" && reason !== "rate-limited") {
       cursor.phase = "done";
     }
-    const finalStats = buildStats(cursor, filters, startedAt, currentQuery);
+    const finalStats = buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
     const result = attachCursor ? cursor : null;
     emit({ type: "done", reason, message, stats: finalStats, cursor: result });
     return { reason, message, cursor: result, stats: finalStats };
@@ -143,7 +200,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         continue;
       }
 
-      seen.add(app.packageName);
+      if (seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
       cursor.counters.discovered += 1;
       cursor.counters.evaluated += 1;
 
@@ -154,10 +211,17 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       }
 
       if (evaluation.status === "match" && evaluation.lead) {
-        if (cursor.counters.matched >= filters.limit) return true;
         const lead = evaluation.lead;
+        if (emitted.has(lead.packageName)) continue;
+        if (cursor.counters.matched >= filters.limit) return true;
+
+        emitted.add(lead.packageName);
         cursor.counters.matched += 1;
-        if (lead.ratingsCount === null && !queuedEnrich.has(lead.packageName)) {
+        if (
+          lead.ratingsCount === null &&
+          !queuedEnrich.has(lead.packageName) &&
+          cursor.enrichQueue.length < MAX_ENRICH_QUEUE
+        ) {
           queuedEnrich.add(lead.packageName);
           cursor.enrichQueue.push(lead.packageName);
         }
@@ -181,49 +245,42 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.similarQueue.push(seed);
   }
 
-  const addSuggestions = (queries: string[], hl: string, gl: string): void => {
-    const existing = new Set(
-      cursor.plan.map((item) => `${item.query.toLowerCase()}|${item.hl}|${item.gl}`),
+  /** Pulls the cheapest expansion seeds off the queue, skipping repeats. */
+  function takeSeeds(count: number): SimilarSeed[] {
+    const picked: SimilarSeed[] = [];
+    cursor.similarQueue.sort(
+      (a, b) => (a.i ?? Number.MAX_SAFE_INTEGER) - (b.i ?? Number.MAX_SAFE_INTEGER),
     );
-    const extra: QueryPlanEntry[] = [];
-    for (const query of queries) {
-      const key = `${query.toLowerCase()}|${hl}|${gl}`;
-      if (existing.has(key)) continue;
-      existing.add(key);
-      extra.push({ query, hl, gl, kind: "suggestion" });
+    while (
+      picked.length < count &&
+      cursor.similarQueue.length > 0 &&
+      expandRequests + picked.length < MAX_EXPAND_REQUESTS
+    ) {
+      const seed = cursor.similarQueue.shift();
+      if (!seed) break;
+      queuedSeeds.delete(seed.p);
+      if (expanded.has(seed.p)) continue;
+      picked.push(seed);
     }
-    if (extra.length === 0) return;
-    const room = MAX_PLAN_SIZE - cursor.plan.length;
-    if (room <= 0) return;
-    cursor.plan = [
-      ...cursor.plan.slice(0, cursor.planIndex + 1),
-      ...extra.slice(0, room),
-      ...cursor.plan.slice(cursor.planIndex + 1),
-    ].slice(0, MAX_PLAN_SIZE);
-  };
+    return picked;
+  }
 
-  // ---------------------------------------------------------------- search --
-  while (cursor.phase === "search") {
-    if (cursor.counters.matched >= filters.limit) {
-      cursor.phase = "enrich";
-      break;
+  /** Turns a batch of task outcomes into a terminal decision for the step. */
+  function batchFailure(outcomes: TaskOutcome[]): StepResult | null {
+    if (outcomes.includes("rate-limited")) {
+      return finish("rate-limited", RATE_LIMITED_MESSAGE, true);
     }
-    if (cursor.planIndex >= cursor.plan.length) {
-      cursor.phase = "expand";
-      break;
+    if (parseFailures >= MAX_PARSE_FAILURES) {
+      return finish("failed", STRUCTURE_MESSAGE, false);
     }
-    if (!hasTimeForRequest()) {
-      return finish("budget-exhausted", "Time budget reached for this step — resume to continue.", true);
+    if (transportFailures >= MAX_TRANSPORT_FAILURES) {
+      return finish("failed", NETWORK_MESSAGE, false);
     }
+    return null;
+  }
 
-    const entry: QueryPlanEntry = cursor.plan[cursor.planIndex];
-    currentQuery = entry.query;
-    emit({
-      type: "progress",
-      stats: stats(),
-      message: `Searching Play Store for “${entry.query}”…`,
-    });
-
+  async function runSearchTask(entry: QueryPlanEntry): Promise<TaskOutcome> {
+    if (options.aborted?.()) return "ok";
     try {
       const result = await searchApps(client, {
         query: entry.query,
@@ -236,53 +293,17 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       cursor.counters.pagesFetched += 1;
       parseFailures = 0;
       transportFailures = 0;
+      currentQuery = entry.query;
 
-      if (!suggestionsAdded) {
-        suggestionsAdded = true;
-        try {
-          const suggestions = await fetchSearchSuggestions(
-            client,
-            filters.keyword,
-            entry.hl,
-            entry.gl,
-            result.buildLabel,
-            MAX_SUGGESTIONS,
-          );
-          addSuggestions(suggestions, entry.hl, entry.gl);
-        } catch {
-          // Suggestions are optional; the deterministic plan still runs.
-        }
-      }
-
-      const targetReached = ingest(result.apps);
-      cursor.planIndex += 1;
-
-      if (targetReached) {
-        cursor.phase = "enrich";
-        break;
-      }
+      if (ingest(result.apps)) return "target";
+      return "ok";
     } catch (error) {
-      cursor.planIndex += 1;
-
-      if (error instanceof PlayRateLimitError) {
-        return finish(
-          "rate-limited",
-          "Play Store temporarily rejected requests. Please try again in a few minutes.",
-          true,
-        );
-      }
+      if (error instanceof PlayRateLimitError) return "rate-limited";
 
       if (error instanceof PlayParseError) {
         parseFailures += 1;
         emit({ type: "warning", message: "Play Store returned an unexpected page layout." });
-        if (parseFailures >= MAX_PARSE_FAILURES) {
-          return finish(
-            "failed",
-            "Play Store changed its page structure and results could no longer be read.",
-            false,
-          );
-        }
-        continue;
+        return "parse-failure";
       }
 
       transportFailures += 1;
@@ -290,41 +311,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         type: "warning",
         message: `A Play Store request failed (${error instanceof Error ? error.message : "unknown error"}). Moving on to the next query.`,
       });
-      if (transportFailures >= MAX_TRANSPORT_FAILURES) {
-        return finish(
-          "failed",
-          "Could not reach the Play Store after several attempts. Please try again later.",
-          false,
-        );
-      }
+      return "transport-failure";
     }
   }
 
-  // ---------------------------------------------------------------- expand --
-  while (cursor.phase === "expand") {
-    if (cursor.counters.matched >= filters.limit) {
-      cursor.phase = "enrich";
-      break;
-    }
-    if (cursor.similarQueue.length === 0 || expandRequests >= MAX_EXPAND_REQUESTS) {
-      cursor.phase = "enrich";
-      break;
-    }
-    if (!hasTimeForRequest()) {
-      return finish("budget-exhausted", "Time budget reached for this step — resume to continue.", true);
-    }
-
-    // Smallest apps first: they lead to the same low-install neighbourhood.
-    cursor.similarQueue.sort(
-      (a, b) => (a.i ?? Number.MAX_SAFE_INTEGER) - (b.i ?? Number.MAX_SAFE_INTEGER),
-    );
-    const seed = cursor.similarQueue.shift();
-    if (!seed) {
-      cursor.phase = "enrich";
-      break;
-    }
-    queuedSeeds.delete(seed.p);
-    if (expanded.has(seed.p)) continue;
+  async function runExpandTask(seed: SimilarSeed): Promise<TaskOutcome> {
+    if (options.aborted?.()) return "ok";
     expanded.add(seed.p);
     cursor.expanded.push(seed.p);
     expandRequests += 1;
@@ -348,48 +340,25 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         if (detail.app) emit({ type: "lead-update", app: detail.app });
       }
 
-      if (ingest(detail.similarApps)) {
-        cursor.phase = "enrich";
-        break;
-      }
+      if (ingest(detail.similarApps)) return "target";
+      return "ok";
     } catch (error) {
-      if (error instanceof PlayRateLimitError) {
-        return finish(
-          "rate-limited",
-          "Play Store temporarily rejected requests. Please try again in a few minutes.",
-          true,
-        );
-      }
+      if (error instanceof PlayRateLimitError) return "rate-limited";
       if (error instanceof PlayParseError) {
         parseFailures += 1;
-        if (parseFailures >= MAX_PARSE_FAILURES) {
-          return finish(
-            "failed",
-            "Play Store changed its page structure and results could no longer be read.",
-            false,
-          );
-        }
-      } else {
-        transportFailures += 1;
-        if (transportFailures >= MAX_TRANSPORT_FAILURES) {
-          return finish(
-            "failed",
-            "Could not reach the Play Store after several attempts. Please try again later.",
-            false,
-          );
-        }
+        return "parse-failure";
       }
+      transportFailures += 1;
+      emit({
+        type: "warning",
+        message: `Could not explore apps related to “${seed.p}”.`,
+      });
+      return "transport-failure";
     }
   }
 
-  // ---------------------------------------------------------------- enrich --
-  while (cursor.phase === "enrich") {
-    if (cursor.enrichQueue.length === 0) break;
-    if (!hasTimeForRequest()) {
-      return finish("budget-exhausted", "Time budget reached for this step — resume to continue.", true);
-    }
-
-    const pkg = cursor.enrichQueue[0];
+  async function runEnrichTask(pkg: string): Promise<TaskOutcome> {
+    if (options.aborted?.()) return "ok";
     currentQuery = pkg;
     emit({
       type: "progress",
@@ -400,6 +369,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     try {
       const detail = await fetchAppDetail(client, pkg);
       cursor.counters.pagesFetched += 1;
+      enrichRequests += 1;
       parseFailures = 0;
       transportFailures = 0;
 
@@ -412,45 +382,238 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
       cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
       queuedEnrich.delete(pkg);
+      return "ok";
     } catch (error) {
       cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
       queuedEnrich.delete(pkg);
 
-      if (error instanceof PlayRateLimitError) {
-        return finish(
-          "rate-limited",
-          "Leads are ready, but Play Store rejected further detail requests. Resume later to finish enriching them.",
-          true,
-        );
-      }
-
+      if (error instanceof PlayRateLimitError) return "rate-limited";
       if (error instanceof PlayParseError) {
         parseFailures += 1;
-        if (parseFailures >= MAX_PARSE_FAILURES) {
-          return finish(
-            "failed",
-            "Play Store changed its page structure and results could no longer be read.",
-            false,
+        return "parse-failure";
+      }
+
+      transportFailures += 1;
+      emit({
+        type: "warning",
+        message: `Could not fetch details for ${pkg}.`,
+      });
+      return "transport-failure";
+    }
+  }
+
+  // --------------------------------------------------------------- suggest --
+  while (cursor.phase === "suggest") {
+    const prefixes = suggestPrefixes(cursor.keyword);
+    if (cursor.suggestIndex >= prefixes.length) {
+      cursor.phase = "search";
+      break;
+    }
+    if (suggestions.length >= MAX_SUGGESTION_QUERIES) {
+      cursor.phase = "search";
+      break;
+    }
+    if (!hasTimeForRequest()) {
+      return finish(
+        "budget-exhausted",
+        "Time budget reached for this step — resume to continue.",
+        true,
+      );
+    }
+
+    const batch: string[] = [];
+    for (let offset = 0; offset < SUGGEST_CONCURRENCY; offset += 1) {
+      const prefix = prefixes[cursor.suggestIndex + offset];
+      if (prefix === undefined) break;
+      batch.push(prefix);
+    }
+    cursor.suggestIndex += batch.length;
+    currentQuery = batch[0] ?? null;
+
+    emit({
+      type: "progress",
+      stats: stats(),
+      message: `Expanding “${cursor.keyword}” with Play suggestions…`,
+    });
+
+    const collected: string[] = [];
+    await Promise.all(
+      batch.map(async (prefix) => {
+        try {
+          const found = await fetchSearchSuggestions(
+            client,
+            prefix,
+            "en",
+            "US",
+            undefined,
+            SUGGESTS_PER_PREFIX,
           );
+          for (const label of found) {
+            if (keepsKeyword(cursor.keyword, label)) collected.push(label);
+          }
+        } catch {
+          // Suggestions are optional; the deterministic plan still runs.
         }
-      } else {
-        transportFailures += 1;
-        emit({
-          type: "warning",
-          message: `Could not fetch details for ${pkg}.`,
-        });
-        if (transportFailures >= MAX_TRANSPORT_FAILURES) {
-          return finish(
-            "budget-exhausted",
-            "Leads are ready; some detail pages could not be fetched. Resume to finish them.",
-            true,
-          );
-        }
+      }),
+    );
+
+    for (const label of collected) {
+      if (suggestions.length >= MAX_SUGGESTION_QUERIES) break;
+      if (!suggestions.some((item) => item.toLowerCase() === label.toLowerCase())) {
+        suggestions.push(label);
       }
     }
   }
 
+  // ---------------------------------------------------------------- search --
+  while (cursor.phase === "search") {
+    if (cursor.counters.matched >= filters.limit) {
+      cursor.phase = "enrich";
+      break;
+    }
+    if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
+      return finish(
+        "budget-exhausted",
+        "Time budget reached for this step — resume to continue.",
+        true,
+      );
+    }
+
+    const seeds =
+      cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS
+        ? takeSeeds(
+            cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
+              ? EXPAND_SLOTS_FULL
+              : EXPAND_SLOTS_SPARSE,
+          )
+        : [];
+
+    const searchSlots = SEARCH_CONCURRENCY - seeds.length;
+    const batch: QueryPlanEntry[] = [];
+    for (let offset = 0; offset < searchSlots; offset += 1) {
+      const entry = entryAt(queries, cursor.planIndex + offset);
+      if (!entry) break;
+      batch.push(entry);
+    }
+    cursor.planIndex += batch.length;
+
+    if (batch.length === 0 && seeds.length === 0) {
+      cursor.phase = "expand";
+      break;
+    }
+    currentQuery = batch[0]?.query ?? seeds[0]?.p ?? null;
+
+    emit({
+      type: "progress",
+      stats: stats(),
+      message:
+        batch.length > 0
+          ? `Searching Play Store for “${batch[0].query}” (${batch[0].gl})…`
+          : `Exploring apps related to “${seeds[0].p}”…`,
+    });
+
+    const outcomes = await Promise.all([
+      ...seeds.map((seed) => runExpandTask(seed)),
+      ...batch.map((entry) => runSearchTask(entry)),
+    ]);
+
+    const failure = batchFailure(outcomes);
+    if (failure) return failure;
+    if (outcomes.includes("target")) {
+      cursor.phase = "enrich";
+      break;
+    }
+    if (cursor.planIndex >= totalPlan) {
+      cursor.phase = "expand";
+      break;
+    }
+  }
+
+  // ---------------------------------------------------------------- expand --
+  while (cursor.phase === "expand") {
+    if (cursor.counters.matched >= filters.limit) {
+      cursor.phase = "enrich";
+      break;
+    }
+    if (cursor.similarQueue.length === 0) {
+      cursor.phase = "enrich";
+      break;
+    }
+    if (expandRequests >= MAX_EXPAND_REQUESTS) {
+      return finish(
+        "budget-exhausted",
+        "Exploring related apps — resume to continue.",
+        true,
+      );
+    }
+    if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
+      return finish(
+        "budget-exhausted",
+        "Time budget reached for this step — resume to continue.",
+        true,
+      );
+    }
+
+    const seeds = takeSeeds(SEARCH_CONCURRENCY);
+    if (seeds.length === 0) {
+      cursor.phase = "enrich";
+      break;
+    }
+    currentQuery = seeds[0].p;
+
+    emit({
+      type: "progress",
+      stats: stats(),
+      message: `Exploring apps related to “${seeds[0].p}”…`,
+    });
+
+    const outcomes = await Promise.all(seeds.map((seed) => runExpandTask(seed)));
+
+    const failure = batchFailure(outcomes);
+    if (failure) return failure;
+    if (outcomes.includes("target")) {
+      cursor.phase = "enrich";
+      break;
+    }
+  }
+
+  // ---------------------------------------------------------------- enrich --
+  while (cursor.phase === "enrich") {
+    if (cursor.enrichQueue.length === 0 || enrichRequests >= MAX_ENRICH_PER_STEP) break;
+    if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
+      return finish(
+        "budget-exhausted",
+        "Time budget reached for this step — resume to continue.",
+        true,
+      );
+    }
+
+    const batch = cursor.enrichQueue.slice(0, ENRICH_CONCURRENCY);
+    if (batch.length === 0) break;
+
+    const outcomes = await Promise.all(batch.map((pkg) => runEnrichTask(pkg)));
+
+    const failure = batchFailure(outcomes);
+    if (failure) return failure;
+  }
+
   // ------------------------------------------------------------------ done --
+  if (cursor.enrichQueue.length > 0 && enrichRequests >= MAX_ENRICH_PER_STEP) {
+    return finish(
+      "budget-exhausted",
+      "Backfilling details for the collected leads — resume to continue.",
+      true,
+    );
+  }
+
+  if (cursor.similarQueue.length > 0 && expandRequests >= MAX_EXPAND_REQUESTS) {
+    return finish(
+      "budget-exhausted",
+      "Exploring related apps — resume to continue.",
+      true,
+    );
+  }
+
   if (cursor.counters.matched >= filters.limit) {
     return finish(
       "target-reached",

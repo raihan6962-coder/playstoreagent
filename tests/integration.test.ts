@@ -77,7 +77,6 @@ liveDescribe("live Play Store", () => {
         },
       });
 
-      // eslint-disable-next-line no-console
       console.log(
         `[live] reason=${result.reason} discovered=${result.stats.discovered} ` +
           `evaluated=${result.stats.evaluated} matched=${result.stats.matched} ` +

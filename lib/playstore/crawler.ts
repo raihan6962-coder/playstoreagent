@@ -100,6 +100,71 @@ function emptyCounters(): SessionCounters {
   };
 }
 
+/**
+ * Runs tasks through a sliding window instead of a fixed batch.
+ *
+ * A batch barrier idles every slot that finished early while it waits for the
+ * slowest page of that batch (production measured ~2.7 s per 16-wide batch at
+ * 5.9 req/s, i.e. 16 slots held open for the tail alone). A window refills a
+ * slot the moment its task settles, so one slow detail page can no longer
+ * throttle the other 15.
+ *
+ * `pullTask` supplies the next task, or null when this window's queues are
+ * exhausted; `shouldContinue` gates new starts (time budget, target, failure
+ * limits). Target and rate-limit outcomes close the window so in-flight work
+ * drains without pulling anything new.
+ */
+async function runWindow(
+  concurrency: number,
+  pullTask: () => Promise<TaskOutcome> | null,
+  shouldContinue: () => boolean,
+): Promise<TaskOutcome[]> {
+  const outcomes: TaskOutcome[] = [];
+  const running = new Set<Promise<void>>();
+  let open = true;
+  let crash: unknown = null;
+  let crashed = false;
+
+  const fill = (): void => {
+    while (open && running.size < concurrency && shouldContinue()) {
+      let task: Promise<TaskOutcome> | null;
+      try {
+        task = pullTask();
+      } catch (error) {
+        crash = error;
+        crashed = true;
+        open = false;
+        break;
+      }
+      if (!task) {
+        open = false;
+        break;
+      }
+      const settled = task.then((outcome) => {
+        outcomes.push(outcome);
+        if (outcome === "target" || outcome === "rate-limited") open = false;
+      });
+      running.add(settled);
+      void settled.then(
+        () => {
+          running.delete(settled);
+          fill();
+        },
+        () => {
+          running.delete(settled);
+        },
+      );
+    }
+  };
+
+  fill();
+  while (running.size > 0) {
+    await Promise.all(Array.from(running));
+  }
+  if (crashed) throw crash;
+  return outcomes;
+}
+
 export function createInitialCursor(keyword: string): SessionCursor {
   return {
     keyword,
@@ -531,43 +596,48 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       );
     }
 
-    const seeds =
-      cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS
-        ? takeSeeds(
-            cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
-              ? EXPAND_SLOTS_FULL
-              : EXPAND_SLOTS_SPARSE,
-          )
-        : [];
+    let expandCredit = 0;
+    const pullSearchTask = (): Promise<TaskOutcome> | null => {
+      const seedsAvailable =
+        cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
+      if (seedsAvailable) {
+        expandCredit +=
+          (cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
+            ? EXPAND_SLOTS_FULL
+            : EXPAND_SLOTS_SPARSE) / SEARCH_CONCURRENCY;
+      }
+      if (expandCredit >= 1) {
+        const [seed] = takeSeeds(1);
+        if (seed) {
+          expandCredit = Math.min(expandCredit - 1, 1);
+          return runExpandTask(seed);
+        }
+        expandCredit = 0;
+      }
 
-    const searchSlots = SEARCH_CONCURRENCY - seeds.length;
-    const batch: QueryPlanEntry[] = [];
-    for (let offset = 0; offset < searchSlots; offset += 1) {
-      const entry = entryAt(queries, cursor.planIndex + offset);
-      if (!entry) break;
-      batch.push(entry);
-    }
-    cursor.planIndex += batch.length;
+      const entry = entryAt(queries, cursor.planIndex);
+      if (!entry) {
+        if (!seedsAvailable) return null;
+        const [seed] = takeSeeds(1);
+        if (!seed) return null;
+        return runExpandTask(seed);
+      }
+      cursor.planIndex += 1;
+      currentQuery = entry.query;
+      emit({
+        type: "progress",
+        stats: stats(),
+        message: `Searching Play Store for “${entry.query}” (${entry.gl})…`,
+      });
+      return runSearchTask(entry);
+    };
 
-    if (batch.length === 0 && seeds.length === 0) {
-      cursor.phase = "expand";
-      break;
-    }
-    currentQuery = batch[0]?.query ?? seeds[0]?.p ?? null;
-
-    emit({
-      type: "progress",
-      stats: stats(),
-      message:
-        batch.length > 0
-          ? `Searching Play Store for “${batch[0].query}” (${batch[0].gl})…`
-          : `Exploring apps related to “${seeds[0].p}”…`,
-    });
-
-    const outcomes = await Promise.all([
-      ...seeds.map((seed) => runExpandTask(seed)),
-      ...batch.map((entry) => runSearchTask(entry)),
-    ]);
+    const outcomes = await runWindow(SEARCH_CONCURRENCY, pullSearchTask, () =>
+      cursor.counters.matched < filters.limit &&
+      hasTimeForRequest(BATCH_HEADROOM_MS) &&
+      parseFailures < MAX_PARSE_FAILURES &&
+      transportFailures < MAX_TRANSPORT_FAILURES,
+    );
 
     const failure = batchFailure(outcomes);
     if (failure) return failure;
@@ -575,7 +645,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       cursor.phase = "enrich";
       break;
     }
-    if (cursor.planIndex >= totalPlan) {
+    if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex) === null) {
       cursor.phase = "expand";
       break;
     }
@@ -606,20 +676,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       );
     }
 
-    const seeds = takeSeeds(SEARCH_CONCURRENCY);
-    if (seeds.length === 0) {
-      cursor.phase = "enrich";
-      break;
-    }
-    currentQuery = seeds[0].p;
-
-    emit({
-      type: "progress",
-      stats: stats(),
-      message: `Exploring apps related to “${seeds[0].p}”…`,
-    });
-
-    const outcomes = await Promise.all(seeds.map((seed) => runExpandTask(seed)));
+    const outcomes = await runWindow(
+      SEARCH_CONCURRENCY,
+      () => {
+        const [seed] = takeSeeds(1);
+        return seed ? runExpandTask(seed) : null;
+      },
+      () =>
+        cursor.counters.matched < filters.limit &&
+        expandRequests < MAX_EXPAND_REQUESTS &&
+        hasTimeForRequest(BATCH_HEADROOM_MS) &&
+        parseFailures < MAX_PARSE_FAILURES &&
+        transportFailures < MAX_TRANSPORT_FAILURES,
+    );
 
     const failure = batchFailure(outcomes);
     if (failure) return failure;
@@ -640,10 +709,26 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       );
     }
 
-    const batch = cursor.enrichQueue.slice(0, ENRICH_CONCURRENCY);
-    if (batch.length === 0) break;
-
-    const outcomes = await Promise.all(batch.map((pkg) => runEnrichTask(pkg)));
+    const inFlight = new Set<string>();
+    const outcomes = await runWindow(
+      ENRICH_CONCURRENCY,
+      () => {
+        if (enrichRequests + inFlight.size >= MAX_ENRICH_PER_STEP) return null;
+        for (const pkg of cursor.enrichQueue) {
+          if (inFlight.has(pkg)) continue;
+          inFlight.add(pkg);
+          return runEnrichTask(pkg).then((outcome) => {
+            inFlight.delete(pkg);
+            return outcome;
+          });
+        }
+        return null;
+      },
+      () =>
+        hasTimeForRequest(BATCH_HEADROOM_MS) &&
+        parseFailures < MAX_PARSE_FAILURES &&
+        transportFailures < MAX_TRANSPORT_FAILURES,
+    );
 
     const failure = batchFailure(outcomes);
     if (failure) return failure;

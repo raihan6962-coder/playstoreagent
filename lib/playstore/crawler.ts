@@ -29,20 +29,21 @@ import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
 /** Requests issued in parallel inside one batch (search, expand or enrich). */
-const SEARCH_CONCURRENCY = 8;
+export const SEARCH_CONCURRENCY = 16;
 /**
- * Minimum spacing between request starts. Throughput is latency-bound inside
- * a batch (the batch waits for its slowest task), so parallelism buys more
- * than tighter spacing: an A/B on the live store measured 8 × 180 ms at 1.74
- * requests/s against 6 × 150 ms at 1.36, with zero 429s either way. Spacing
- * stays generous because 8 × 120 ms was the one config that underperformed
- * (research2.test.ts R7).
+ * Minimum spacing between request starts. Throughput is bounded by the gate
+ * (1 / intervalMs) and by latency inside a batch (the batch waits for its
+ * slowest task), so both ends have to move together: production measured
+ * 4.67 req/s at 8 × 180 ms — 84% of the 5.55 gate cap, with the batch side
+ * at 8 / 1.7 s ≈ the same number. 16 × 120 ms lifts the cap to 8.3 req/s;
+ * any Play pushback still goes through RateGate.penalize, which doubles the
+ * spacing up to 4 s and creeps back after successful requests.
  */
-const CLIENT_INTERVAL_MS = 180;
+export const CLIENT_INTERVAL_MS = 120;
 /** Suggest lookups issued in parallel inside one step. */
-const SUGGEST_CONCURRENCY = 8;
+export const SUGGEST_CONCURRENCY = 16;
 /** Detail pages fetched per step to backfill lead metadata. */
-const ENRICH_CONCURRENCY = 8;
+export const ENRICH_CONCURRENCY = 16;
 /** Suggest prefixes processed per step (the rest resume later). */
 const SUGGESTS_PER_PREFIX = 10;
 /** How many "similar apps" detail pages one step may fetch. */
@@ -94,6 +95,7 @@ function emptyCounters(): SessionCounters {
     queriesRun: 0,
     pagesFetched: 0,
     requests: 0,
+    rateLimitHits: 0,
     lowestRatingSeen: null,
   };
 }
@@ -192,6 +194,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.emitted = Array.from(emitted);
     cursor.suggestions = suggestions.slice(0, MAX_SUGGESTION_QUERIES);
     cursor.counters.requests += client.requests;
+    cursor.counters.rateLimitHits += client.rateLimitHits;
     if (reason !== "budget-exhausted" && reason !== "rate-limited") {
       cursor.phase = "done";
     }

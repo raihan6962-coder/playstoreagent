@@ -67,6 +67,11 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {
   }
   const lowest = counters.lowestRatingSeen;
   if (lowest !== null && (typeof lowest !== "number" || !Number.isFinite(lowest))) return null;
+  // Optional so cursors minted before this counter existed still resume.
+  const hits = (value as Record<string, unknown>).rateLimitHits;
+  if (hits === undefined || hits === null) counters.rateLimitHits = 0;
+  else if (typeof hits !== "number" || !Number.isFinite(hits) || hits < 0) return null;
+  else counters.rateLimitHits = Math.floor(hits);
   return counters;
 }
 

@@ -66,6 +66,8 @@ export interface SessionCounters {
   queriesRun: number;
   pagesFetched: number;
   requests: number;
+  /** Play 429 / block responses seen across the session (diagnostics). */
+  rateLimitHits: number;
   lowestRatingSeen: number | null;
 }
 

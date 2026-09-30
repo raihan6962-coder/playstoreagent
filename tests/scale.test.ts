@@ -3,7 +3,12 @@ import { mergeLead } from "@/lib/client/generation";
 import { evaluateApp, leadPassesFilters } from "@/lib/filters/leadFilter";
 import { tokenizeKeyword } from "@/lib/filters/relevance";
 import { PlayClient } from "@/lib/playstore/client";
-import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
+import {
+  CLIENT_INTERVAL_MS,
+  SEARCH_CONCURRENCY,
+  createInitialCursor,
+  runGenerationStep,
+} from "@/lib/playstore/crawler";
 import type { Lead, LeadFilters, SessionCursor, StoreApp } from "@/types/lead";
 
 const live = process.env.PLAY_LIVE === "1";
@@ -24,8 +29,6 @@ describe.skipIf(!live)("live scale run", () => {
       const emitted: Lead[] = [];
       const visible = new Map<string, Lead>();
       let cursor: SessionCursor | null = createInitialCursor(KEYWORD);
-      // Same settings the server uses by default (see crawler.ts). The client
-      // is recreated per step, exactly like the route does.
       let rateLimitHits = 0;
       const startedAt = Date.now();
       const stepBudgetMs = 70_000;
@@ -38,7 +41,12 @@ describe.skipIf(!live)("live scale run", () => {
 
       while (cursor && steps < 3 && Date.now() - startedAt < 240_000) {
         steps += 1;
-        const client = new PlayClient({ concurrency: 8, intervalMs: 180 });
+        // Same settings the server uses by default (see crawler.ts). The client
+        // is recreated per step, exactly like the route does.
+        const client = new PlayClient({
+          concurrency: SEARCH_CONCURRENCY,
+          intervalMs: CLIENT_INTERVAL_MS,
+        });
         const result = await runGenerationStep({
           filters: FILTERS,
           cursor,

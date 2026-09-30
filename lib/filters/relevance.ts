@@ -86,6 +86,11 @@ export const RELEVANCE_THRESHOLD = 50;
 /**
  * Scores how strongly an app matches the requested keyword. Title matches are
  * worth the most, followed by developer, category and finally the description.
+ *
+ * An app only qualifies when it mentions *every* significant keyword word
+ * somewhere in its listing — a partial hit (only "crypto" for "crypto wallet")
+ * scores high enough to clear the numeric threshold but is not a match for the
+ * keyword the user asked for, so it is rejected.
  */
 export function scoreRelevance(
   fields: { title: string | null; developer: string | null; category: string | null; text: string | null },
@@ -126,9 +131,13 @@ export function scoreRelevance(
       ? 0
       : Math.round((total / tokens.significant.length) * 100);
 
+  const allTermsMatched =
+    tokens.significant.length > 0 &&
+    tokens.significant.every((term) => matchedTerms.includes(term));
+
   return {
     score,
     matchedTerms,
-    relevant: score >= RELEVANCE_THRESHOLD,
+    relevant: score >= RELEVANCE_THRESHOLD && allTermsMatched,
   };
 }

@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { mergeLead, runGeneration } from "@/lib/client/generation";
 import { csvFilename, leadsToCsv } from "@/lib/csv/export";
+import { leadPassesFilters } from "@/lib/filters/leadFilter";
 import {
   parseInstallInput,
   validateKeyword,
@@ -21,9 +22,18 @@ import { LeadTable } from "./lead-table";
 import { ProgressPanel } from "./progress-panel";
 import { SearchForm, type SearchValues } from "./search-form";
 
-/** Each step streams for up to ~3 minutes server-side; this bounds a full run. */
+/** Each step streams for up to ~4 minutes server-side; this bounds a full run. */
 const MAX_AUTO_RESUMES = 24;
 const MAX_AUTO_MS = 45 * 60_000;
+
+function sameFilters(a: LeadFilters, b: LeadFilters): boolean {
+  return (
+    a.keyword === b.keyword &&
+    a.maxRating === b.maxRating &&
+    a.maxInstalls === b.maxInstalls &&
+    a.limit === b.limit
+  );
+}
 
 export function Dashboard() {
   const [values, setValues] = useState<SearchValues>({
@@ -44,6 +54,8 @@ export function Dashboard() {
   const cursorRef = useRef<SessionCursor | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const runningRef = useRef(false);
+  /** Filters the leads currently on screen were qualified with. */
+  const filtersRef = useRef<LeadFilters | null>(null);
 
   function validate(): LeadFilters | null {
     const keyword = validateKeyword(values.keyword);
@@ -71,12 +83,17 @@ export function Dashboard() {
   }
 
   function handleEvent(event: GenerationEvent): void {
+    const active = filtersRef.current;
+
     switch (event.type) {
       case "progress":
         setStats(event.stats);
         setMessage(event.message);
         break;
       case "lead":
+        // Last line of defence: a row only ever reaches the table (and the CSV)
+        // if it satisfies the filters the run was started with.
+        if (active && !leadPassesFilters(event.lead, active)) break;
         setLeads((previous) =>
           previous.some((lead) => lead.packageName === event.lead.packageName)
             ? previous
@@ -85,9 +102,16 @@ export function Dashboard() {
         break;
       case "lead-update":
         setLeads((previous) =>
-          previous.map((lead) =>
-            lead.packageName === event.app.packageName ? mergeLead(lead, event.app) : lead,
-          ),
+          previous.flatMap((lead) => {
+            if (lead.packageName !== event.app.packageName) return [lead];
+            const merged = mergeLead(lead, event.app);
+            return active && !leadPassesFilters(merged, active) ? [] : [merged];
+          }),
+        );
+        break;
+      case "lead-remove":
+        setLeads((previous) =>
+          previous.filter((lead) => lead.packageName !== event.packageName),
         );
         break;
       case "warning":
@@ -109,6 +133,14 @@ export function Dashboard() {
   async function execute(resume: boolean): Promise<void> {
     const filters = validate();
     if (!filters || runningRef.current) return;
+
+    // The leads on screen were qualified with the previous settings. If those
+    // settings changed, restart instead of resuming: a resume would keep rows
+    // that no longer match and would skip packages the old rules already saw.
+    if (resume && filtersRef.current && !sameFilters(filters, filtersRef.current)) {
+      resume = false;
+    }
+    filtersRef.current = filters;
 
     runningRef.current = true;
     setRunning(true);
@@ -213,6 +245,7 @@ export function Dashboard() {
     setMessage("");
     cursorRef.current = null;
     setErrors({});
+    filtersRef.current = null;
   }
 
   function exportCsv(): void {

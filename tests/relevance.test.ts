@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { scoreRelevance, tokenizeKeyword, wordsMatch } from "@/lib/filters/relevance";
+import {
+  RELEVANCE_THRESHOLD,
+  scoreRelevance,
+  tokenizeKeyword,
+  wordsMatch,
+} from "@/lib/filters/relevance";
 
 describe("tokenizeKeyword", () => {
   it("drops stopwords but keeps meaningful words", () => {
@@ -46,5 +51,49 @@ describe("scoreRelevance", () => {
     );
     expect(result.relevant).toBe(false);
     expect(result.matchedTerms).toEqual([]);
+  });
+
+  it("rejects apps that only match part of the keyword", () => {
+    const tokens = tokenizeKeyword("crypto wallet");
+
+    const onlyCrypto = scoreRelevance(
+      { title: "Watch Crypto Complication", developer: null, category: "Personalization", text: null },
+      tokens,
+    );
+    expect(onlyCrypto.matchedTerms).toEqual(["crypto"]);
+    expect(onlyCrypto.score).toBeGreaterThanOrEqual(RELEVANCE_THRESHOLD);
+    expect(onlyCrypto.relevant).toBe(false);
+
+    const onlyWallet = scoreRelevance(
+      { title: "CKBull - Nervos Network Wallet", developer: null, category: "Finance", text: null },
+      tokens,
+    );
+    expect(onlyWallet.matchedTerms).toEqual(["wallet"]);
+    expect(onlyWallet.relevant).toBe(false);
+  });
+
+  it("accepts apps that mention every keyword word in any field", () => {
+    const tokens = tokenizeKeyword("crypto wallet");
+    const inDescriptionOnly = scoreRelevance(
+      {
+        title: "Ledger Companion",
+        developer: null,
+        category: null,
+        text: "A secure place for your cryptocurrency and hardware wallet seeds.",
+      },
+      tokens,
+    );
+
+    expect(inDescriptionOnly.matchedTerms).toEqual(["crypto", "wallet"]);
+    expect(inDescriptionOnly.relevant).toBe(true);
+  });
+
+  it("still accepts single-word keywords from any field", () => {
+    const tokens = tokenizeKeyword("wallpaper");
+    const result = scoreRelevance(
+      { title: "Nature Scenes", developer: null, category: "Personalization", text: "4k wallpaper packs" },
+      tokens,
+    );
+    expect(result.relevant).toBe(true);
   });
 });

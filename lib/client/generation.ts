@@ -104,7 +104,10 @@ export function mergeLead(base: Lead, patch: StoreApp): Lead {
     installs: patch.installs ?? base.installs,
     installsUpper: patch.installsUpper ?? base.installsUpper,
     category: patch.category ?? base.category,
-    summary: patch.summary ?? base.summary,
+    // The search snippet is what qualified the lead for the keyword; the
+    // detail page's own description lands in `description` below, so the
+    // merged record keeps both texts the store published for this app.
+    summary: base.summary ?? patch.summary,
     description: patch.description ?? base.description,
     icon: patch.icon ?? base.icon,
     urlPath: patch.urlPath ?? base.urlPath,

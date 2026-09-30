@@ -16,7 +16,8 @@ import type {
 
 export const maxDuration = 300;
 
-const DEFAULT_BUDGET_MS = 180_000;
+/** Longest step: leaves 60s of headroom below `maxDuration` for the platform. */
+const DEFAULT_BUDGET_MS = 240_000;
 const MIN_BUDGET_MS = 5_000;
 const MAX_BUDGET_MS = 240_000;
 

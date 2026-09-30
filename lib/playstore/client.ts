@@ -137,6 +137,7 @@ export class PlayClient {
   private readonly gate: RateGate;
   private readonly semaphore: Semaphore;
   private requestCount = 0;
+  private rateLimitCount = 0;
 
   constructor(options: PlayClientOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? 12_000;
@@ -148,6 +149,11 @@ export class PlayClient {
 
   get requests(): number {
     return this.requestCount;
+  }
+
+  /** How often Play pushed back with a 429/captcha during this session. */
+  get rateLimitHits(): number {
+    return this.rateLimitCount;
   }
 
   async get(url: string, extraHeaders: Record<string, string> = {}): Promise<PlayResponse> {
@@ -225,6 +231,7 @@ export class PlayClient {
         const status = response.status;
 
         if (status === 429 || looksBlocked(text, status)) {
+          this.rateLimitCount += 1;
           this.gate.penalize();
           lastError = new PlayRateLimitError();
           continue;

@@ -165,6 +165,43 @@ describe("runGenerationStep", () => {
     expect(updates.some((app) => app.packageName === "com.example.budget")).toBe(true);
   });
 
+  it("removes a lead whose detail page reports a rating above the ceiling", async () => {
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName) => {
+        if (packageName === "com.example.budget") {
+          // Search card printed 2.1; the authoritative detail page says 4.6.
+          return detailHtml(
+            { ...GOOD, ratingValue: 4.6, summary: "Track your budget" },
+            [GOOD_TWO, TOO_POPULAR_RATING, TOO_MANY_INSTALLS, IRRELEVANT].map((entry) => ({
+              ...entry,
+            })),
+            "10,000+",
+          );
+        }
+        return detailRoute(packageName);
+      },
+    });
+
+    const result = await runGenerationStep({
+      filters: filters(),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    const removes = harness.events.filter(
+      (event): event is Extract<GenerationEvent, { type: "lead-remove" }> =>
+        event.type === "lead-remove",
+    );
+    expect(removes.map((event) => event.packageName)).toEqual(["com.example.budget"]);
+    expect(harness.updates().some((app) => app.packageName === "com.example.budget")).toBe(false);
+    expect(result.stats.matched).toBe(1);
+    expect(result.message).toContain("Only 1 matching app was found");
+  });
+
   it("hands back a resumable cursor when the time budget is already spent", async () => {
     const harness = collect();
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });

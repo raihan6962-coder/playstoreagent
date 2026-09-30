@@ -1,4 +1,5 @@
 import { scoreRelevance, tokenizeKeyword } from "./relevance";
+import { roundRating } from "@/lib/parser/rating";
 import type { InstallCertainty, Lead, LeadFilters, StoreApp } from "@/types/lead";
 
 export type RejectReason =
@@ -45,6 +46,7 @@ export function toLead(app: StoreApp, filters: LeadFilters): Lead {
 
   return {
     ...app,
+    rating: roundRating(app.rating),
     playStoreUrl: buildPlayStoreUrl(app.packageName),
     keyword: filters.keyword,
     relevanceScore: relevance.score,
@@ -88,7 +90,7 @@ export function evaluateApp(
 
   if (app.rating === null) {
     reasons.push("missing-rating");
-  } else if (app.rating > filters.maxRating) {
+  } else if (roundRating(app.rating) > filters.maxRating) {
     reasons.push("rating-too-high");
   }
 
@@ -114,4 +116,52 @@ export function evaluateApp(
   }
 
   return { status, reasons, lead: null };
+}
+
+/**
+ * Re-checks a lead that is already on screen against the filters in force.
+ *
+ * This is the last line of defence before a row is rendered or exported: a
+ * user who tightens the ceiling between steps, or a detail-page merge that
+ * changed the numbers, can never leave a lead behind that breaks the rules the
+ * run is collecting under. Ratings are compared at the one-decimal precision
+ * Play prints (see {@link roundRating}).
+ */
+export function leadPassesFilters(lead: Lead, filters: LeadFilters): boolean {
+  if (lead.rating === null || roundRating(lead.rating) > filters.maxRating) return false;
+  if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
+
+  const tokens = tokenizeKeyword(filters.keyword);
+  const relevance = scoreRelevance(
+    {
+      title: lead.title,
+      developer: lead.developer,
+      category: lead.category,
+      text: [lead.summary, lead.description].filter(Boolean).join(" "),
+    },
+    tokens,
+  );
+  return relevance.relevant;
+}
+
+/** Drops every lead that no longer satisfies the current filters. */
+export function filterLeads(leads: Lead[], filters: LeadFilters): Lead[] {
+  return leads.filter((lead) => leadPassesFilters(lead, filters));
+}
+
+/**
+ * Checks the numeric fields of a freshly fetched detail page before it is
+ * merged into a lead the user can already see.
+ *
+ * The detail page reports the precise rating behind the rounded search-card
+ * value, so a merge can otherwise push a lead over the rating ceiling (4.03
+ * behind a printed "4.0"). Only the ceilings are re-checked here: whether the
+ * listing still carries the keyword is decided on the merged record, which
+ * combines the search snippet that qualified the lead with the detail page's
+ * own description — {@link leadPassesFilters} does that on the client.
+ */
+export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean {
+  if (app.rating !== null && roundRating(app.rating) > filters.maxRating) return false;
+  if (app.installs !== null && app.installs > filters.maxInstalls) return false;
+  return true;
 }

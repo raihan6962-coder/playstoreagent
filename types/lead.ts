@@ -117,6 +117,8 @@ export type GenerationEvent =
   | { type: "progress"; stats: GenerationStats; message: string }
   | { type: "lead"; lead: Lead; stats: GenerationStats }
   | { type: "lead-update"; app: StoreApp }
+  /** The detail page no longer satisfies the filters; drop the lead. */
+  | { type: "lead-remove"; packageName: string }
   | { type: "warning"; message: string }
   | {
       type: "done";

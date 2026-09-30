@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { evaluateApp } from "@/lib/filters/leadFilter";
+import {
+  detailAppQualifies,
+  evaluateApp,
+  filterLeads,
+  leadPassesFilters,
+} from "@/lib/filters/leadFilter";
 import { RELEVANCE_THRESHOLD, scoreRelevance, tokenizeKeyword } from "@/lib/filters/relevance";
-import type { LeadFilters, StoreApp } from "@/types/lead";
+import type { Lead, LeadFilters, StoreApp } from "@/types/lead";
 
 const KEYWORD = "crypto wallet";
 
@@ -133,5 +138,129 @@ describe("strict qualification rules", () => {
     const evaluation = evaluateApp(app, filters(), new Set([app.packageName]));
     expect(evaluation.status).toBe("reject");
     expect(evaluation.reasons).toEqual(["duplicate"]);
+  });
+});
+
+describe("guards for leads that are already on screen", () => {
+  const filters: LeadFilters = {
+    keyword: KEYWORD,
+    maxRating: 3.5,
+    maxInstalls: 100_000,
+    limit: 1_000,
+  };
+
+  function qualifiedLead(overrides: Partial<Lead> = {}): Lead {
+    const evaluation = evaluateApp(
+      makeApp({ title: "Crypto Wallet", rating: 3.4, installs: 90_000 }),
+      filters,
+      new Set(),
+    );
+    expect(evaluation.status).toBe("match");
+    return { ...evaluation.lead!, ...overrides };
+  }
+
+  it("keeps a lead that still satisfies the filters", () => {
+    expect(leadPassesFilters(qualifiedLead(), filters)).toBe(true);
+  });
+
+  it("keeps a lead whose rating only differs below the printed precision", () => {
+    // Play prints one decimal: a detail page reporting 3.54 is the same "3.5"
+    // the store card showed, so it stays within a 3.5 ceiling.
+    expect(leadPassesFilters(qualifiedLead({ rating: 3.54 }), filters)).toBe(true);
+    expect(leadPassesFilters(qualifiedLead({ rating: 3 }), filters)).toBe(true);
+  });
+
+  it("drops a lead whose printed rating is above the ceiling", () => {
+    expect(leadPassesFilters(qualifiedLead({ rating: 3.56 }), filters)).toBe(false);
+    expect(leadPassesFilters(qualifiedLead({ rating: 4.2 }), filters)).toBe(false);
+  });
+
+  it("drops a lead whose installs climbed above the ceiling", () => {
+    expect(leadPassesFilters(qualifiedLead({ installs: 250_000 }), filters)).toBe(false);
+  });
+
+  it("drops a lead that no longer carries the keyword", () => {
+    const lead = qualifiedLead();
+    const withoutKeyword: Lead = {
+      ...lead,
+      title: "Wallet Companion",
+      summary: null,
+      description: null,
+    };
+    expect(leadPassesFilters(withoutKeyword, filters)).toBe(false);
+
+    const stillMatched: Lead = {
+      ...lead,
+      title: "Ledger Companion",
+      summary: null,
+      description: "Keep your cryptocurrency wallet safe.",
+    };
+    expect(leadPassesFilters(stillMatched, filters)).toBe(true);
+  });
+
+  it("re-qualifies against the keyword in use, not the one it was found with", () => {
+    const lead = qualifiedLead();
+    expect(leadPassesFilters(lead, { ...filters, keyword: "budget tracker" })).toBe(false);
+  });
+
+  it("filterLeads removes exactly the rows that break the rules", () => {
+    const good = qualifiedLead({ packageName: "com.example.a" });
+    const highRating = { ...qualifiedLead({ packageName: "com.example.b" }), rating: 3.6 };
+    const highInstalls = { ...qualifiedLead({ packageName: "com.example.c" }), installs: 999_999 };
+    const irrelevant: Lead = {
+      ...qualifiedLead({ packageName: "com.example.d" }),
+      title: "Puzzle Game",
+      summary: null,
+      description: null,
+    };
+
+    const kept = filterLeads([good, highRating, highInstalls, irrelevant], filters);
+    expect(kept.map((lead) => lead.packageName)).toEqual(["com.example.a"]);
+  });
+
+  it("detailAppQualifies rejects a printed rating above the ceiling", () => {
+    expect(
+      detailAppQualifies(makeApp({ title: "Crypto Wallet", rating: 3.56, installs: 10_000 }), filters),
+    ).toBe(false);
+    expect(
+      detailAppQualifies(makeApp({ title: "Crypto Wallet", rating: 4.6, installs: 10_000 }), filters),
+    ).toBe(false);
+    // 3.54 is the store's "3.5": same number the user sees on Play.
+    expect(
+      detailAppQualifies(makeApp({ title: "Crypto Wallet", rating: 3.54, installs: 10_000 }), filters),
+    ).toBe(true);
+    expect(
+      detailAppQualifies(makeApp({ title: "Crypto Wallet", rating: 3.5, installs: 10_000 }), filters),
+    ).toBe(true);
+  });
+
+  it("detailAppQualifies keeps the search values when the detail page lacks them", () => {
+    const partial = makeApp({
+      title: "Crypto Wallet",
+      rating: null,
+      installs: null,
+      installsRaw: null,
+      summary: "Store your cryptocurrency wallet.",
+      description: null,
+    });
+    expect(detailAppQualifies(partial, filters)).toBe(true);
+  });
+
+  it("detailAppQualifies only judges the numeric ceilings", () => {
+    // Keyword matching for a merge is decided on the merged record (search
+    // snippet + detail description) by leadPassesFilters, not on the detail
+    // page's short JSON-LD blurb alone.
+    expect(
+      detailAppQualifies(makeApp({ title: "Puzzle Game", rating: 1, installs: 100 }), filters),
+    ).toBe(true);
+    expect(
+      detailAppQualifies(makeApp({ title: "Puzzle Game", rating: 4.9, installs: 100 }), filters),
+    ).toBe(false);
+    expect(
+      detailAppQualifies(
+        makeApp({ title: "Puzzle Game", rating: 1, installs: 1_000_000 }),
+        filters,
+      ),
+    ).toBe(false);
   });
 });

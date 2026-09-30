@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { tokenizeKeyword } from "@/lib/filters/relevance";
 import { PlayClient } from "@/lib/playstore/client";
 import { fetchAppDetail } from "@/lib/playstore/detail";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
@@ -15,13 +16,14 @@ const LIVE = process.env.PLAY_LIVE === "1";
 
 const liveDescribe = describe.skipIf(!LIVE);
 
-function satisfied(lead: Lead, maxRating: number, maxInstalls: number): boolean {
+function satisfied(lead: Lead, keyword: string, maxRating: number, maxInstalls: number): boolean {
+  const terms = tokenizeKeyword(keyword).significant;
   return (
     lead.rating !== null &&
     lead.rating <= maxRating &&
     lead.installs !== null &&
     lead.installs <= maxInstalls &&
-    lead.relevanceScore >= 50
+    terms.every((term) => lead.relevanceTerms.includes(term))
   );
 }
 
@@ -88,7 +90,7 @@ liveDescribe("live Play Store", () => {
       expect(result.stats.evaluated).toBeGreaterThan(0);
       expect(events.some((event) => event.type === "progress")).toBe(true);
       for (const lead of leads) {
-        expect(satisfied(lead, maxRating, maxInstalls)).toBe(true);
+        expect(satisfied(lead, "budget tracker", maxRating, maxInstalls)).toBe(true);
       }
     },
     120_000,

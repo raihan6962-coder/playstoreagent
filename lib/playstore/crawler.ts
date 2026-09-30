@@ -1,4 +1,5 @@
-import { evaluateApp } from "@/lib/filters/leadFilter";
+import { detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
+import { roundRating } from "@/lib/parser/rating";
 import type {
   DoneReason,
   GenerationEvent,
@@ -28,11 +29,20 @@ import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
 /** Requests issued in parallel inside one batch (search, expand or enrich). */
-const SEARCH_CONCURRENCY = 6;
+const SEARCH_CONCURRENCY = 8;
+/**
+ * Minimum spacing between request starts. Throughput is latency-bound inside
+ * a batch (the batch waits for its slowest task), so parallelism buys more
+ * than tighter spacing: an A/B on the live store measured 8 × 180 ms at 1.74
+ * requests/s against 6 × 150 ms at 1.36, with zero 429s either way. Spacing
+ * stays generous because 8 × 120 ms was the one config that underperformed
+ * (research2.test.ts R7).
+ */
+const CLIENT_INTERVAL_MS = 180;
 /** Suggest lookups issued in parallel inside one step. */
-const SUGGEST_CONCURRENCY = 6;
+const SUGGEST_CONCURRENCY = 8;
 /** Detail pages fetched per step to backfill lead metadata. */
-const ENRICH_CONCURRENCY = 6;
+const ENRICH_CONCURRENCY = 8;
 /** Suggest prefixes processed per step (the rest resume later). */
 const SUGGESTS_PER_PREFIX = 10;
 /** How many "similar apps" detail pages one step may fetch. */
@@ -59,9 +69,9 @@ const BATCH_HEADROOM_MS = 5_000;
 /**
  * Detail pages and searches share every batch: walking "similar apps" measured
  * ~6x the qualified leads per request of a fresh search (see research3.test.ts),
- * so a healthy seed queue keeps half of the batch busy with expansion.
+ * so a healthy seed queue keeps a large share of the batch busy with expansion.
  */
-const EXPAND_SLOTS_FULL = 3;
+const EXPAND_SLOTS_FULL = 4;
 const EXPAND_SLOTS_SPARSE = 1;
 /** Seed queue size considered "healthy" for a full expansion slot share. */
 const EXPAND_QUEUE_HEALTHY = 12;
@@ -152,7 +162,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   const cursor = options.cursor;
   const client =
     options.client ??
-    new PlayClient({ concurrency: SEARCH_CONCURRENCY, intervalMs: 180 });
+    new PlayClient({ concurrency: SEARCH_CONCURRENCY, intervalMs: CLIENT_INTERVAL_MS });
   const startedAt = Date.now();
   const deadline = startedAt + budgetMs;
 
@@ -280,6 +290,36 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     return null;
   }
 
+  /**
+   * Applies an authoritative detail page to a lead the user may already be
+   * looking at.
+   *
+   * The detail page reports the precise rating behind the rounded search-card
+   * value (3.54 behind a printed "3.5"), so a merge can push a lead over the
+   * rating ceiling the user set. When the detail data no longer qualifies the
+   * lead it is removed again — with its counters, so the reported total always
+   * matches what the table and the CSV show.
+   */
+  function applyDetail(pkg: string, app: StoreApp | null): void {
+    if (!app || app.packageName !== pkg) return;
+
+    const qualifies = detailAppQualifies(app, filters);
+    if (qualifies) {
+      // The store prints one decimal; hand the client the same number Play
+      // shows so the table and the CSV never differ from the store listing.
+      if (emitted.has(pkg)) emit({ type: "lead-update", app: { ...app, rating: roundRating(app.rating) } });
+      return;
+    }
+
+    if (!emitted.has(pkg)) return;
+    emitted.delete(pkg);
+    if (queuedEnrich.delete(pkg)) {
+      cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
+    }
+    if (cursor.counters.matched > 0) cursor.counters.matched -= 1;
+    emit({ type: "lead-remove", packageName: pkg });
+  }
+
   async function runSearchTask(entry: QueryPlanEntry): Promise<TaskOutcome> {
     if (options.aborted?.()) return "ok";
     try {
@@ -338,8 +378,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (cursor.enrichQueue.includes(seed.p)) {
         cursor.enrichQueue = cursor.enrichQueue.filter((pkg) => pkg !== seed.p);
         queuedEnrich.delete(seed.p);
-        if (detail.app) emit({ type: "lead-update", app: detail.app });
       }
+      applyDetail(seed.p, detail.app);
 
       if (ingest(detail.similarApps)) return "target";
       return "ok";
@@ -374,7 +414,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       parseFailures = 0;
       transportFailures = 0;
 
-      if (detail.app) emit({ type: "lead-update", app: detail.app });
+      applyDetail(pkg, detail.app);
       if (!expanded.has(pkg)) {
         expanded.add(pkg);
         cursor.expanded.push(pkg);

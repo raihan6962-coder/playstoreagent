@@ -11,15 +11,17 @@ to the browser in real time and exports them as CSV.
 ## What it does
 
 1. Enter a keyword, a maximum rating (e.g. `3.0`), a maximum install count
-   (e.g. `100K`) and how many leads you want (1–100).
+   (e.g. `100K`) and how many leads you want (1–1,000).
 2. The server searches the Play Store, starting with your keyword and then a
-   plan of ~30 related queries (suggestions, variants, long-tail modifiers,
-   other locales, free/paid filters).
+   plan of related queries (suggestions, variants, long-tail modifiers,
+   40+ storefront locales, free/paid filters).
 3. Every app card is scored for keyword relevance and qualified against your
    rating and install ceilings. Matches stream to the table immediately.
-4. Confirmed leads are enriched with the ratings count from their detail page,
-   and relevant results seed a "similar apps" expansion pass so the search can
-   reach apps the keyword plan alone would miss.
+4. Confirmed leads are enriched from their detail page — the ratings count, the
+   precise rating and the install bucket are re-checked there, and a lead that
+   would break a ceiling is removed again (`lead-remove`) — and relevant
+   results seed a "similar apps" expansion pass so the search can reach apps
+   the keyword plan alone would miss.
 5. Generation stops as soon as the requested number of leads is found.
 6. Export the results to CSV (RFC 4180, Excel-friendly BOM).
 
@@ -71,14 +73,17 @@ tests/                    vitest suites + fixtures + optional live tests
 ### Real-time streaming
 
 `POST /api/generate` replies with `text/event-stream`. Events are `progress`,
-`lead`, `lead-update`, `warning`, `done` and `error`. The browser renders each
-`lead` the moment the server finds it.
+`lead`, `lead-update`, `lead-remove`, `warning`, `done` and `error`. The browser
+renders each `lead` the moment the server finds it, and every event passes the
+same qualification check on the client before a row can appear in the table or
+the CSV — if the settings change between steps, the run restarts with the new
+settings instead of keeping rows that no longer match.
 
 ### Resumable sessions (serverless friendly)
 
 The Play Store has no working pagination for search results, so depth comes from
 running a plan of queries. Each invocation works under a time budget
-(`GENERATION_BUDGET_MS`, default 25 s) and, when the budget runs out, returns
+(`GENERATION_BUDGET_MS`, default 240 s) and, when the budget runs out, returns
 the `done` event with a **cursor** (query plan position, dedupe set, expansion
 and enrichment queues, counters). The client replays that cursor on the next
 request and the session continues exactly where it stopped. Cursors are fully
@@ -90,8 +95,8 @@ An app becomes a lead only when **all** of these hold:
 
 | Rule | Behaviour |
 | --- | --- |
-| Keyword relevance | weighted match across title / developer / category / description, score ≥ 50 |
-| Rating | present and `rating <= maxRating` |
+| Keyword relevance | **every** significant word of the keyword must appear in the listing (title / developer / category / description); weighted score is kept for ranking |
+| Rating | present and `rating <= maxRating`, compared and stored at the one-decimal precision Play prints |
 | Installs | parseable and `installs <= maxInstalls` |
 | Duplicate | seen earlier in the session |
 
@@ -100,11 +105,16 @@ Missing ratings and missing/unparseable install counts **never** qualify.
 Install counts are store buckets (`"10,000+"`), so they are treated as lower
 bounds and flagged with `installCertainty: "bucket"`.
 
+Detail pages are authoritative: after enrichment a lead is re-checked against
+the ceilings (and re-matched against the keyword on the combined search +
+detail text). A lead that no longer qualifies is removed from the table rather
+than left on screen with numbers that break the rules it was collected with.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GENERATION_BUDGET_MS` | `25000` | work budget per SSE invocation (5 000–240 000) |
+| `GENERATION_BUDGET_MS` | `240000` | work budget per SSE invocation (5 000–240 000) |
 
 No other environment variables are required. Nothing secret is shipped to the
 browser: all Play Store access happens in the route handler.

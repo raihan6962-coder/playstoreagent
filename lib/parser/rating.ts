@@ -32,3 +32,18 @@ export function parseRatingsCount(input: unknown): number | null {
   if (!Number.isFinite(value) || value < 0) return null;
   return Math.round(value);
 }
+
+/**
+ * Ratings are compared and stored at the one-decimal precision Play itself
+ * prints: a detail page reports 4.03 where the store card and the app's Play
+ * listing both show "4.0". Rounding to that precision keeps the number in the
+ * table and in the CSV identical to what the user sees on Play, and stops a
+ * sub-display rounding difference from disqualifying an app that visibly
+ * satisfies the ceiling.
+ */
+export function roundRating(value: number): number;
+export function roundRating(value: number | null): number | null;
+export function roundRating(value: number | null): number | null {
+  if (value === null) return null;
+  return Math.round(value * 10) / 10;
+}

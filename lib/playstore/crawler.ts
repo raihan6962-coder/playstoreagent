@@ -35,13 +35,13 @@ export const SEARCH_CONCURRENCY = 24;
 /**
  * Minimum spacing between request starts. Throughput is bounded by the gate
  * (1 / intervalMs) and by latency inside a window, so both ends move together:
- * production measured 8.0–8.2 req/s at 16 × 120 ms (gate cap 8.3) across two
- * full E2E runs. 100 ms widens the cap to 10 req/s and 24 slots keep the
- * window full at typical Play latency; any pushback still goes through
- * RateGate.penalize, which doubles the spacing up to 4 s and creeps back
- * after successful requests.
+ * production measured 8.0–8.2 req/s at 16 × 120 ms (cap 8.3) and then
+ * 9.5 req/s at 24 × 100 ms (cap 10) across full E2E runs — consistently
+ * gate-bound, so the spacing drops to 80 ms (cap 12.5) with the same 24
+ * slots. Any Play pushback still goes through RateGate.penalize, which
+ * doubles the spacing up to 4 s and creeps back after successful requests.
  */
-export const CLIENT_INTERVAL_MS = 100;
+export const CLIENT_INTERVAL_MS = 80;
 /** Suggest lookups issued in parallel inside one step. */
 export const SUGGEST_CONCURRENCY = 24;
 /** Detail pages fetched per step to backfill lead metadata. */
@@ -86,8 +86,8 @@ const BATCH_HEADROOM_MS = 5_000;
  * research3.test.ts), so a healthy seed queue gets the larger half of the
  * window — eight of 24 slots — and a sparse queue still gets a quarter.
  */
-const EXPAND_SLOTS_FULL = 8;
-const EXPAND_SLOTS_SPARSE = 2;
+const EXPAND_SLOTS_FULL = 10;
+const EXPAND_SLOTS_SPARSE = 3;
 /** Seed queue size considered "healthy" for the full expansion slot share. */
 const EXPAND_QUEUE_HEALTHY = 8;
 

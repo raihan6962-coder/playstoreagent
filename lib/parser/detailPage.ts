@@ -51,6 +51,33 @@ function findPackageName(html: string, fallback?: string): string | null {
   return anyMatch ? anyMatch[1] : null;
 }
 
+/**
+ * Contact email Play publishes on the listing itself:
+ *  1. the rendered support anchor (`href="mailto:…"`) — the address the store
+ *     shows next to "Support email";
+ *  2. the developer-contact block Play embeds in the page data
+ *     (`["Dev Name",["email@example.com"],["address…"]])`.
+ *
+ * Deliberately not a free-floating email scan: descriptions quote addresses
+ * belonging to other products, and those must never end up on a lead row.
+ * Returns null when the developer publishes no address — that is the honest
+ * value for a listing without one.
+ */
+const SUPPORT_EMAIL_PATTERNS = [
+  /href="mailto:([^"&?#\s<>]+)"/i,
+  /\["[^"\[\]]{1,80}",\["([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"\]/,
+];
+
+function readDeveloperEmail(html: string): string | null {
+  for (const pattern of SUPPORT_EMAIL_PATTERNS) {
+    const match = pattern.exec(html);
+    if (!match) continue;
+    const email = match[1].trim();
+    if (email.length > 0 && email.length <= 254 && email.includes("@")) return email;
+  }
+  return null;
+}
+
 function collectAllApps(html: string): StoreApp[] {
   const merged = new Map<string, StoreApp>();
   for (const script of extractAfScripts(html)) {
@@ -98,6 +125,7 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
         description: jsonLd?.description ? truncate(stripHtml(jsonLd.description), 4_000) : null,
         icon: jsonLd?.image ?? fromAf?.icon ?? null,
         urlPath: fromAf?.urlPath ?? `/store/apps/details?id=${encodeURIComponent(packageName)}`,
+        email: readDeveloperEmail(html),
       };
     }
   }

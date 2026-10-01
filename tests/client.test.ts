@@ -63,4 +63,33 @@ describe("PlayClient concurrency", () => {
       client.get("https://play.google.com/store/search?c=apps&q=x"),
     ).rejects.toBeInstanceOf(PlayRateLimitError);
   });
+
+  it("times out when headers arrive but the body never does", async () => {
+    // Regression: the abort timer used to be cleared the moment headers
+    // arrived, so a throttled connection that stalled the payload blocked
+    // `response.text()` forever and deadlocked every window behind it.
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () =>
+            controller.error(init.signal?.reason ?? new Error("aborted")),
+          );
+          // Headers are "sent"; the payload never arrives.
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new PlayClient({
+      concurrency: 1,
+      intervalMs: 1,
+      retries: 0,
+      timeoutMs: 300,
+    });
+    const startedAt = Date.now();
+    await expect(
+      client.get("https://play.google.com/store/search?c=apps&q=x"),
+    ).rejects.toThrow(/Timed out/);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
 });

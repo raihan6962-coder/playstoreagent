@@ -33,6 +33,20 @@ describe("wordsMatch", () => {
     expect(wordsMatch("wallet", "wallpapers")).toBe(false);
     expect(wordsMatch("wallet", "wallreels")).toBe(false);
     expect(wordsMatch("money", "monkey")).toBe(false);
+    // Production case: a developer named "RED BRIX WALL" made "Alice's Hotel"
+    // a lead for "wallet" — the fully shared four-letter onset is not an
+    // inflection.
+    expect(wordsMatch("wallet", "wall")).toBe(false);
+    expect(wordsMatch("wallet", "wal")).toBe(false);
+    expect(wordsMatch("wallet", "walle")).toBe(false);
+  });
+
+  it("keeps short inflections and short keyword stems working", () => {
+    expect(wordsMatch("note", "notes")).toBe(true);
+    expect(wordsMatch("note", "noted")).toBe(true);
+    expect(wordsMatch("key", "keys")).toBe(true);
+    expect(wordsMatch("sol", "solana")).toBe(true);
+    expect(wordsMatch("bit", "bitcoin")).toBe(true);
   });
 });
 
@@ -105,5 +119,34 @@ describe("scoreRelevance", () => {
       tokens,
     );
     expect(result.relevant).toBe(true);
+  });
+
+  it("never qualifies an app on a developer or category hit alone", () => {
+    // Production case: six leads qualified because their publisher's domain
+    // was "walletpasses.me" while title and description described remotes
+    // and authenticators. The hit still registers as a partial for queueing.
+    const tokens = tokenizeKeyword("wallet");
+    const devOnly = scoreRelevance(
+      {
+        title: "Universal TV Remote Controller",
+        developer: "walletpasses.me",
+        category: "Tools",
+        text: "Turn your phone into a universal remote.",
+      },
+      tokens,
+    );
+    expect(devOnly.matchedTerms).toEqual(["wallet"]);
+    expect(devOnly.relevant).toBe(false);
+
+    const descOnly = scoreRelevance(
+      {
+        title: "Ledger Companion",
+        developer: "Some Dev",
+        category: "Finance",
+        text: "Keep your hardware wallet seeds safe.",
+      },
+      tokenizeKeyword("wallet"),
+    );
+    expect(descOnly.relevant).toBe(true);
   });
 });

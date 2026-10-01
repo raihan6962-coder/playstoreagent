@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateApp, toLead } from "@/lib/filters/leadFilter";
+import { cardCanStillQualify, evaluateApp, FOREIGN_RATING_WINDOW, toLead } from "@/lib/filters/leadFilter";
 import type { LeadFilters, StoreApp } from "@/types/lead";
 
 const filters: LeadFilters = {
@@ -75,6 +75,21 @@ describe("evaluateApp", () => {
     const result = evaluateApp(app({ installs: 100_000, installsRaw: "100,000+" }), filters, new Set());
     expect(result.status).toBe("match");
   });
+
+  it("reports which keyword terms the card text matched", () => {
+    expect(evaluateApp(app(), filters, new Set()).matchedTerms).toEqual(["budget", "tracker"]);
+    // One of two terms — the card is partial, not irrelevant: worth a detail
+    // fetch because the listing's description may carry the other term.
+    const partial = evaluateApp(app({ title: "Budget Only", summary: null }), filters, new Set());
+    expect(partial.status).toBe("reject");
+    expect(partial.matchedTerms).toEqual(["budget"]);
+    expect(
+      evaluateApp(app({ title: "Zombie Run", summary: "run away" }), filters, new Set()).matchedTerms,
+    ).toEqual([]);
+    expect(
+      evaluateApp(app(), filters, new Set(["com.example.budget"])).matchedTerms,
+    ).toEqual([]);
+  });
 });
 
 describe("toLead", () => {
@@ -95,5 +110,39 @@ describe("toLead", () => {
     const lead = toLead(app(), { ...filters, country: "BD" });
     expect(lead.playStoreUrl).toContain("gl=BD");
     expect(toLead(app(), filters).playStoreUrl).toContain("gl=US");
+  });
+
+  it("carries the listing's contact email, null when there is none", () => {
+    expect(toLead(app({ email: "dev@example.com" }), filters).email).toBe("dev@example.com");
+    expect(toLead(app(), filters).email).toBeNull();
+  });
+});
+
+describe("cardCanStillQualify", () => {
+  it("treats the run's own storefront as final", () => {
+    // Home card already shows the rating — a detail fetch can only repeat it.
+    expect(cardCanStillQualify({ rating: 3.8, installs: 10_000 }, filters, true)).toBe(false);
+    expect(cardCanStillQualify({ rating: 2.9, installs: 10_000 }, filters, true)).toBe(true);
+    expect(cardCanStillQualify({ rating: null, installs: null }, filters, true)).toBe(true);
+  });
+
+  it("treats foreign ratings above the ceiling as final too", () => {
+    // Measured live (research R6): home storefronts rate these apps *higher*
+    // than foreign ones — 0 of 10 foreign cards printed 3.6–4.5 passed at
+    // home — so a foreign card over the ceiling is a known miss, and only a
+    // card at or below the ceiling earns a detail fetch.
+    expect(FOREIGN_RATING_WINDOW).toBe(0);
+    expect(cardCanStillQualify({ rating: 3.0, installs: 10_000 }, filters, false)).toBe(true);
+    expect(cardCanStillQualify({ rating: 3.1, installs: 10_000 }, filters, false)).toBe(false);
+    expect(cardCanStillQualify({ rating: 3.0, installs: 10_000 }, filters, true)).toBe(true);
+    expect(cardCanStillQualify({ rating: 3.1, installs: 10_000 }, filters, true)).toBe(false);
+    expect(cardCanStillQualify({ rating: null, installs: null }, filters, false)).toBe(true);
+  });
+
+  it("always drops an over-cap install bucket", () => {
+    // Play prints the same install bucket on every storefront.
+    expect(cardCanStillQualify({ rating: 2.0, installs: 1_000_000 }, filters, true)).toBe(false);
+    expect(cardCanStillQualify({ rating: 2.0, installs: 1_000_000 }, filters, false)).toBe(false);
+    expect(cardCanStillQualify({ rating: null, installs: 10_000 }, filters, false)).toBe(true);
   });
 });

@@ -68,17 +68,25 @@ function commonPrefixLength(a: string, b: string): number {
  * Matches lightly inflected forms of the same word: "wallet"/"wallets",
  * "tracker"/"tracking", "crypto"/"cryptocurrency".
  *
- * The shared prefix must reach deep into the shorter word (five characters,
- * or all of it when it is shorter). A looser four-letter rule made
- * "wallet" match "wallpapers" — unrelated words that merely start alike are
- * not inflections of each other, and the false positives it let through were
- * real rows in the user's table.
+ * From five characters up the shared prefix must reach five characters.
+ * Below that the shorter word must be fully consumed *and* the leftover on
+ * the longer one must be a plain inflection ending (-s, -ed, -ing, ...):
+ * an earlier rule that accepted any fully shared prefix let "wall" match
+ * "wallet" — a developer named "RED BRIX WALL" produced "Alice's Hotel" rows
+ * for the keyword "wallet". Genuinely short keyword stems still extend into
+ * longer words ("sol" -> "solana").
  */
 export function wordsMatch(keywordWord: string, textWord: string): boolean {
   if (keywordWord === textWord) return true;
   const shorter = Math.min(keywordWord.length, textWord.length);
-  if (shorter < 4) return keywordWord.startsWith(textWord) || textWord.startsWith(keywordWord);
-  return commonPrefixLength(keywordWord, textWord) >= Math.min(shorter, 5);
+  if (shorter >= 6) return commonPrefixLength(keywordWord, textWord) >= 5;
+  const prefix = commonPrefixLength(keywordWord, textWord);
+  if (prefix < shorter) return false;
+  const longer = keywordWord.length >= textWord.length ? keywordWord : textWord;
+  const rest = longer.slice(shorter);
+  if (/^(?:d|s|es|ed|ing|er|ers|ly|ies)$/.test(rest)) return true;
+  if (keywordWord.length < 4 && rest.length <= 8) return true;
+  return false;
 }
 
 export interface RelevanceResult {
@@ -93,24 +101,29 @@ export const RELEVANCE_THRESHOLD = 50;
  * Scores how strongly an app matches the requested keyword. Title matches are
  * worth the most, followed by developer, category and finally the description.
  *
- * An app only qualifies when it mentions *every* significant keyword word
- * somewhere in its listing — a partial hit (only "crypto" for "crypto wallet")
- * scores high enough to clear the numeric threshold but is not a match for the
- * keyword the user asked for, so it is rejected.
+ * An app only qualifies when it mentions *every* significant keyword word in
+ * its **title or description** — the two fields that describe what the app is.
+ * A hit confined to the developer or category (six live leads qualified
+ * because their publisher's domain was "walletpasses.me") still counts as a
+ * partial hit for seeding and queueing, but can never satisfy the keyword on
+ * its own. A partial hit (only "crypto" for "crypto wallet") scores high
+ * enough to clear the numeric threshold but is not a match for the keyword
+ * the user asked for, so it is rejected.
  */
 export function scoreRelevance(
   fields: { title: string | null; developer: string | null; category: string | null; text: string | null },
   tokens: KeywordTokens,
 ): RelevanceResult {
   const haystacks = [
-    { text: fields.title, weight: 1 },
-    { text: fields.developer, weight: 0.9 },
-    { text: fields.category, weight: 0.85 },
-    { text: fields.text, weight: 0.7 },
+    { text: fields.title, weight: 1, primary: true },
+    { text: fields.developer, weight: 0.9, primary: false },
+    { text: fields.category, weight: 0.85, primary: false },
+    { text: fields.text, weight: 0.7, primary: true },
   ]
     .filter((entry) => (entry.text ?? "").trim().length > 0)
     .map((entry) => ({
       weight: entry.weight,
+      primary: entry.primary,
       words: (entry.text as string)
         .split(/[^\p{L}\p{N}]+/u)
         .map(normalizeWord)
@@ -119,16 +132,22 @@ export function scoreRelevance(
     .filter((entry) => entry.words.length > 0);
 
   const matchedTerms: string[] = [];
+  const primaryTerms: string[] = [];
   let total = 0;
 
   for (const term of tokens.significant) {
     let best = 0;
+    let primary = false;
     for (const haystack of haystacks) {
       const matched = haystack.words.some((word) => wordsMatch(term, word));
-      if (matched && haystack.weight > best) best = haystack.weight;
+      if (matched) {
+        if (haystack.primary) primary = true;
+        if (haystack.weight > best) best = haystack.weight;
+      }
       if (best === 1) break;
     }
     if (best > 0) matchedTerms.push(term);
+    if (primary) primaryTerms.push(term);
     total += best;
   }
 
@@ -139,7 +158,7 @@ export function scoreRelevance(
 
   const allTermsMatched =
     tokens.significant.length > 0 &&
-    tokens.significant.every((term) => matchedTerms.includes(term));
+    tokens.significant.every((term) => primaryTerms.includes(term));
 
   return {
     score,

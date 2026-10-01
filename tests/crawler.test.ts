@@ -84,8 +84,12 @@ function detailRoute(packageName: string): string {
   const main = all.find((entry) => entry.packageName === packageName);
   if (!main) return searchHtml([]);
   const similar = all.filter((entry) => entry.packageName !== packageName);
+  // An irrelevant listing keeps its own text on its own page: only fetching
+  // it (description rescue) would ever read it, and it still must not pass.
+  const summary =
+    main.packageName === IRRELEVANT.packageName ? "Run from the undead horde" : "Track your budget";
   return detailHtml(
-    { ...main, summary: "Track your budget" },
+    { ...main, summary },
     similar.map((entry) => ({ ...entry })),
     main.installs ?? "10,000+",
   );
@@ -500,5 +504,263 @@ describe("runGenerationStep", () => {
     expect(second.leads().length).toBeGreaterThan(0);
     expect(resumed.reason).toBe("plan-exhausted");
     expect(resumed.stats.matched).toBe(second.leads().length);
+  });
+
+  it("recovers a partial keyword match from the detail page's full description", async () => {
+    // The card proves "crypto" but not "wallet": dropped at card level before,
+    // the listing's description completes the keyword once fetched.
+    const PARTIAL = {
+      packageName: "com.example.cryptokeep",
+      title: "Crypto Keeper",
+      rating: "2.3",
+      ratingValue: 2.3,
+      installs: "10,000+",
+      summary: "Cold storage",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(PARTIAL)]),
+      detail: () =>
+        detailHtml(
+          { ...PARTIAL, summary: "A crypto wallet for cold storage", email: "hi@cryptokeep.io" },
+          [],
+          "10,000+",
+        ),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    const leads = harness.leads();
+    expect(leads.map((lead) => lead.packageName)).toContain("com.example.cryptokeep");
+    expect(result.stats.candidates).toBeGreaterThan(0);
+    expect(result.stats.verifyRejected).toBe(0);
+    expect(result.stats.matched).toBe(1);
+    expect(result.reason).toBe("plan-exhausted");
+    // The contact email rides along with the verified lead.
+    expect(leads[0].email).toBe("hi@cryptokeep.io");
+    expect(harness.events.filter((event) => event.type === "lead-remove")).toHaveLength(0);
+  });
+
+  it("fetches a zero-term card whose numbers pass to read its description", async () => {
+    // Play returned this listing for the query, but the card's own truncated
+    // text (title + snippet) carries no keyword term — only the detail page's
+    // full description can prove relevance, and both printed numbers already
+    // pass, so the card is worth exactly one fetch.
+    const NO_CARD_TERMS = {
+      packageName: "com.example.ledgerly",
+      title: "Ledgerly",
+      rating: "2.9",
+      ratingValue: 2.9,
+      installs: "50,000+",
+      summary: "Manage your money",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(NO_CARD_TERMS)]),
+      detail: () =>
+        detailHtml(
+          { ...NO_CARD_TERMS, summary: "A crypto wallet for careful people" },
+          [],
+          "50,000+",
+        ),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads().map((lead) => lead.packageName)).toContain("com.example.ledgerly");
+    expect(result.stats.candidates).toBeGreaterThan(0);
+    expect(result.stats.verifyRejected).toBe(0);
+    expect(result.stats.matched).toBe(1);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("never queues a zero-term card whose printed numbers are already hopeless", async () => {
+    // The description rescue only fires when both ceilings pass on the card:
+    // a zero-term listing rated 4.6 under a 3.0 ceiling is a known miss on
+    // every storefront, so no request is spent proving it again.
+    const HOPELESS = {
+      packageName: "com.example.ledgerly.premium",
+      title: "Ledgerly Premium",
+      rating: "4.6",
+      ratingValue: 4.6,
+      installs: "50,000+",
+      summary: "Manage your money",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(HOPELESS)]),
+      detail: () => detailHtml({ ...HOPELESS, summary: "A crypto wallet for careful people" }),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.stats.candidates).toBe(0);
+    expect(result.stats.verifyRejected).toBe(0);
+    expect(result.stats.matched).toBe(0);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("never shows a partial match whose detail page still lacks the full keyword", async () => {
+    const PARTIAL = {
+      packageName: "com.example.cryptokeep",
+      title: "Crypto Keeper",
+      rating: "2.3",
+      ratingValue: 2.3,
+      installs: "10,000+",
+      summary: "Cold storage",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(PARTIAL)]),
+      // The description still never says "wallet": the fetch settles it as a
+      // reject, and the row must never appear.
+      detail: () => detailHtml({ ...PARTIAL, summary: "Cold storage only" }, [], "10,000+"),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.stats.candidates).toBeGreaterThan(0);
+    expect(result.stats.verifyRejected).toBeGreaterThan(0);
+    expect(result.stats.matched).toBe(0);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("verifies a fully relevant card whose rating the search card could not report", async () => {
+    // Some cards print no rating at all: the card is relevant and the
+    // installs pass, but without a number the old flow never verified it.
+    const NO_CARD_RATING = {
+      packageName: "com.example.budget.dark",
+      title: "Budget Tracker Dark",
+      rating: null,
+      ratingValue: 2.4,
+      installs: "10,000+",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(NO_CARD_RATING)]),
+      detail: () =>
+        detailHtml({ ...NO_CARD_RATING, summary: "Track your budget" }, [], "10,000+"),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 10 }),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget.dark"]);
+    expect(result.stats.candidates).toBeGreaterThan(0);
+    expect(result.stats.verifyRejected).toBe(0);
+  });
+
+  it("queues unrated home cards behind rated ones", async () => {
+    // Live runs measured 521 unrated fetches spending the verify budget ahead
+    // of rated candidates: unrated cards may still get their one authoritative
+    // fetch, but never in front of a card that can pass today.
+    const UNRATED = {
+      packageName: "com.example.crypto.unrated",
+      title: "Crypto Keeper Dark",
+      rating: null,
+      ratingValue: null,
+      installs: "10,000+",
+      summary: "Cold storage",
+    };
+    const RATED = {
+      packageName: "com.example.crypto.rated",
+      title: "Crypto Keeper",
+      rating: "2.3",
+      ratingValue: 2.3,
+      installs: "10,000+",
+      summary: "Cold storage",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(UNRATED), makeAppEntry(RATED)]),
+      // Every detail fetch fails as a transport error: the entries stay
+      // queued (pendingRetried only defers them) so the order is readable.
+      detail: () => {
+        throw new Error("network down");
+      },
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(result.cursor?.candidateQueue.map((entry) => entry.p)).toEqual([
+      "com.example.crypto.rated",
+      "com.example.crypto.unrated",
+    ]);
+    expect(result.stats.homeQueued).toBe(2);
+  });
+
+  it("rejects a match whose detail page carries no text of its own", async () => {
+    // The card snippet read as a full match ("budget tracker" in the summary),
+    // but the detail page arrives with numbers only — no JSON-LD description,
+    // no AF summary. Falling back to the card's snippet there let a live run
+    // emit an "Alice's Hotel" lead for "wallet" whose real listing never said
+    // the word; the detail page must confirm the text itself or the entry
+    // rejects.
+    const CARD = {
+      packageName: "com.example.cash.helper",
+      title: "Cash Helper",
+      rating: "2.5",
+      ratingValue: 2.5,
+      installs: "10,000+",
+      summary: "Track your budget tracker monthly",
+    };
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(CARD)]),
+      detail: () =>
+        detailHtml({ ...CARD, summary: null }).replace(
+          /<script type="application\/ld\+json"[^>]*>[\s\S]*?<\/script>/,
+          "",
+        ),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 10 }),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.stats.verifyTextRejected).toBeGreaterThan(0);
+    expect(result.stats.matched).toBe(0);
   });
 });

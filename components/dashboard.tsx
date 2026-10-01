@@ -45,8 +45,12 @@ function sameFilters(a: LeadFilters, b: LeadFilters): boolean {
 export function Dashboard() {
   const [values, setValues] = useState<SearchValues>({
     keyword: "",
-    maxRating: "3",
-    maxInstalls: "100000",
+    // 4 / 500 K is the tightest pair that still surfaces a healthy share of
+    // the market: popular keyword apps cluster at 4.0–4.4, and the outreach
+    // point is small publishers — at 3 / 100 K the pool for a head keyword
+    // was nearly empty (production measured: 1 lead after minutes of crawl).
+    maxRating: "4",
+    maxInstalls: "500000",
     country: "BD",
     limit: "1000",
   });

@@ -88,7 +88,7 @@ export function LeadTable({ leads }: LeadTableProps) {
 
   return (
     <div className="overflow-x-auto rounded-2xl border border-zinc-800 bg-zinc-900/60">
-      <table className="w-full min-w-[820px] border-collapse text-sm">
+      <table className="w-full min-w-[980px] border-collapse text-sm">
         <thead className="border-b border-zinc-800 bg-zinc-900">
           <tr>
             {header("title", "App")}
@@ -99,6 +99,9 @@ export function LeadTable({ leads }: LeadTableProps) {
             </th>
             <th className="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-zinc-400">
               Developer
+            </th>
+            <th className="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-zinc-400">
+              Email
             </th>
             <th className="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-zinc-400">
               Ratings
@@ -158,6 +161,19 @@ export function LeadTable({ leads }: LeadTableProps) {
               <td className="px-3 py-2.5 text-xs text-zinc-400">{lead.category ?? "—"}</td>
               <td className="max-w-[10rem] truncate px-3 py-2.5 text-xs text-zinc-400">
                 {lead.developer ?? "—"}
+              </td>
+              <td className="max-w-[11rem] truncate px-3 py-2.5 text-xs text-zinc-400">
+                {lead.email ? (
+                  <a
+                    href={`mailto:${lead.email}`}
+                    className="hover:text-emerald-400"
+                    title={lead.email}
+                  >
+                    {lead.email}
+                  </a>
+                ) : (
+                  "—"
+                )}
               </td>
               <td className="px-3 py-2.5 font-mono text-xs text-zinc-400">
                 {lead.ratingsCount === null ? "—" : lead.ratingsCount.toLocaleString("en-US")}

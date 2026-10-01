@@ -31,9 +31,15 @@ to the browser in real time and exports them as CSV.
    shows (the same app can rate 2.2 in one country and 4.5 in another). Only
    after that page confirms both ceilings does the lead stream to the table —
    a row that appears stays, because the check that put it there is the same
-   check the user sees. The ratings count and install bucket come from the same
-   page, and relevant results seed a "similar apps" expansion pass so the
-   search can reach apps the keyword plan alone would miss.
+   check the user sees. Cards that **cannot decide on their own** — a partial
+   keyword hit (the card proves some of the keyword's words while the listing's
+   description may carry the rest) or a missing rating/install number — are
+   queued for the same detail-page verification instead of being dropped, so
+   multi-term keywords surface apps a thin search card could not prove. The
+   ratings count and install bucket come from the same page, and relevant
+   results seed a "similar apps" expansion pass so the search can reach apps
+   the keyword plan alone would miss. When Play publishes a developer contact
+   email for the listing, it is collected with the lead and exported.
 4. A lead whose page later stops qualifying or 404s — or whose rating the
    store changes mid-run — is removed (`lead-remove`), so the table and the
    CSV can never show numbers that break the rules the run collected with.
@@ -41,7 +47,8 @@ to the browser in real time and exports them as CSV.
    if the strict ceilings leave fewer apps than requested — after the query
    waves are exhausted, reported honestly as `plan-exhausted` with the count
    that was actually found.
-6. Export the results to CSV (RFC 4180, Excel-friendly BOM).
+6. Export the results to CSV (RFC 4180, Excel-friendly BOM), including the
+   developer contact email when the listing published one.
 
 ## Running locally
 
@@ -132,15 +139,20 @@ Missing ratings and missing/unparseable install counts **never** qualify.
 Install counts are store buckets (`"10,000+"`), so they are treated as lower
 bounds and flagged with `installCertainty: "bucket"`.
 
-Detail pages are the gate: a search-card match is verified against its
-country's detail page **before it is ever shown** (relevance is re-matched on
-the combined search + detail text), so the foreign storefront's rating can
-never flash a row onto the table and take it away again. After a lead is on
+Detail pages are the gate: a search-card match **and** an undecided card
+(partial keyword hit or missing number) are verified against the country's
+detail page **before anything is shown** (relevance is re-matched on the
+combined search + detail text), so the foreign storefront's rating can never
+flash a row onto the table and take it away again, and a thin search card can
+never hide an app whose full listing qualifies. After a lead is on
 screen, a detail page that later stops qualifying — or cannot confirm a rating
 from the run's country — removes it rather than leaving numbers on screen that
 break the rules it was collected with.
 Every row's link carries the same country (`&gl=…`), so opening it shows the
-same numbers the table printed.
+same numbers the table printed. Each lead also carries the listing's contact
+email (the rendered support anchor, falling back to the developer-contact
+block Play embeds in the page) — null when Play publishes none; addresses
+quoted inside descriptions are never mistaken for the developer's.
 
 ## Configuration
 

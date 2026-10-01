@@ -197,6 +197,12 @@ export class PlayClient {
         let text: string;
         try {
           const controller = new AbortController();
+          // The timer must cover the body read too: a throttled Play
+          // connection that sends headers and then stalls the payload would
+          // otherwise block `response.text()` forever, holding its semaphore
+          // slot until every window deadlocks (measured: one step hung for
+          // 13 minutes this way). Aborting after headers destroys the body
+          // stream, so `text()` rejects instead of waiting on a dead socket.
           const timer = setTimeout(() => controller.abort(), this.timeoutMs);
           try {
             response = await fetch(url, {
@@ -212,10 +218,10 @@ export class PlayClient {
                 ...extraHeaders,
               },
             });
+            text = await response.text();
           } finally {
             clearTimeout(timer);
           }
-          text = await response.text();
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") {
             lastError = new PlayTimeoutError("Timed out while contacting the Play Store.");

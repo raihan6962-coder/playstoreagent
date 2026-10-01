@@ -97,6 +97,43 @@ describe("parseDetailPage", () => {
     expect(result.app?.packageName).toBe("com.example.townwallet");
     expect(result.app?.rating).toBe(4.5);
   });
+
+  it("reads the developer's published contact email from the support anchor", () => {
+    const html = detailHtml({
+      packageName: "com.example.budget",
+      title: "Budget Tracker",
+      ratingValue: 2.4,
+      email: "help@budget.example",
+    });
+
+    expect(parseDetailPage(html, "com.example.budget").app?.email).toBe("help@budget.example");
+  });
+
+  it("falls back to the developer-contact block when no support anchor is rendered", () => {
+    const html = `<html><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Ledger Lite","author":{"@type":"Person","name":"Ledger Works"}}</script>
+</head><body>
+<div class="WsMG1c">5,000+</div><div class="ClM7O">Downloads</div>
+<script>AF_initDataCallback({key: 'ds:8', hash: '1', data:[[["com.example.ledger",7]],["Ledger Works",["ledger@works.example"],["2 Test St"]]], sideChannel: {}});</script>
+</body></html>`;
+
+    expect(parseDetailPage(html, "com.example.ledger").app?.email).toBe("ledger@works.example");
+  });
+
+  it("reports no email when the listing publishes none", () => {
+    const plain = detailHtml({ packageName: "com.example.budget", title: "Budget Tracker", ratingValue: 2.4 });
+    expect(parseDetailPage(plain, "com.example.budget").app?.email).toBeNull();
+
+    // A description that quotes somebody else's address is not this app's
+    // contact email and must never surface as one.
+    const quoted = detailHtml({
+      packageName: "com.example.budget",
+      title: "Budget Tracker",
+      ratingValue: 2.4,
+      summary: "Questions? Mail billing@someone-else.example for help.",
+    });
+    expect(parseDetailPage(quoted, "com.example.budget").app?.email).toBeNull();
+  });
 });
 
 describe("html helpers", () => {

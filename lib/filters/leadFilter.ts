@@ -17,6 +17,12 @@ export interface Evaluation {
   status: EvaluationStatus;
   reasons: RejectReason[];
   lead: Lead | null;
+  /**
+   * Significant keyword terms found in the app's card text. Empty on
+   * duplicates. Lets the crawler tell a partial hit (worth one detail-page
+   * fetch — the description may carry the missing term) from no hit at all.
+   */
+  matchedTerms: string[];
 }
 
 export const PLAY_BASE_URL = "https://play.google.com";
@@ -46,6 +52,7 @@ export function toLead(app: StoreApp, filters: LeadFilters): Lead {
 
   return {
     ...app,
+    email: app.email ?? null,
     rating: roundRating(app.rating),
     // `gl` pins the link to the country whose ratings the run filtered on, so
     // opening the lead shows the same numbers the table printed.
@@ -72,7 +79,7 @@ export function evaluateApp(
   const reasons: RejectReason[] = [];
 
   if (seen.has(app.packageName)) {
-    return { status: "reject", reasons: ["duplicate"], lead: null };
+    return { status: "reject", reasons: ["duplicate"], lead: null, matchedTerms: [] };
   }
 
   const tokens = tokenizeKeyword(filters.keyword);
@@ -114,10 +121,10 @@ export function evaluateApp(
   if (reasons.length > 0 && status === "match") status = "reject";
 
   if (status === "match") {
-    return { status: "match", reasons: [], lead: toLead(app, filters) };
+    return { status: "match", reasons: [], lead: toLead(app, filters), matchedTerms: relevance.matchedTerms };
   }
 
-  return { status, reasons, lead: null };
+  return { status, reasons, lead: null, matchedTerms: relevance.matchedTerms };
 }
 
 /**
@@ -169,5 +176,39 @@ export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean
   if (app.rating === null) return false;
   if (roundRating(app.rating) > filters.maxRating) return false;
   if (app.installs !== null && app.installs > filters.maxInstalls) return false;
+  return true;
+}
+
+/**
+ * How far above the ceiling a **foreign** storefront's printed rating may sit
+ * and still be worth a detail-page fetch from the run's own country.
+ *
+ * Measured live (research R6): cards printed 3.6–4.5 abroad landed at 3.9–4.9
+ * at home — 0 of 10 passed, because home storefronts rate these apps *higher*,
+ * not lower. A foreign card printed above the ceiling is therefore a known
+ * miss: only cards at or below the ceiling earn a fetch (those still pass
+ * 12–100% depending on the storefront, R6b).
+ */
+export const FOREIGN_RATING_WINDOW = 0.0;
+
+/**
+ * Decides whether fetching this card's detail page could still change its
+ * verdict. `countryFinal` means the card already shows the run's own
+ * storefront: its rating is final, and anything above the ceiling can only be
+ * repeated by the detail page. Foreign cards get {@link FOREIGN_RATING_WINDOW}
+ * of slack for cross-storefront drift. Install buckets are global (Play prints
+ * the same bucket everywhere), so an over-cap bucket is always final.
+ */
+export function cardCanStillQualify(
+  app: Pick<StoreApp, "rating" | "installs">,
+  filters: LeadFilters,
+  countryFinal: boolean,
+): boolean {
+  if (app.installs !== null && app.installs > filters.maxInstalls) return false;
+  if (app.rating !== null) {
+    const printed = roundRating(app.rating);
+    const ceiling = countryFinal ? filters.maxRating : filters.maxRating + FOREIGN_RATING_WINDOW;
+    if (printed > ceiling) return false;
+  }
   return true;
 }

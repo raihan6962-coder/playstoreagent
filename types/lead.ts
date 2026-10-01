@@ -13,11 +13,19 @@ export interface StoreApp {
   description: string | null;
   icon: string | null;
   urlPath: string | null;
+  /**
+   * Contact email Play publishes for the listing (support anchor or the
+   * developer-contact block). Search cards never carry it, so it stays
+   * optional until a detail page fills it in.
+   */
+  email?: string | null;
 }
 
 export type InstallCertainty = "exact" | "bucket" | "unknown";
 
 export interface Lead extends StoreApp {
+  /** Always present on a lead: null when Play does not publish one. */
+  email: string | null;
   playStoreUrl: string;
   keyword: string;
   relevanceScore: number;
@@ -76,6 +84,35 @@ export interface SessionCounters {
   requests: number;
   /** Play 429 / block responses seen across the session (diagnostics). */
   rateLimitHits: number;
+  /**
+   * Cards queued for a detail-page verification: confirmed matches waiting
+   * for their country's page plus undecided cards whose own numbers or text
+   * could not answer the rules. Monotonic — never decremented.
+   */
+  candidates: number;
+  /** Detail verifications that did not produce a lead (rejected or unreadable). */
+  verifyRejected: number;
+  /** Subset of `verifyRejected` where the verified text still lacked a required keyword term (or any of them). */
+  verifyTextRejected: number;
+  /** Subset of `verifyRejected` where the numbers broke a ceiling (or the detail page could not confirm them). */
+  verifyCeilingRejected: number;
+  /**
+   * Diagnostic funnel for the run's own storefront: cards read from `gl`
+   * equal to the target country. Home cards are the ones whose printed
+   * numbers are final (100% detail pass measured), so when leads stay scarce
+   * these three numbers show whether the plan even visits the home
+   * storefront, whether the cards queue, and whether they become pending
+   * matches.
+   */
+  homeDiscovered: number;
+  homeQueued: number;
+  homePending: number;
+  /** Ceiling-bucket split: detail rating above the ceiling. */
+  verifyCeilingRating: number;
+  /** Ceiling-bucket split: detail installs above the cap. */
+  verifyCeilingInstalls: number;
+  /** Ceiling-bucket split: no readable rating (or unreadable page) from this country. */
+  verifyCeilingMissing: number;
   lowestRatingSeen: number | null;
 }
 
@@ -145,6 +182,15 @@ export interface SessionCursor {
    * that already earned a search request is never silently discarded.
    */
   pendingQueue: PendingVerify[];
+  /**
+   * Cards whose own data could not decide the outcome: a partial keyword hit
+   * (one of several terms on the card, with the rest possibly in the detail
+   * page's description) or a missing rating/installs value. The detail page
+   * carries the full text and this run's country numbers, so fetching it is
+   * the only way to settle these — dropping them at card level left real
+   * leads uncollected for multi-term keywords.
+   */
+  candidateQueue: PendingVerify[];
   counters: SessionCounters;
 }
 

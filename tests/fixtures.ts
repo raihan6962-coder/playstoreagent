@@ -9,6 +9,8 @@ export interface EntryOptions {
   developer?: string | null;
   category?: string | null;
   summary?: string | null;
+  /** Rendered as Play's support anchor on detail pages only. */
+  email?: string | null;
 }
 
 /** Builds one positional app card in the shape Play embeds in search pages. */
@@ -69,11 +71,15 @@ export function detailHtml(
   };
 
   const afData = [main, ...similar].map((entry) => [makeAppEntry(entry)]);
+  const emailAnchor = main.email
+    ? `<a class="Si6A0c RrSxVb" href="mailto:${main.email}" target="_blank" aria-label="Support email mailto:${main.email} will open in your email app"></a>`
+    : "";
 
   return `<html><head><meta property="og:url" content="https://play.google.com/store/apps/details?id=${main.packageName}&hl=en"></head>
 <body>
 <script type="application/ld+json" nonce="abc123">${JSON.stringify(jsonLd)}</script>
 <div class="WsMG1c">${installsLabel}</div><div class="ClM7O">Downloads</div>
+<div class="fgfPI">${emailAnchor}</div>
 <script>${afScript("ds:8", afData)}</script>
 </body></html>`;
 }

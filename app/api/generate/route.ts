@@ -144,6 +144,7 @@ export async function POST(request: Request): Promise<Response> {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let closed = false;
       const send = (event: unknown): void => {
         if (cancelled) return;
         try {
@@ -152,6 +153,18 @@ export async function POST(request: Request): Promise<Response> {
           cancelled = true;
         }
       };
+
+      // SSE comment heartbeat: keeps idle proxies and clients from declaring
+      // the stream dead between generation events (a silent stretch longer
+      // than their body timeout kills the connection mid-run).
+      const heartbeat = setInterval(() => {
+        if (cancelled || closed) return;
+        try {
+          controller.enqueue(encoder.encode(`: keep-alive\n\n`));
+        } catch {
+          cancelled = true;
+        }
+      }, 15_000);
 
       try {
         send({
@@ -173,6 +186,8 @@ export async function POST(request: Request): Promise<Response> {
           message: error instanceof Error ? error.message : "Unexpected server error.",
         });
       } finally {
+        clearInterval(heartbeat);
+        closed = true;
         cancelled = true;
         try {
           controller.close();

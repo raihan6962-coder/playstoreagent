@@ -1,4 +1,4 @@
-import { detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
+import { cardCanStillQualify, detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
 import { roundRating } from "@/lib/parser/rating";
 import type {
   DoneReason,
@@ -60,6 +60,18 @@ const MAX_EXPAND_REQUESTS = 1_500;
 /** Stop queueing expansion seeds beyond this size. */
 const MAX_SIMILAR_QUEUE = 2_000;
 /**
+ * Queued summaries are only a fallback for detail pages that arrive without
+ * text, but some search cards embed multi-kilobyte snippets — clipped here so
+ * a long snippet can never push the resume cursor past the validator's cap
+ * (which would make every step restart from scratch instead of resuming).
+ */
+const QUEUE_SUMMARY_CAP = 1_000;
+
+function clipSummary(summary: string | null): string | null {
+  if (summary === null) return null;
+  return summary.length > QUEUE_SUMMARY_CAP ? summary.slice(0, QUEUE_SUMMARY_CAP) : summary;
+}
+/**
  * Leads waiting for their canonical detail page. Every emitted lead is queued;
  * the search window pulls these first (see `pullSearchTask`) so the rating the
  * table shows is refreshed from the run's own country within seconds instead
@@ -80,6 +92,20 @@ const MAX_PENDING_QUEUE = 500;
 /** Detail verifications per step before the step reports back to the caller. */
 const MAX_PENDING_PER_STEP = 500;
 /**
+ * Undecided cards waiting for their detail page: partial keyword hits (the
+ * card's text proves some but not all significant terms) and cards missing
+ * the rating or install number. Search cards are thin — for a multi-term
+ * keyword like "crypto wallet" the card usually carries one term while the
+ * listing's description carries the other, and some cards print no rating at
+ * all. Fetching the detail page settles both with full text plus this run's
+ * country numbers, so these are queued instead of dropped. Capped because
+ * every entry costs a request; overflow simply leaves the app at its card
+ * verdict.
+ */
+const MAX_CANDIDATE_QUEUE = 1200;
+/** Detail fetches per step spent on undecided cards. */
+const MAX_CANDIDATE_PER_STEP = 700;
+/**
  * Package names kept for dedupe. Past this point repeats may be re-evaluated;
  * `emitted` still guarantees a lead is only counted once. The cap also keeps
  * the resume cursor small enough to round trip through the browser.
@@ -99,8 +125,8 @@ const BATCH_HEADROOM_MS = 5_000;
  * research3.test.ts), so a healthy seed queue gets the larger half of the
  * window — eight of 24 slots — and a sparse queue still gets a quarter.
  */
-const EXPAND_SLOTS_FULL = 10;
-const EXPAND_SLOTS_SPARSE = 3;
+const EXPAND_SLOTS_FULL = 16;
+const EXPAND_SLOTS_SPARSE = 6;
 /** Seed queue size considered "healthy" for the full expansion slot share. */
 const EXPAND_QUEUE_HEALTHY = 8;
 
@@ -123,6 +149,16 @@ function emptyCounters(): SessionCounters {
     pagesFetched: 0,
     requests: 0,
     rateLimitHits: 0,
+    candidates: 0,
+    verifyRejected: 0,
+    verifyTextRejected: 0,
+    verifyCeilingRejected: 0,
+    homeDiscovered: 0,
+    homeQueued: 0,
+    homePending: 0,
+    verifyCeilingRating: 0,
+    verifyCeilingInstalls: 0,
+    verifyCeilingMissing: 0,
     lowestRatingSeen: null,
   };
 }
@@ -207,6 +243,7 @@ export function createInitialCursor(keyword: string): SessionCursor {
     expanded: [],
     enrichQueue: [],
     pendingQueue: [],
+    candidateQueue: [],
     counters: emptyCounters(),
   };
 }
@@ -270,11 +307,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   const queuedSeeds = new Set(cursor.similarQueue.map((seed) => seed.p));
   const queuedEnrich = new Set(cursor.enrichQueue);
   const queuedPending = new Set(cursor.pendingQueue.map((entry) => entry.p));
+  const queuedCandidates = new Set(cursor.candidateQueue.map((entry) => entry.p));
   const suggestions = [...cursor.suggestions];
   let expandRequests = 0;
   let enrichRequests = 0;
   let pendingRequests = 0;
-  /** Pending packages that failed this step; retried on the next one instead. */
+  let candidateRequests = 0;
+  /** Verification packages that failed this step; retried on the next one instead. */
   const pendingRetried = new Set<string>();
   let parseFailures = 0;
   let transportFailures = 0;
@@ -306,8 +345,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     return { reason, message, cursor: result, stats: finalStats };
   };
 
-  /** Returns true when the lead target has been reached. */
-  const ingest = (apps: StoreApp[]): boolean => {
+  /**
+   * Returns true when the lead target has been reached. `cardGl` is the
+   * storefront the cards were read from: when it matches the run's country
+   * the printed rating is final, foreign cards still have cross-storefront
+   * drift to give them a chance (see {@link cardCanStillQualify}).
+   */
+  const ingest = (apps: StoreApp[], cardGl: string = filters.country): boolean => {
+    const countryFinal = cardGl === filters.country;
     for (const app of apps) {
       const evaluation = evaluateApp(app, filters, seen);
 
@@ -319,6 +364,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
       cursor.counters.discovered += 1;
       cursor.counters.evaluated += 1;
+      if (countryFinal) cursor.counters.homeDiscovered += 1;
 
       if (app.rating !== null) {
         const lowest = cursor.counters.lowestRatingSeen;
@@ -342,8 +388,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             cursor.pendingQueue.push({
               p: lead.packageName,
               i: lead.installs,
-              s: lead.summary,
+              s: clipSummary(lead.summary),
             });
+            cursor.counters.candidates += 1;
+            if (countryFinal) cursor.counters.homePending += 1;
           }
           continue;
         }
@@ -355,8 +403,45 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       }
 
       const relevant = !evaluation.reasons.includes("not-relevant");
-      if (relevant) {
+      // Unrated cards never seed expansions: live measurement showed they
+      // pour into expansion neighborhoods (watch faces, 5-install trackers)
+      // that can never carry a rating, flooding the verify queue with pages
+      // that answer `rating=null` — 521 of 521 unrated verifies in one step.
+      if (relevant && app.rating !== null) {
         pushSeed({ p: app.packageName, i: app.installs }, queuedSeeds);
+      }
+
+      // The card could not settle the verdict on its own: either its text
+      // carries only part of the keyword (the listing's description may
+      // complete it), a decisive number is missing (the detail page reports
+      // it for this run's country), or the card's own text carries no keyword
+      // term at all while both printed numbers already pass (Play returned it
+      // for this query, so the full description may hold the terms the
+      // truncated card text lacks — the detail page is the first place that
+      // text can even be read). Cards the card already proves hopeless (rating
+      // over the ceiling on any storefront, install bucket over the cap) never
+      // queue: measured live, foreign cards printed above the ceiling passed
+      // 0 of 10 checks at home (research R6), so fetching them only burned the
+      // verify budget on rejections that were visible before the request went
+      // out.
+      const undecidedNumbers = evaluation.reasons.some(
+        (reason) =>
+          reason === "missing-rating" ||
+          reason === "missing-installs" ||
+          reason === "unparseable-installs",
+      );
+      const descriptionRescue =
+        evaluation.matchedTerms.length === 0 &&
+        app.rating !== null &&
+        roundRating(app.rating) <= filters.maxRating &&
+        (app.installs === null || app.installs <= filters.maxInstalls);
+      if (
+        ((!relevant && evaluation.matchedTerms.length > 0) ||
+          undecidedNumbers ||
+          descriptionRescue) &&
+        cardCanStillQualify(app, filters, countryFinal)
+      ) {
+        queueCandidate(app, countryFinal);
       }
     }
     return false;
@@ -389,6 +474,43 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   function dropFromPending(pkg: string): void {
     queuedPending.delete(pkg);
     cursor.pendingQueue = cursor.pendingQueue.filter((entry) => entry.p !== pkg);
+  }
+
+  /**
+   * Queues a card whose own evidence cannot settle it — partial keyword hit,
+   * a missing number, or a description-only rescue — for one authoritative
+   * detail-page fetch. The fetch re-runs every rule on the full text and this
+   * run's country data, so nothing is ever shown that has not passed the same
+   * gates as a match. Cards read from the run's own storefront jump the queue:
+   * their printed rating *is* the verified number (100% pass measured, R6b),
+   * so they are the first requests worth spending.
+   */
+  function queueCandidate(app: StoreApp, homeFirst = false): void {
+    if (cursor.candidateQueue.length >= MAX_CANDIDATE_QUEUE) return;
+    if (queuedCandidates.has(app.packageName)) return;
+    if (queuedPending.has(app.packageName)) return;
+    if (emitted.has(app.packageName)) return;
+    queuedCandidates.add(app.packageName);
+    const entry = { p: app.packageName, i: app.installs, s: clipSummary(app.summary) };
+    // Rated home cards jump the queue: their printed number is final. Unrated
+    // cards (home or foreign) go to the back — they are still worth one
+    // authoritative fetch (search cards sometimes hide a rating the detail
+    // page carries) but must never spend the budget ahead of cards that can
+    // pass today. One step measured 521 unrated fetches in front of rated
+    // candidates this way.
+    if (homeFirst && app.rating !== null) {
+      cursor.candidateQueue.unshift(entry);
+    } else {
+      cursor.candidateQueue.push(entry);
+    }
+    if (homeFirst) cursor.counters.homeQueued += 1;
+    cursor.counters.candidates += 1;
+  }
+
+  /** Removes a package from the candidate queue (settled or gone). */
+  function dropFromCandidate(pkg: string): void {
+    queuedCandidates.delete(pkg);
+    cursor.candidateQueue = cursor.candidateQueue.filter((entry) => entry.p !== pkg);
   }
 
   function pushSeed(seed: SimilarSeed, queued: Set<string>): void {
@@ -492,7 +614,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       transportFailures = 0;
       currentQuery = entry.query;
 
-      if (ingest(result.apps)) return "target";
+      if (ingest(result.apps, entry.gl)) return "target";
       return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
@@ -620,18 +742,23 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   /**
-   * Verifies a search-card match against its canonical detail page from this
-   * run's country — the single gate a lead must pass before it may appear.
+   * Verifies one queued card against its canonical detail page from this run's
+   * country — the single gate a lead must pass before it may appear.
    *
-   * The card's rating came from whichever storefront answered the query; this
-   * page reports what the user's own Play Store shows. Only a lead confirmed
-   * here is emitted, so the table never has to retract a row it already showed
-   * (the previous flow emitted on the card's rating and removed the lead when
-   * the country page disagreed — most rows vanished seconds after appearing).
+   * Serves both queues: a search-card match (`"pending"` — confirm the
+   * country's numbers) and an undecided card (`"candidate"` — the full
+   * description decides the keyword, the country's page decides the
+   * ceilings). Either way the table only ever shows leads this page
+   * confirmed, so rows never have to be retracted when the foreign
+   * storefront's data disagreed with them.
    */
-  async function runPendingTask(entry: PendingVerify): Promise<TaskOutcome> {
+  async function runVerifyTask(
+    entry: PendingVerify,
+    queue: "pending" | "candidate",
+  ): Promise<TaskOutcome> {
     if (options.aborted?.()) return "ok";
-    pendingRequests += 1;
+    if (queue === "pending") pendingRequests += 1;
+    else candidateRequests += 1;
     currentQuery = entry.p;
     emit({
       type: "progress",
@@ -639,48 +766,87 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       message: `Fetching details for ${entry.p}…`,
     });
 
+    const drop = (): void => {
+      if (queue === "pending") dropFromPending(entry.p);
+      else dropFromCandidate(entry.p);
+    };
+
     try {
       const detail = await fetchAppDetail(client, entry.p, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       parseFailures = 0;
       transportFailures = 0;
-      dropFromPending(entry.p);
+      drop();
 
-      // The card match no longer seeds itself; walk its similar apps here so
-      // the expansion continues from the same detail page we just fetched.
+      // Settle this entry first — the page we just paid for decides whether
+      // it becomes a lead — then keep walking from the same fetch.
       let target = false;
+      let settled = false;
+      let textRejected = false;
+      if (detail.app && detail.app.packageName === entry.p) {
+        // The detail page is authoritative for numbers: a missing install
+        // bucket falls back to the card's value (same storefront answer, just
+        // less precise). Text does NOT fall back to the search card: when a
+        // page variant arrives with no description at all, the card snippet
+        // can carry query context that the listing itself never says — a live
+        // run emitted an "Alice's Hotel" lead for the keyword "wallet" that
+        // way while the real page contained the word zero times. No detail
+        // text means the keyword cannot be confirmed, so the entry rejects.
+        const app: StoreApp = {
+          ...detail.app,
+          installs: detail.app.installs ?? entry.i,
+        };
+        if (detailAppQualifies(app, filters)) {
+          // Numbers passed: every remaining way to lose here is a relevance
+          // loss (the full text still misses a required term, or carries none
+          // at all), so it belongs in the text bucket — the ceiling bucket is
+          // reserved for verifications whose numbers never confirmed.
+          const evalSeen = new Set(seen);
+          evalSeen.delete(entry.p);
+          const evaluation = evaluateApp(app, filters, evalSeen);
+          if (evaluation.status === "match" && evaluation.lead) {
+            settled = true;
+            target = emitLead(evaluation.lead);
+          } else if (!evaluation.reasons.includes("not-relevant")) {
+            // Kept the keyword but broke a ceiling: the closest misses make
+            // the best expansion seeds (their neighborhood tends to match).
+            pushSeed({ p: entry.p, i: app.installs }, queuedSeeds);
+            textRejected = true;
+          } else {
+            textRejected = true;
+          }
+        } else {
+          cursor.counters.verifyCeilingRejected += 1;
+          if (app.rating === null) cursor.counters.verifyCeilingMissing += 1;
+          else if (roundRating(app.rating) > filters.maxRating)
+            cursor.counters.verifyCeilingRating += 1;
+          else cursor.counters.verifyCeilingInstalls += 1;
+        }
+      } else {
+        // Unreadable page or package mismatch: the numeric gate could not be
+        // confirmed, so this is a ceiling-bucket rejection, not a text one.
+        cursor.counters.verifyCeilingRejected += 1;
+        cursor.counters.verifyCeilingMissing += 1;
+      }
+      if (!settled) {
+        cursor.counters.verifyRejected += 1;
+        if (textRejected) cursor.counters.verifyTextRejected += 1;
+      }
+      if (target) return "target";
+
       if (detail.app && detail.app.packageName === entry.p && !expanded.has(entry.p)) {
         expanded.add(entry.p);
         cursor.expanded.push(entry.p);
         if (ingest(detail.similarApps)) return "target";
       }
-
-      if (detail.app && detail.app.packageName === entry.p) {
-        // The detail page is authoritative, but its parsed text or install
-        // bucket can be thinner than the card's — fall back to the card's
-        // values so a fully passing candidate is never lost to a parse gap.
-        const app: StoreApp = {
-          ...detail.app,
-          installs: detail.app.installs ?? entry.i,
-          summary: detail.app.summary ?? entry.s,
-        };
-        if (detailAppQualifies(app, filters)) {
-          const evalSeen = new Set(seen);
-          evalSeen.delete(entry.p);
-          const evaluation = evaluateApp(app, filters, evalSeen);
-          if (evaluation.status === "match" && evaluation.lead) {
-            target = emitLead(evaluation.lead);
-          }
-        }
-      }
-      return target ? "target" : "ok";
+      return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
 
       if (error instanceof PlayHttpError && error.status === 404) {
-        // Gone before it was ever shown: drop the pending entry silently —
-        // there is no row to retract and no lead to count.
-        dropFromPending(entry.p);
+        // Gone before it was ever shown: drop the entry silently — there is
+        // no row to retract and no lead to count.
+        drop();
         return "ok";
       }
 
@@ -702,20 +868,42 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
   }
 
-  const pendingFlight = new Set<string>();
-  /** Pulls the next unverified candidate, skipping ones already retried. */
+  const verifyFlight = new Set<string>();
+  /** Pulls the next unverified match, skipping ones already retried. */
   const pullPendingTask = (): Promise<TaskOutcome> | null => {
     if (pendingRequests >= MAX_PENDING_PER_STEP) return null;
     for (const entry of cursor.pendingQueue) {
-      if (pendingFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
-      pendingFlight.add(entry.p);
-      return runPendingTask(entry).then((outcome) => {
-        pendingFlight.delete(entry.p);
+      if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
+      verifyFlight.add(entry.p);
+      return runVerifyTask(entry, "pending").then((outcome) => {
+        verifyFlight.delete(entry.p);
         return outcome;
       });
     }
     return null;
   };
+
+  /**
+   * Pulls the next undecided card. Matches always get their fetches first:
+   * a match is one confirm away from becoming a lead, while an undecided
+   * card still has to prove itself.
+   */
+  const pullCandidateTask = (): Promise<TaskOutcome> | null => {
+    if (candidateRequests >= MAX_CANDIDATE_PER_STEP) return null;
+    for (const entry of cursor.candidateQueue) {
+      if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
+      verifyFlight.add(entry.p);
+      return runVerifyTask(entry, "candidate").then((outcome) => {
+        verifyFlight.delete(entry.p);
+        return outcome;
+      });
+    }
+    return null;
+  };
+
+  /** Next verification fetch for this window: confirmed match first, then undecided card. */
+  const pullVerifyTask = (): Promise<TaskOutcome> | null =>
+    pullPendingTask() ?? pullCandidateTask();
 
   // --------------------------------------------------------------- suggest --
   while (cursor.phase === "suggest") {
@@ -805,13 +993,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     let expandCredit = 0;
     const enrichFlight = new Set<string>();
     const pullSearchTask = (): Promise<TaskOutcome> | null => {
-      // Candidates awaiting their country's detail page come first: that page
-      // is the only gate before a lead may appear, so a match found this very
-      // window reaches the table as soon as it is confirmed — and never
-      // before. On transient failures the package stays queued for the next
-      // step, so a null return here just falls through to the queues below.
-      const pending = pullPendingTask();
-      if (pending) return pending;
+      // Queued verifications come first: that detail page is the only gate
+      // before a lead may appear, so a match found this very window reaches
+      // the table as soon as it is confirmed — and never before. On transient
+      // failures the package stays queued for the next step, so a null return
+      // here just falls through to the queues below.
+      const verify = pullVerifyTask();
+      if (verify) return verify;
 
       // Then backfill metadata for leads already on screen (their ratings
       // count, if the detail page carried none at verification time).
@@ -924,8 +1112,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     const outcomes = await runWindow(
       SEARCH_CONCURRENCY,
       () => {
-        const pending = pullPendingTask();
-        if (pending) return pending;
+        const verify = pullVerifyTask();
+        if (verify) return verify;
         const [seed] = takeSeeds(1);
         return seed ? runExpandTask(seed) : null;
       },
@@ -949,10 +1137,11 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   while (cursor.phase === "enrich") {
     if (cursor.counters.matched >= filters.limit) break;
 
-    // Drain pending verifications before anything else: every candidate here
-    // already passed the card check, and a terminal decision with the queue
-    // non-empty would discard leads the run already spent searches on.
-    if (cursor.pendingQueue.length > 0) {
+    // Drain verifications before anything else: every entry here already
+    // earned its place from a search or a detail fetch, and a terminal
+    // decision with either queue non-empty would discard leads the run has
+    // already spent requests on.
+    if (cursor.pendingQueue.length > 0 || cursor.candidateQueue.length > 0) {
       if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
         return finish(
           "budget-exhausted",
@@ -960,20 +1149,17 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           true,
         );
       }
-      const pendingOutcomes = await runWindow(
-        ENRICH_CONCURRENCY,
-        pullPendingTask,
-        () =>
-          cursor.counters.matched < filters.limit &&
-          hasTimeForRequest(BATCH_HEADROOM_MS) &&
-          parseFailures < MAX_PARSE_FAILURES &&
-          transportFailures < MAX_TRANSPORT_FAILURES,
+      const verifyOutcomes = await runWindow(ENRICH_CONCURRENCY, pullVerifyTask, () =>
+        cursor.counters.matched < filters.limit &&
+        hasTimeForRequest(BATCH_HEADROOM_MS) &&
+        parseFailures < MAX_PARSE_FAILURES &&
+        transportFailures < MAX_TRANSPORT_FAILURES,
       );
-      const pendingFailure = batchFailure(pendingOutcomes);
-      if (pendingFailure) return pendingFailure;
+      const verifyFailure = batchFailure(verifyOutcomes);
+      if (verifyFailure) return verifyFailure;
       // Nothing pulled (everything left was already retried this step) or the
-      // target just closed the queue — stop looping over an unchanged queue.
-      if (pendingOutcomes.length === 0 || pendingOutcomes.includes("target")) break;
+      // target just closed the queues — stop looping over unchanged queues.
+      if (verifyOutcomes.length === 0 || verifyOutcomes.includes("target")) break;
       continue;
     }
 
@@ -1022,11 +1208,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
   // A terminal decision with candidates still pending would silently discard
   // leads the run already spent searches on, so report back and let the next
-  // step (or the dashboard's auto-resume) drain the queue first.
+  // step (or the dashboard's auto-resume) drain the queues first.
   if (cursor.pendingQueue.length > 0) {
     return finish(
       "budget-exhausted",
       `Verifying ${cursor.pendingQueue.length} candidate${cursor.pendingQueue.length === 1 ? "" : "s"} against the ${filters.country} Play Store — resume to continue.`,
+      true,
+    );
+  }
+
+  if (cursor.candidateQueue.length > 0) {
+    return finish(
+      "budget-exhausted",
+      `Reading detail pages for ${cursor.candidateQueue.length} undecided app${cursor.candidateQueue.length === 1 ? "" : "s"} — resume to continue.`,
       true,
     );
   }

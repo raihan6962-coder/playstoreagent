@@ -102,6 +102,11 @@ const LANGUAGE_STOREFRONTS: Array<{ hl: string; gl: string }> = [
   { hl: "pt", gl: "BR" },
   { hl: "de", gl: "DE" },
   { hl: "hi", gl: "IN" },
+  // Measured (research R7): the Bengali home storefront returns a largely
+  // different card set than the English one for the same query (22 of 91
+  // cards unique), including apps the English sweep never surfaces — and
+  // home cards verify at 100% (R6b), so the extra slot pays for itself.
+  { hl: "bn", gl: "BD" },
   { hl: "id", gl: "ID" },
   { hl: "fr", gl: "FR" },
   { hl: "ja", gl: "JP" },
@@ -342,7 +347,7 @@ export function planSize(queries: PlanQuery[]): number {
  *
  * Why this matters: a search card shows the rating of the storefront that
  * answered it. Qualification, however, is verified against the run's own
- * country's detail page (see crawler.ts `runPendingTask`). Sweeping only
+ * country's detail page (see crawler.ts `runVerifyTask`). Sweeping only
  * foreign storefronts therefore matches cards on ratings the user's Play Store
  * never shows and rejects them at verification — under a strict ceiling the
  * table stays empty while the plan burns queries. Putting the country's own

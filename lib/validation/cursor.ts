@@ -16,6 +16,7 @@ const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
 const MAX_ENRICH_QUEUE = 1_000;
 const MAX_PENDING = 500;
+const MAX_CANDIDATES = 1_200;
 const MAX_PENDING_SUMMARY = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,25 +55,35 @@ function parseSeeds(value: unknown): SimilarSeed[] | null {
 /**
  * Candidates waiting for their country's detail page. Optional so cursors
  * minted before this field existed still resume (they simply have nothing
- * pending).
+ * pending). An over-long summary is clipped rather than rejected: the text is
+ * only a fallback for unreadable detail pages, and throwing the whole cursor
+ * away over it would silently restart the session from scratch.
  */
-function parsePending(value: unknown): PendingVerify[] | null {
+function parsePending(value: unknown, cap: number): PendingVerify[] | null {
   if (value === undefined || value === null) return [];
-  if (!Array.isArray(value) || value.length > MAX_PENDING) return null;
+  if (!Array.isArray(value)) return null;
+  // An oversized queue trims its tail instead of rejecting the cursor: a cap
+  // mismatch between the crawler that wrote it and the parser that reads it
+  // must never silently restart the session (dropping the oldest overflow
+  // entries only costs a few later verifies).
+  const items = value.length > cap ? value.slice(0, cap) : value;
   const out: PendingVerify[] = [];
-  for (const item of value) {
+  for (const item of items) {
     if (!isRecord(item)) return null;
     if (typeof item.p !== "string" || item.p.length === 0) return null;
     const installs = item.i;
     if (installs !== undefined && installs !== null && typeof installs !== "number") return null;
     const summary = item.s;
-    if (summary !== undefined && summary !== null) {
-      if (typeof summary !== "string" || summary.length > MAX_PENDING_SUMMARY) return null;
-    }
+    if (summary !== undefined && summary !== null && typeof summary !== "string") return null;
     out.push({
       p: item.p,
       i: typeof installs === "number" ? installs : null,
-      s: typeof summary === "string" ? summary : null,
+      s:
+        typeof summary === "string"
+          ? summary.length > MAX_PENDING_SUMMARY
+            ? summary.slice(0, MAX_PENDING_SUMMARY)
+            : summary
+          : null,
     });
   }
   return out;
@@ -102,6 +113,25 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {
   if (hits === undefined || hits === null) counters.rateLimitHits = 0;
   else if (typeof hits !== "number" || !Number.isFinite(hits) || hits < 0) return null;
   else counters.rateLimitHits = Math.floor(hits);
+  // Same for the verification diagnostics.
+  const optional = [
+    "candidates",
+    "verifyRejected",
+    "verifyTextRejected",
+    "verifyCeilingRejected",
+    "homeDiscovered",
+    "homeQueued",
+    "homePending",
+    "verifyCeilingRating",
+    "verifyCeilingInstalls",
+    "verifyCeilingMissing",
+  ] as const;
+  for (const key of optional) {
+    const current = (value as Record<string, unknown>)[key];
+    if (current === undefined || current === null) counters[key] = 0;
+    else if (typeof current !== "number" || !Number.isFinite(current) || current < 0) return null;
+    else counters[key] = Math.floor(current);
+  }
   return counters;
 }
 
@@ -141,10 +171,11 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
   const emitted = asStringArray(input.emitted, MAX_EMITTED);
   const expanded = asStringArray(input.expanded, MAX_EXPANDED);
   const enrichQueue = asStringArray(input.enrichQueue, MAX_ENRICH_QUEUE);
-  const pendingQueue = parsePending(input.pendingQueue);
+  const pendingQueue = parsePending(input.pendingQueue, MAX_PENDING);
+  const candidateQueue = parsePending(input.candidateQueue, MAX_CANDIDATES);
   const similarQueue = parseSeeds(input.similarQueue);
   const counters = parseCounters(input.counters);
-  if (!seen || !emitted || !expanded || !enrichQueue || !pendingQueue || !similarQueue || !counters) {
+  if (!seen || !emitted || !expanded || !enrichQueue || !pendingQueue || !candidateQueue || !similarQueue || !counters) {
     return null;
   }
   if (counters.matched < 0) return null;
@@ -163,6 +194,7 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     expanded,
     enrichQueue,
     pendingQueue,
+    candidateQueue,
     counters,
   };
 }

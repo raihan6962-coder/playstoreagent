@@ -97,6 +97,7 @@ export function mergeLead(base: Lead, patch: StoreApp): Lead {
     ...base,
     title: patch.title || base.title,
     developer: patch.developer ?? base.developer,
+    email: patch.email ?? base.email,
     rating: patch.rating ?? base.rating,
     ratingRaw: patch.ratingRaw ?? base.ratingRaw,
     ratingsCount: patch.ratingsCount ?? base.ratingsCount,

@@ -153,7 +153,7 @@ describe("runGenerationStep", () => {
     expect(harness.messages().some((message) => message.includes("Searching Play Store"))).toBe(true);
   });
 
-  it("enriches confirmed leads with the ratings count from their detail page", async () => {
+  it("verifies a candidate against its country's detail page before showing it", async () => {
     const harness = collect();
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
 
@@ -165,13 +165,17 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    const updates = harness.updates();
-    expect(updates.length).toBeGreaterThan(0);
-    expect(updates.every((app) => app.ratingsCount !== null)).toBe(true);
-    expect(updates.some((app) => app.packageName === "com.example.budget")).toBe(true);
+    const leads = harness.leads();
+    expect(leads).toHaveLength(2);
+    // The table shows what the detail page (this run's country) reports: the
+    // ratings count is already there when the row appears.
+    expect(leads.every((lead) => lead.ratingsCount === 57)).toBe(true);
+    expect(leads.every((lead) => lead.rating !== null)).toBe(true);
+    // Nothing was ever shown and then taken back.
+    expect(harness.events.filter((event) => event.type === "lead-remove")).toHaveLength(0);
   });
 
-  it("removes a lead whose detail page reports a rating above the ceiling", async () => {
+  it("never shows a lead whose detail page reports a rating above the ceiling", async () => {
     const harness = collect();
     const client = makeFakeClient({
       search: () => searchRoutes(),
@@ -198,11 +202,10 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    const removes = harness.events.filter(
-      (event): event is Extract<GenerationEvent, { type: "lead-remove" }> =>
-        event.type === "lead-remove",
-    );
-    expect(removes.map((event) => event.packageName)).toEqual(["com.example.budget"]);
+    // The lead never became a lead: verification rejected it before the first
+    // emission, so there is nothing to retract.
+    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget.mini"]);
+    expect(harness.events.filter((event) => event.type === "lead-remove")).toHaveLength(0);
     expect(harness.updates().some((app) => app.packageName === "com.example.budget")).toBe(false);
     expect(result.stats.matched).toBe(1);
     expect(result.message).toContain("Only 1 matching app was found");
@@ -402,7 +405,7 @@ describe("runGenerationStep", () => {
     expect(result.message).not.toContain("query waves");
   });
 
-  it("removes a lead whose detail page now returns 404", async () => {
+  it("never shows a lead whose detail page returns 404", async () => {
     const harness = collect();
     const client = makeFakeClient({
       search: () => searchRoutes(),
@@ -422,17 +425,80 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    const removes = harness.events.filter(
-      (event): event is Extract<GenerationEvent, { type: "lead-remove" }> =>
-        event.type === "lead-remove",
-    );
-    expect(removes.map((event) => event.packageName)).toEqual(["com.example.budget"]);
-    expect(
-      harness.events.some(
-        (event) => event.type === "warning" && event.message.includes("no longer lists"),
-      ),
-    ).toBe(true);
+    // The app was gone before it was ever shown: no row, no retraction.
+    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget.mini"]);
+    expect(harness.events.filter((event) => event.type === "lead-remove")).toHaveLength(0);
     expect(result.stats.matched).toBe(1);
     expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("verifies pending candidates before reporting the plan exhausted", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
+    const cursor = createInitialCursor(KEYWORD);
+    // A resumed session whose plan ran dry while candidates were still queued:
+    // the terminal decision must not discard them.
+    cursor.phase = "enrich";
+    cursor.pendingQueue = [
+      { p: "com.example.budget", i: 10_000, s: "Track your budget" },
+      { p: "com.example.budget.mini", i: 5_000, s: "Track your budget" },
+    ];
+    cursor.seen = ["com.example.budget", "com.example.budget.mini"];
+    cursor.counters.discovered = 5;
+    cursor.counters.evaluated = 5;
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 50 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads().map((lead) => lead.packageName).sort()).toEqual([
+      "com.example.budget",
+      "com.example.budget.mini",
+    ]);
+    expect(cursor.pendingQueue).toHaveLength(0);
+    expect(result.stats.matched).toBe(2);
+    expect(result.reason).toBe("plan-exhausted");
+    expect(result.cursor).toBeNull();
+  });
+
+  it("keeps every shown lead when a step wraps up and the next one resumes", async () => {
+    const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
+    const first = collect();
+
+    // Spend the whole budget inside the search phase with a match already
+    // queued for verification: the step must come back resumable instead of
+    // dropping the candidate or emitting it unverified.
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "search";
+    const partial = await runGenerationStep({
+      filters: filters({ limit: 50 }),
+      cursor,
+      budgetMs: 1,
+      emit: first.emit,
+      client,
+    });
+
+    expect(partial.reason).toBe("budget-exhausted");
+    expect(partial.cursor).not.toBeNull();
+    expect(first.leads()).toHaveLength(0);
+
+    const second = collect();
+    const resumed = await runGenerationStep({
+      filters: filters({ limit: 50 }),
+      cursor: partial.cursor!,
+      budgetMs: 8_000,
+      emit: second.emit,
+      client,
+    });
+
+    const allEvents = [...first.events, ...second.events];
+    expect(allEvents.filter((event) => event.type === "lead-remove")).toHaveLength(0);
+    expect(second.leads().length).toBeGreaterThan(0);
+    expect(resumed.reason).toBe("plan-exhausted");
+    expect(resumed.stats.matched).toBe(second.leads().length);
   });
 });

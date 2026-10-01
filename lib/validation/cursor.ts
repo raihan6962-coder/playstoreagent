@@ -5,7 +5,7 @@ import {
   planSize,
   suggestPrefixes,
 } from "@/lib/playstore/queryPlan";
-import type { SessionCursor, SimilarSeed } from "@/types/lead";
+import type { PendingVerify, SessionCursor, SimilarSeed } from "@/types/lead";
 
 const PHASES = new Set(["suggest", "search", "expand", "enrich", "done"]);
 
@@ -15,6 +15,8 @@ const MAX_EMITTED = 1_000;
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
 const MAX_ENRICH_QUEUE = 1_000;
+const MAX_PENDING = 500;
+const MAX_PENDING_SUMMARY = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -45,6 +47,33 @@ function parseSeeds(value: unknown): SimilarSeed[] | null {
     const installs = item.i;
     if (installs !== null && typeof installs !== "number") return null;
     out.push({ p: item.p, i: typeof installs === "number" ? installs : null });
+  }
+  return out;
+}
+
+/**
+ * Candidates waiting for their country's detail page. Optional so cursors
+ * minted before this field existed still resume (they simply have nothing
+ * pending).
+ */
+function parsePending(value: unknown): PendingVerify[] | null {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > MAX_PENDING) return null;
+  const out: PendingVerify[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    if (typeof item.p !== "string" || item.p.length === 0) return null;
+    const installs = item.i;
+    if (installs !== undefined && installs !== null && typeof installs !== "number") return null;
+    const summary = item.s;
+    if (summary !== undefined && summary !== null) {
+      if (typeof summary !== "string" || summary.length > MAX_PENDING_SUMMARY) return null;
+    }
+    out.push({
+      p: item.p,
+      i: typeof installs === "number" ? installs : null,
+      s: typeof summary === "string" ? summary : null,
+    });
   }
   return out;
 }
@@ -112,9 +141,12 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
   const emitted = asStringArray(input.emitted, MAX_EMITTED);
   const expanded = asStringArray(input.expanded, MAX_EXPANDED);
   const enrichQueue = asStringArray(input.enrichQueue, MAX_ENRICH_QUEUE);
+  const pendingQueue = parsePending(input.pendingQueue);
   const similarQueue = parseSeeds(input.similarQueue);
   const counters = parseCounters(input.counters);
-  if (!seen || !emitted || !expanded || !enrichQueue || !similarQueue || !counters) return null;
+  if (!seen || !emitted || !expanded || !enrichQueue || !pendingQueue || !similarQueue || !counters) {
+    return null;
+  }
   if (counters.matched < 0) return null;
 
   return {
@@ -130,6 +162,7 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     similarQueue,
     expanded,
     enrichQueue,
+    pendingQueue,
     counters,
   };
 }

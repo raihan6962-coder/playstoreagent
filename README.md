@@ -22,15 +22,18 @@ to the browser in real time and exports them as CSV.
    run appends fresh query waves and keeps going — it only stops at your
    limit or when another wave finds nothing new.
 3. Every app card is scored for keyword relevance and qualified against your
-   rating and install ceilings. Matches stream to the table immediately.
-4. Confirmed leads are enriched from their detail page — fetched **from your
-   selected country's storefront**, so the rating in the table is the number
-   your Play Store shows (the same app can rate 2.2 in one country and 4.5 in
-   another). The ratings count and install bucket are re-checked there too: a
-   lead that would break a ceiling, has no rating to compare, or whose page
-   now 404s is removed again (`lead-remove`) — and relevant results seed a
-   "similar apps" expansion pass so the search can reach apps the keyword plan
-   alone would miss.
+   rating and install ceilings. A match is **not a lead yet**: it is queued for
+   verification against its detail page, fetched **from your selected country's
+   storefront**, so the rating in the table is always the number your Play Store
+   shows (the same app can rate 2.2 in one country and 4.5 in another). Only
+   after that page confirms both ceilings does the lead stream to the table —
+   a row that appears stays, because the check that put it there is the same
+   check the user sees. The ratings count and install bucket come from the same
+   page, and relevant results seed a "similar apps" expansion pass so the
+   search can reach apps the keyword plan alone would miss.
+4. A lead whose page later stops qualifying or 404s — or whose rating the
+   store changes mid-run — is removed (`lead-remove`), so the table and the
+   CSV can never show numbers that break the rules the run collected with.
 5. Generation stops as soon as the requested number of leads is found, or —
    if the strict ceilings leave fewer apps than requested — after the query
    waves are exhausted, reported honestly as `plan-exhausted` with the count
@@ -126,11 +129,13 @@ Missing ratings and missing/unparseable install counts **never** qualify.
 Install counts are store buckets (`"10,000+"`), so they are treated as lower
 bounds and flagged with `installCertainty: "bucket"`.
 
-Detail pages are authoritative: after enrichment a lead is re-checked against
-the ceilings (and re-matched against the keyword on the combined search +
-detail text). A lead that no longer qualifies — or whose detail page cannot
-confirm a rating from the run's country — is removed from the table rather
-than left on screen with numbers that break the rules it was collected with.
+Detail pages are the gate: a search-card match is verified against its
+country's detail page **before it is ever shown** (relevance is re-matched on
+the combined search + detail text), so the foreign storefront's rating can
+never flash a row onto the table and take it away again. After a lead is on
+screen, a detail page that later stops qualifying — or cannot confirm a rating
+from the run's country — removes it rather than leaving numbers on screen that
+break the rules it was collected with.
 Every row's link carries the same country (`&gl=…`), so opening it shows the
 same numbers the table printed.
 

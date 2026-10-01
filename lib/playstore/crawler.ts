@@ -4,7 +4,9 @@ import type {
   DoneReason,
   GenerationEvent,
   GenerationStats,
+  Lead,
   LeadFilters,
+  PendingVerify,
   QueryPlanEntry,
   SessionCounters,
   SessionCursor,
@@ -66,6 +68,17 @@ const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_ENRICH_QUEUE = 1_000;
 /** Enriched detail pages per step before the step reports back to the caller. */
 const MAX_ENRICH_PER_STEP = 200;
+/**
+ * Search-card matches waiting for their country's canonical detail page.
+ * Verified candidates are streamed to the table only after that page confirms
+ * both ceilings, so the queue holds everything the run has found but not yet
+ * been allowed to show. The cap only matters under pathological supply (hundreds
+ * of matches inside a single window); overflow falls back to showing the
+ * card-verified lead rather than silently discarding a passing candidate.
+ */
+const MAX_PENDING_QUEUE = 500;
+/** Detail verifications per step before the step reports back to the caller. */
+const MAX_PENDING_PER_STEP = 500;
 /**
  * Package names kept for dedupe. Past this point repeats may be re-evaluated;
  * `emitted` still guarantees a lead is only counted once. The cap also keeps
@@ -193,6 +206,7 @@ export function createInitialCursor(keyword: string): SessionCursor {
     similarQueue: [],
     expanded: [],
     enrichQueue: [],
+    pendingQueue: [],
     counters: emptyCounters(),
   };
 }
@@ -255,9 +269,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   const expanded = new Set(cursor.expanded);
   const queuedSeeds = new Set(cursor.similarQueue.map((seed) => seed.p));
   const queuedEnrich = new Set(cursor.enrichQueue);
+  const queuedPending = new Set(cursor.pendingQueue.map((entry) => entry.p));
   const suggestions = [...cursor.suggestions];
   let expandRequests = 0;
   let enrichRequests = 0;
+  let pendingRequests = 0;
+  /** Pending packages that failed this step; retried on the next one instead. */
+  const pendingRetried = new Set<string>();
   let parseFailures = 0;
   let transportFailures = 0;
   let suggestFailed = false;
@@ -313,19 +331,26 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         if (emitted.has(lead.packageName)) continue;
         if (cursor.counters.matched >= filters.limit) return true;
 
-        emitted.add(lead.packageName);
-        cursor.counters.matched += 1;
-        if (
-          lead.ratingsCount === null &&
-          !queuedEnrich.has(lead.packageName) &&
-          cursor.enrichQueue.length < MAX_ENRICH_QUEUE
-        ) {
-          queuedEnrich.add(lead.packageName);
-          cursor.enrichQueue.push(lead.packageName);
+        // The search card's rating came from whichever storefront answered the
+        // query, but the table must show this run's country. Queue the package
+        // for its canonical detail page — the lead is emitted only after that
+        // page confirms both ceilings, so rows that appear never have to be
+        // retracted when the foreign storefront's rating turns out to differ.
+        if (cursor.pendingQueue.length < MAX_PENDING_QUEUE) {
+          if (!queuedPending.has(lead.packageName)) {
+            queuedPending.add(lead.packageName);
+            cursor.pendingQueue.push({
+              p: lead.packageName,
+              i: lead.installs,
+              s: lead.summary,
+            });
+          }
+          continue;
         }
-        pushSeed({ p: lead.packageName, i: lead.installs }, queuedSeeds);
-        emit({ type: "lead", lead, stats: stats() });
-        if (cursor.counters.matched >= filters.limit) return true;
+        // Safety valve: the verify queue is overflowing (hundreds of matches
+        // inside one window). Show the card-verified lead instead of silently
+        // discarding a candidate that already passed every card-side rule.
+        if (emitLead(lead)) return true;
         continue;
       }
 
@@ -336,6 +361,35 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
     return false;
   };
+
+  /**
+   * Counts a verified lead, streams it to the client and returns true when
+   * this lead reached the target. The only place a lead ever becomes visible.
+   */
+  const emitLead = (lead: Lead): boolean => {
+    if (emitted.has(lead.packageName)) return cursor.counters.matched >= filters.limit;
+    if (cursor.counters.matched >= filters.limit) return true;
+
+    emitted.add(lead.packageName);
+    cursor.counters.matched += 1;
+    if (
+      lead.ratingsCount === null &&
+      !queuedEnrich.has(lead.packageName) &&
+      cursor.enrichQueue.length < MAX_ENRICH_QUEUE
+    ) {
+      queuedEnrich.add(lead.packageName);
+      cursor.enrichQueue.push(lead.packageName);
+    }
+    pushSeed({ p: lead.packageName, i: lead.installs }, queuedSeeds);
+    emit({ type: "lead", lead, stats: stats() });
+    return cursor.counters.matched >= filters.limit;
+  };
+
+  /** Removes a package from the pending-verify queue (verified or gone). */
+  function dropFromPending(pkg: string): void {
+    queuedPending.delete(pkg);
+    cursor.pendingQueue = cursor.pendingQueue.filter((entry) => entry.p !== pkg);
+  }
 
   function pushSeed(seed: SimilarSeed, queued: Set<string>): void {
     if (queued.has(seed.p) || cursor.similarQueue.length >= MAX_SIMILAR_QUEUE) return;
@@ -386,6 +440,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   function dropLead(pkg: string): boolean {
     if (!emitted.has(pkg)) return false;
     emitted.delete(pkg);
+    dropFromPending(pkg);
     if (queuedEnrich.delete(pkg)) {
       cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
     }
@@ -564,6 +619,104 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
   }
 
+  /**
+   * Verifies a search-card match against its canonical detail page from this
+   * run's country — the single gate a lead must pass before it may appear.
+   *
+   * The card's rating came from whichever storefront answered the query; this
+   * page reports what the user's own Play Store shows. Only a lead confirmed
+   * here is emitted, so the table never has to retract a row it already showed
+   * (the previous flow emitted on the card's rating and removed the lead when
+   * the country page disagreed — most rows vanished seconds after appearing).
+   */
+  async function runPendingTask(entry: PendingVerify): Promise<TaskOutcome> {
+    if (options.aborted?.()) return "ok";
+    pendingRequests += 1;
+    currentQuery = entry.p;
+    emit({
+      type: "progress",
+      stats: stats(),
+      message: `Fetching details for ${entry.p}…`,
+    });
+
+    try {
+      const detail = await fetchAppDetail(client, entry.p, "en", filters.country);
+      cursor.counters.pagesFetched += 1;
+      parseFailures = 0;
+      transportFailures = 0;
+      dropFromPending(entry.p);
+
+      // The card match no longer seeds itself; walk its similar apps here so
+      // the expansion continues from the same detail page we just fetched.
+      let target = false;
+      if (detail.app && detail.app.packageName === entry.p && !expanded.has(entry.p)) {
+        expanded.add(entry.p);
+        cursor.expanded.push(entry.p);
+        if (ingest(detail.similarApps)) return "target";
+      }
+
+      if (detail.app && detail.app.packageName === entry.p) {
+        // The detail page is authoritative, but its parsed text or install
+        // bucket can be thinner than the card's — fall back to the card's
+        // values so a fully passing candidate is never lost to a parse gap.
+        const app: StoreApp = {
+          ...detail.app,
+          installs: detail.app.installs ?? entry.i,
+          summary: detail.app.summary ?? entry.s,
+        };
+        if (detailAppQualifies(app, filters)) {
+          const evalSeen = new Set(seen);
+          evalSeen.delete(entry.p);
+          const evaluation = evaluateApp(app, filters, evalSeen);
+          if (evaluation.status === "match" && evaluation.lead) {
+            target = emitLead(evaluation.lead);
+          }
+        }
+      }
+      return target ? "target" : "ok";
+    } catch (error) {
+      if (error instanceof PlayRateLimitError) return "rate-limited";
+
+      if (error instanceof PlayHttpError && error.status === 404) {
+        // Gone before it was ever shown: drop the pending entry silently —
+        // there is no row to retract and no lead to count.
+        dropFromPending(entry.p);
+        return "ok";
+      }
+
+      // The candidate stays queued and is retried on the next step rather
+      // than inside this window (a permanent per-URL failure must not spin).
+      pendingRetried.add(entry.p);
+
+      if (error instanceof PlayParseError) {
+        parseFailures += 1;
+        return "parse-failure";
+      }
+
+      transportFailures += 1;
+      emit({
+        type: "warning",
+        message: `Could not fetch details for ${entry.p}.`,
+      });
+      return "transport-failure";
+    }
+  }
+
+  const pendingFlight = new Set<string>();
+  /** Pulls the next unverified candidate, skipping ones already retried. */
+  const pullPendingTask = (): Promise<TaskOutcome> | null => {
+    if (pendingRequests >= MAX_PENDING_PER_STEP) return null;
+    for (const entry of cursor.pendingQueue) {
+      if (pendingFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
+      pendingFlight.add(entry.p);
+      return runPendingTask(entry).then((outcome) => {
+        pendingFlight.delete(entry.p);
+        return outcome;
+      });
+    }
+    return null;
+  };
+
   // --------------------------------------------------------------- suggest --
   while (cursor.phase === "suggest") {
     const prefixes = suggestPrefixes(cursor.keyword);
@@ -652,9 +805,16 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     let expandCredit = 0;
     const enrichFlight = new Set<string>();
     const pullSearchTask = (): Promise<TaskOutcome> | null => {
-      // Canonical detail pages for leads already on screen come first: the
-      // table must show this run's country rating, and the search phase is the
-      // only phase guaranteed to execute before the step's budget runs out.
+      // Candidates awaiting their country's detail page come first: that page
+      // is the only gate before a lead may appear, so a match found this very
+      // window reaches the table as soon as it is confirmed — and never
+      // before. On transient failures the package stays queued for the next
+      // step, so a null return here just falls through to the queues below.
+      const pending = pullPendingTask();
+      if (pending) return pending;
+
+      // Then backfill metadata for leads already on screen (their ratings
+      // count, if the detail page carried none at verification time).
       if (enrichRequests + enrichFlight.size < MAX_ENRICH_PER_STEP) {
         for (const pkg of cursor.enrichQueue) {
           if (enrichFlight.has(pkg)) continue;
@@ -764,6 +924,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     const outcomes = await runWindow(
       SEARCH_CONCURRENCY,
       () => {
+        const pending = pullPendingTask();
+        if (pending) return pending;
         const [seed] = takeSeeds(1);
         return seed ? runExpandTask(seed) : null;
       },
@@ -785,6 +947,36 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
   // ---------------------------------------------------------------- enrich --
   while (cursor.phase === "enrich") {
+    if (cursor.counters.matched >= filters.limit) break;
+
+    // Drain pending verifications before anything else: every candidate here
+    // already passed the card check, and a terminal decision with the queue
+    // non-empty would discard leads the run already spent searches on.
+    if (cursor.pendingQueue.length > 0) {
+      if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
+        return finish(
+          "budget-exhausted",
+          "Time budget reached for this step — resume to continue.",
+          true,
+        );
+      }
+      const pendingOutcomes = await runWindow(
+        ENRICH_CONCURRENCY,
+        pullPendingTask,
+        () =>
+          cursor.counters.matched < filters.limit &&
+          hasTimeForRequest(BATCH_HEADROOM_MS) &&
+          parseFailures < MAX_PARSE_FAILURES &&
+          transportFailures < MAX_TRANSPORT_FAILURES,
+      );
+      const pendingFailure = batchFailure(pendingOutcomes);
+      if (pendingFailure) return pendingFailure;
+      // Nothing pulled (everything left was already retried this step) or the
+      // target just closed the queue — stop looping over an unchanged queue.
+      if (pendingOutcomes.length === 0 || pendingOutcomes.includes("target")) break;
+      continue;
+    }
+
     if (cursor.enrichQueue.length === 0 || enrichRequests >= MAX_ENRICH_PER_STEP) break;
     if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
       return finish(
@@ -820,6 +1012,25 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   // ------------------------------------------------------------------ done --
+  if (cursor.counters.matched >= filters.limit) {
+    return finish(
+      "target-reached",
+      `Found ${cursor.counters.matched} matching leads for “${filters.keyword}”.`,
+      false,
+    );
+  }
+
+  // A terminal decision with candidates still pending would silently discard
+  // leads the run already spent searches on, so report back and let the next
+  // step (or the dashboard's auto-resume) drain the queue first.
+  if (cursor.pendingQueue.length > 0) {
+    return finish(
+      "budget-exhausted",
+      `Verifying ${cursor.pendingQueue.length} candidate${cursor.pendingQueue.length === 1 ? "" : "s"} against the ${filters.country} Play Store — resume to continue.`,
+      true,
+    );
+  }
+
   if (cursor.enrichQueue.length > 0 && enrichRequests >= MAX_ENRICH_PER_STEP) {
     return finish(
       "budget-exhausted",
@@ -833,14 +1044,6 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       "budget-exhausted",
       "Exploring related apps — resume to continue.",
       true,
-    );
-  }
-
-  if (cursor.counters.matched >= filters.limit) {
-    return finish(
-      "target-reached",
-      `Found ${cursor.counters.matched} matching leads for “${filters.keyword}”.`,
-      false,
     );
   }
 

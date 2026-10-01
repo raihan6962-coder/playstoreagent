@@ -90,6 +90,22 @@ export interface GenerationStats extends SessionCounters {
   elapsedMs: number;
 }
 
+/**
+ * A candidate that passed every check the search card can answer (rating,
+ * installs, relevance) and now waits for its canonical detail page from this
+ * run's own country. Only after that page confirms both ceilings does the
+ * candidate become a lead — so a row that appears in the table never has to be
+ * retracted when the foreign storefront's rating turns out to differ.
+ */
+export interface PendingVerify {
+  /** Package name awaiting its canonical detail page. */
+  p: string;
+  /** Install count from the search card (fallback if the detail page lacks one). */
+  i: number | null;
+  /** Search-card summary (fallback when the detail page carries no text). */
+  s: string | null;
+}
+
 export interface SessionCursor {
   /** Keyword the session was started for; guards against mismatched resumes. */
   keyword: string;
@@ -123,6 +139,12 @@ export interface SessionCursor {
   expanded: string[];
   /** Confirmed leads that still need a ratings count from their detail page. */
   enrichQueue: string[];
+  /**
+   * Search-card matches awaiting verification against their detail page from
+   * this run's country. Drained before every terminal decision, so a candidate
+   * that already earned a search request is never silently discarded.
+   */
+  pendingQueue: PendingVerify[];
   counters: SessionCounters;
 }
 

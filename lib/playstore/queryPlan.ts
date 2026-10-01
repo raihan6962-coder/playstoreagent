@@ -1,4 +1,5 @@
 import { tokenizeKeyword } from "@/lib/filters/relevance";
+import { keywordVariants } from "@/lib/playstore/keywords";
 import type { PriceFilter, QueryKind, QueryPlanEntry } from "@/types/lead";
 
 /** Cap on the legacy single-locale plan helpers. */
@@ -236,11 +237,13 @@ export function keepsKeyword(keyword: string, suggestion: string): boolean {
 }
 
 /**
- * Ordered query list: deterministic base queries first, then Play suggestions
- * appended in discovery order, then (when `wave > 0`) the deterministic
- * long-tail wave batch. Appending is what makes `planIndex` stable across
- * resumes and across waves — earlier entries never move, so wave K's queries
- * are always the first K × {@link WAVE_QUERIES_PER_WAVE} candidates.
+ * Ordered query list: deterministic base queries first, then the locally
+ * generated topic-consistent variants (every one embeds the full keyword),
+ * then Play suggestions appended in discovery order, and finally (when
+ * `wave > 0`) the deterministic long-tail wave batch. Appending is what makes
+ * `planIndex` stable across resumes and across waves — earlier entries never
+ * move, so wave K's queries are always the first K ×
+ * {@link WAVE_QUERIES_PER_WAVE} candidates beyond the base plan.
  */
 export function buildPlanQueries(
   keyword: string,
@@ -250,7 +253,15 @@ export function buildPlanQueries(
   const base = baseQuerySpecs(keyword);
   const out = [...base];
   const seen = new Set(out.map((item) => item.query.toLowerCase()));
-  const budget = base.length + MAX_SUGGESTION_QUERIES;
+
+  for (const variant of keywordVariants(keyword)) {
+    const key = variant.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ query: variant, kind: "variant" });
+  }
+
+  const budget = out.length + MAX_SUGGESTION_QUERIES;
 
   for (const suggestion of suggestions) {
     if (out.length >= budget) break;

@@ -31,25 +31,30 @@ import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
 /** Requests issued in parallel inside one batch (search, expand or enrich). */
-export const SEARCH_CONCURRENCY = 16;
+export const SEARCH_CONCURRENCY = 24;
 /**
  * Minimum spacing between request starts. Throughput is bounded by the gate
- * (1 / intervalMs) and by latency inside a batch (the batch waits for its
- * slowest task), so both ends have to move together: production measured
- * 4.67 req/s at 8 × 180 ms — 84% of the 5.55 gate cap, with the batch side
- * at 8 / 1.7 s ≈ the same number. 16 × 120 ms lifts the cap to 8.3 req/s;
- * any Play pushback still goes through RateGate.penalize, which doubles the
- * spacing up to 4 s and creeps back after successful requests.
+ * (1 / intervalMs) and by latency inside a window, so both ends move together:
+ * production measured 8.0–8.2 req/s at 16 × 120 ms (gate cap 8.3) across two
+ * full E2E runs. 100 ms widens the cap to 10 req/s and 24 slots keep the
+ * window full at typical Play latency; any pushback still goes through
+ * RateGate.penalize, which doubles the spacing up to 4 s and creeps back
+ * after successful requests.
  */
-export const CLIENT_INTERVAL_MS = 120;
+export const CLIENT_INTERVAL_MS = 100;
 /** Suggest lookups issued in parallel inside one step. */
-export const SUGGEST_CONCURRENCY = 16;
+export const SUGGEST_CONCURRENCY = 24;
 /** Detail pages fetched per step to backfill lead metadata. */
-export const ENRICH_CONCURRENCY = 16;
+export const ENRICH_CONCURRENCY = 24;
 /** Suggest prefixes processed per step (the rest resume later). */
 const SUGGESTS_PER_PREFIX = 10;
-/** How many "similar apps" detail pages one step may fetch. */
-const MAX_EXPAND_REQUESTS = 500;
+/**
+ * Detail pages per step spent walking "similar apps". Measured in
+ * research3.test.ts: that walk yields ~6x the qualified leads per request of a
+ * fresh search, so expansion gets the larger half of each window (see
+ * EXPAND_SLOTS_*) and this cap is sized to keep it fed for a whole step.
+ */
+const MAX_EXPAND_REQUESTS = 1_500;
 /** Stop queueing expansion seeds beyond this size. */
 const MAX_SIMILAR_QUEUE = 2_000;
 /**
@@ -76,14 +81,15 @@ const REQUEST_HEADROOM_MS = 1_500;
 /** A parallel batch needs more slack than a single request. */
 const BATCH_HEADROOM_MS = 5_000;
 /**
- * Detail pages and searches share every batch: walking "similar apps" measured
- * ~6x the qualified leads per request of a fresh search (see research3.test.ts),
- * so a healthy seed queue keeps a large share of the batch busy with expansion.
+ * Detail pages and searches share every window: walking "similar apps"
+ * measured ~6x the qualified leads per request of a fresh search (see
+ * research3.test.ts), so a healthy seed queue gets the larger half of the
+ * window — eight of 24 slots — and a sparse queue still gets a quarter.
  */
-const EXPAND_SLOTS_FULL = 4;
-const EXPAND_SLOTS_SPARSE = 1;
-/** Seed queue size considered "healthy" for a full expansion slot share. */
-const EXPAND_QUEUE_HEALTHY = 12;
+const EXPAND_SLOTS_FULL = 8;
+const EXPAND_SLOTS_SPARSE = 2;
+/** Seed queue size considered "healthy" for the full expansion slot share. */
+const EXPAND_QUEUE_HEALTHY = 8;
 
 type TaskOutcome = "ok" | "target" | "rate-limited" | "parse-failure" | "transport-failure";
 

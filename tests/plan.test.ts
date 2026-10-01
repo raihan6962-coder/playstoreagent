@@ -35,8 +35,10 @@ describe("storefront sweep plan", () => {
   });
 
   it("gives the head queries the full sweep and the rest the core sweep", () => {
-    const queries = buildPlanQueries(KEYWORD, ["crypto wallet app", "old crypto wallet"]);
-    expect(queries.length).toBe(66);
+    const queries = buildPlanQueries(KEYWORD, ["cold crypto wallet", "green crypto wallet"]);
+    const withoutSuggestions = buildPlanQueries(KEYWORD);
+    // Both suggestions are novel and keyword-preserving, so they append one each.
+    expect(queries.length).toBe(withoutSuggestions.length + 2);
 
     const headBlock = 2 * PLAN_LOCALES.length;
     expect(planSize(queries)).toBe(headBlock + (queries.length - 2) * CORE_LOCALES.length);
@@ -115,7 +117,9 @@ describe("storefront sweep plan", () => {
     const wave2 = buildPlanQueries(KEYWORD, suggestions, 2);
 
     expect(wave1.length).toBe(wave0.length + WAVE_QUERIES_PER_WAVE);
-    expect(wave2.length).toBe(wave1.length + WAVE_QUERIES_PER_WAVE);
+    // Later waves keep growing while unique candidates last (the pool is
+    // finite when there are no Play suggestions to draw from).
+    expect(wave2.length).toBeGreaterThan(wave1.length);
     expect(wave1.slice(0, wave0.length)).toEqual(wave0);
     expect(wave2.slice(0, wave1.length)).toEqual(wave1);
 

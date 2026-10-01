@@ -3,7 +3,12 @@ import {
   createInitialCursor,
   runGenerationStep,
 } from "@/lib/playstore/crawler";
-import { buildPlanQueries, keepsKeyword, planSize } from "@/lib/playstore/queryPlan";
+import {
+  buildPlanQueries,
+  keepsKeyword,
+  MAX_SUGGESTION_QUERIES,
+  planSize,
+} from "@/lib/playstore/queryPlan";
 import { PlayHttpError } from "@/lib/playstore/client";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
@@ -254,7 +259,9 @@ describe("runGenerationStep", () => {
     expect(cursor.suggestions.every((label) => keepsKeyword(KEYWORD, label))).toBe(true);
     const queries = buildPlanQueries(KEYWORD, cursor.suggestions);
     expect(queries.some((item) => item.kind === "suggestion")).toBe(true);
-    expect(queries.length).toBeLessThanOrEqual(48 + 400);
+    expect(queries.length).toBeLessThanOrEqual(
+      buildPlanQueries(KEYWORD, []).length + MAX_SUGGESTION_QUERIES,
+    );
   });
 
   it("wraps up early when the caller aborts", async () => {

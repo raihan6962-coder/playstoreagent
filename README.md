@@ -14,10 +14,13 @@ to the browser in real time and exports them as CSV.
    (e.g. `100K`), your Play Store country (two-letter code, default `BD`) and
    how many leads you want (1–1,000).
 2. The server searches the Play Store, starting with your keyword and then a
-   plan of related queries (suggestions, variants, long-tail modifiers,
-   40+ storefront locales, free/paid filters). When the base plan runs out
-   before your lead limit, the run appends fresh query waves and keeps going —
-   it only stops at your limit or when another wave finds nothing new.
+   plan of related queries: **locally generated topic-consistent variants of
+   your keyword** (every one keeps all of the keyword's significant words —
+   "best budget tracker", "budget tracker lite apk", …), Play's own
+   suggestions, variants, long-tail modifiers, 40+ storefront locales and
+   free/paid filters. When the base plan runs out before your lead limit, the
+   run appends fresh query waves and keeps going — it only stops at your
+   limit or when another wave finds nothing new.
 3. Every app card is scored for keyword relevance and qualified against your
    rating and install ceilings. Matches stream to the table immediately.
 4. Confirmed leads are enriched from their detail page — fetched **from your
@@ -69,6 +72,7 @@ lib/
     client.ts             polite HTTP client (timeout, retries, request gate)
     search.ts / detail.ts Play search + detail page fetchers
     suggest.ts            Play's own related-search suggestions (best effort)
+    keywords.ts           deterministic topic-consistent keyword variants
     queryPlan.ts          deterministic plan of related queries
     crawler.ts            resumable session engine that emits GenerationEvent
   parser/                 AF_initDataCallback, JSON-LD, installs, rating, HTML

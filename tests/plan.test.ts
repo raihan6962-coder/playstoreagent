@@ -8,6 +8,7 @@ import {
   MAX_WAVES,
   PLAN_LOCALES,
   planSize,
+  storefrontsFor,
   suggestPrefixes,
   WAVE_QUERIES_PER_WAVE,
 } from "@/lib/playstore/queryPlan";
@@ -137,6 +138,53 @@ describe("storefront sweep plan", () => {
     const beyond = buildPlanQueries(KEYWORD, [], MAX_WAVES + 5);
     expect(beyond.length).toBe(capped.length);
     expect(beyond.length).toBeGreaterThan(buildPlanQueries(KEYWORD).length);
+  });
+});
+
+describe("run's own storefront in the sweep", () => {
+  const queries = buildPlanQueries(KEYWORD);
+  const headBlock = 2 * PLAN_LOCALES.length;
+
+  it("searches the run's country first in the head and the core sweep", () => {
+    // A country the sweep does not know yet…
+    expect(entryAt(queries, 0, "BD")?.gl).toBe("BD");
+    expect(entryAt(queries, headBlock, "BD")?.gl).toBe("BD");
+    // …and one that is already part of both lists moves to the front.
+    expect(entryAt(queries, 0, "IN")?.gl).toBe("IN");
+    expect(entryAt(queries, headBlock, "IN")?.gl).toBe("IN");
+    expect(entryAt(queries, 1, "IN")?.gl).toBe("US");
+  });
+
+  it("keeps the plan size and every entry resolvable regardless of country", () => {
+    const total = planSize(queries);
+    for (const country of ["US", "BD", "AE", "FR"]) {
+      const seenPairs = new Set<string>();
+      for (let index = 0; index < total; index += 1) {
+        const resolved = entryAt(queries, index, country);
+        expect(resolved).not.toBeNull();
+        seenPairs.add(
+          `${resolved!.query}|${resolved!.hl}|${resolved!.gl}|${resolved!.price ?? "all"}`,
+        );
+      }
+      expect(seenPairs.size).toBe(total);
+      expect(entryAt(queries, total, country)).toBeNull();
+    }
+    // The shared plan must not depend on the country: saved cursors validate
+    // their planIndex against planSize alone.
+    expect(PLAN_LOCALES[0]).toMatchObject({ hl: "en", gl: "US" });
+    expect(CORE_LOCALES[0]).toMatchObject({ hl: "en", gl: "US" });
+  });
+
+  it("swaps without dropping a storefront wholesale", () => {
+    const { head, core } = storefrontsFor("AE");
+    expect(head).toHaveLength(PLAN_LOCALES.length);
+    expect(core).toHaveLength(CORE_LOCALES.length);
+    expect(head[0]).toMatchObject({ gl: "AE" });
+    expect(core[0]).toMatchObject({ gl: "AE" });
+    // The English slot the country swapped into is still swept by its
+    // language storefront (for AE that slot was English FR).
+    expect(core.some((locale) => locale.gl === "FR" && locale.hl === "fr")).toBe(true);
+    expect(core.some((locale) => locale.gl === "US")).toBe(true);
   });
 });
 

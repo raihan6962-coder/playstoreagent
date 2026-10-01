@@ -335,21 +335,84 @@ export function planSize(queries: PlanQuery[]): number {
   return storefrontCount(queries.length);
 }
 
+/**
+ * Rewrites a storefront list so the run's own country is searched **first**
+ * while the list keeps exactly the same length (the plan size — and with it
+ * every saved cursor's `planIndex` bounds — must not depend on the country).
+ *
+ * Why this matters: a search card shows the rating of the storefront that
+ * answered it. Qualification, however, is verified against the run's own
+ * country's detail page (see crawler.ts `runPendingTask`). Sweeping only
+ * foreign storefronts therefore matches cards on ratings the user's Play Store
+ * never shows and rejects them at verification — under a strict ceiling the
+ * table stays empty while the plan burns queries. Putting the country's own
+ * storefront into the rotation (first, then in every cycle) is what produces
+ * cards whose rating is already the number the run will verify.
+ *
+ * If the country already appears in the list it is moved to the front; if it
+ * never appears, it swaps into the last plain-English slot (the language
+ * storefronts still cover every language, so no locale is lost wholesale).
+ */
+function withCountry(locales: PlanLocale[], country: string): PlanLocale[] {
+  const target = country.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(target)) return locales;
+
+  const existing = locales.findIndex((item) => item.gl === target && item.hl === "en" && !item.price);
+  if (existing === 0) return locales;
+  const copy = [...locales];
+  if (existing > 0) {
+    const [found] = copy.splice(existing, 1);
+    copy.unshift(found);
+    return copy;
+  }
+
+  let slot = -1;
+  for (let index = copy.length - 1; index >= 0; index -= 1) {
+    const item = copy[index];
+    if (item.hl === "en" && !item.price) {
+      slot = index;
+      break;
+    }
+  }
+  if (slot < 0) return locales;
+  copy[slot] = { hl: "en", gl: target };
+  const [moved] = copy.splice(slot, 1);
+  copy.unshift(moved);
+  return copy;
+}
+
+const storefrontCache = new Map<string, { head: PlanLocale[]; core: PlanLocale[] }>();
+
+/** Head and core sweeps for a run's country (cached; lengths are stable). */
+export function storefrontsFor(country: string): { head: PlanLocale[]; core: PlanLocale[] } {
+  const key = (country || "US").trim().toUpperCase();
+  const cached = storefrontCache.get(key);
+  if (cached) return cached;
+  const resolved = { head: withCountry(PLAN_LOCALES, key), core: withCountry(CORE_LOCALES, key) };
+  storefrontCache.set(key, resolved);
+  return resolved;
+}
+
 /** Resolves one index of the query × storefront cross product. */
-export function entryAt(queries: PlanQuery[], index: number): QueryPlanEntry | null {
+export function entryAt(
+  queries: PlanQuery[],
+  index: number,
+  country = "US",
+): QueryPlanEntry | null {
   if (index < 0 || queries.length === 0) return null;
 
-  const headBlock = Math.min(queries.length, FULL_SWEEP_QUERIES) * PLAN_LOCALES.length;
+  const { head, core } = storefrontsFor(country);
+  const headBlock = Math.min(queries.length, FULL_SWEEP_QUERIES) * head.length;
   let queryIndex: number;
   let locale: PlanLocale;
 
   if (index < headBlock) {
-    queryIndex = Math.floor(index / PLAN_LOCALES.length);
-    locale = PLAN_LOCALES[index % PLAN_LOCALES.length];
+    queryIndex = Math.floor(index / head.length);
+    locale = head[index % head.length];
   } else {
     const offset = index - headBlock;
-    queryIndex = FULL_SWEEP_QUERIES + Math.floor(offset / CORE_LOCALES.length);
-    locale = CORE_LOCALES[offset % CORE_LOCALES.length];
+    queryIndex = FULL_SWEEP_QUERIES + Math.floor(offset / core.length);
+    locale = core[offset % core.length];
   }
 
   const query = queries[queryIndex];

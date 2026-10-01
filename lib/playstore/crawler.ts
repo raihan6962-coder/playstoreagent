@@ -843,7 +843,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         expandCredit = 0;
       }
 
-      const entry = entryAt(queries, cursor.planIndex);
+      const entry = entryAt(queries, cursor.planIndex, filters.country);
       if (!entry) {
         if (!seedsAvailable) return null;
         const [seed] = takeSeeds(1);
@@ -873,7 +873,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       cursor.phase = "enrich";
       break;
     }
-    if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex) === null) {
+    if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex, filters.country) === null) {
       // The plan ran out before the lead limit: keep generating. Each wave
       // appends a fresh deterministic batch of long-tail queries (appended
       // only, so `planIndex` stays valid). A wave that finds no new app means

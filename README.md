@@ -18,7 +18,10 @@ to the browser in real time and exports them as CSV.
    your keyword** (every one keeps all of the keyword's significant words —
    "best budget tracker", "budget tracker lite apk", …), Play's own
    suggestions, variants, long-tail modifiers, 40+ storefront locales and
-   free/paid filters. When the base plan runs out before your lead limit, the
+   free/paid filters. **Your own country's storefront is searched first in
+   every sweep** — its search cards already carry the ratings your Play Store
+   shows, so matches survive verification instead of being judged on another
+   country's numbers. When the base plan runs out before your lead limit, the
    run appends fresh query waves and keeps going — it only stops at your
    limit or when another wave finds nothing new.
 3. Every app card is scored for keyword relevance and qualified against your

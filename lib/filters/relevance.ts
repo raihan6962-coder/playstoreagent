@@ -67,12 +67,18 @@ function commonPrefixLength(a: string, b: string): number {
 /**
  * Matches lightly inflected forms of the same word: "wallet"/"wallets",
  * "tracker"/"tracking", "crypto"/"cryptocurrency".
+ *
+ * The shared prefix must reach deep into the shorter word (five characters,
+ * or all of it when it is shorter). A looser four-letter rule made
+ * "wallet" match "wallpapers" — unrelated words that merely start alike are
+ * not inflections of each other, and the false positives it let through were
+ * real rows in the user's table.
  */
 export function wordsMatch(keywordWord: string, textWord: string): boolean {
   if (keywordWord === textWord) return true;
   const shorter = Math.min(keywordWord.length, textWord.length);
-  if (shorter >= 4) return commonPrefixLength(keywordWord, textWord) >= 4;
-  return keywordWord.startsWith(textWord) || textWord.startsWith(keywordWord);
+  if (shorter < 4) return keywordWord.startsWith(textWord) || textWord.startsWith(keywordWord);
+  return commonPrefixLength(keywordWord, textWord) >= Math.min(shorter, 5);
 }
 
 export interface RelevanceResult {

@@ -21,8 +21,18 @@ describe("tokenizeKeyword", () => {
 describe("wordsMatch", () => {
   it("matches lightly inflected forms", () => {
     expect(wordsMatch("tracker", "trackers")).toBe(true);
+    expect(wordsMatch("tracker", "tracking")).toBe(true);
     expect(wordsMatch("crypto", "cryptocurrency")).toBe(true);
+    expect(wordsMatch("wallet", "wallets")).toBe(true);
     expect(wordsMatch("budget", "billets")).toBe(false);
+  });
+
+  it("does not match unrelated words that merely share four letters", () => {
+    // Production case: "wallet" matched "wallpapers", so wallpaper apps
+    // qualified as leads for the keyword "wallet".
+    expect(wordsMatch("wallet", "wallpapers")).toBe(false);
+    expect(wordsMatch("wallet", "wallreels")).toBe(false);
+    expect(wordsMatch("money", "monkey")).toBe(false);
   });
 });
 

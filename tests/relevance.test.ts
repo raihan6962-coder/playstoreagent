@@ -136,6 +136,7 @@ describe("scoreRelevance", () => {
       tokens,
     );
     expect(devOnly.matchedTerms).toEqual(["wallet"]);
+    expect(devOnly.primaryTerms).toEqual([]);
     expect(devOnly.relevant).toBe(false);
 
     const descOnly = scoreRelevance(
@@ -147,6 +148,7 @@ describe("scoreRelevance", () => {
       },
       tokenizeKeyword("wallet"),
     );
+    expect(descOnly.primaryTerms).toEqual(["wallet"]);
     expect(descOnly.relevant).toBe(true);
   });
 });

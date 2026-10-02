@@ -126,14 +126,14 @@ describe("cardCanStillQualify", () => {
     expect(cardCanStillQualify({ rating: null, installs: null }, filters, true)).toBe(true);
   });
 
-  it("treats foreign ratings above the ceiling as final too", () => {
-    // Measured live (research R6): home storefronts rate these apps *higher*
-    // than foreign ones — 0 of 10 foreign cards printed 3.6–4.5 passed at
-    // home — so a foreign card over the ceiling is a known miss, and only a
-    // card at or below the ceiling earns a detail fetch.
-    expect(FOREIGN_RATING_WINDOW).toBe(0);
-    expect(cardCanStillQualify({ rating: 3.0, installs: 10_000 }, filters, false)).toBe(true);
-    expect(cardCanStillQualify({ rating: 3.1, installs: 10_000 }, filters, false)).toBe(false);
+  it("keeps foreign cards a half-star below the ceiling and drops the rest", () => {
+    // Measured live (research R9): at a 4.0 ceiling, foreign cards printed
+    // 3.6–4.0 passed 0 of 2 verifications at home and home cards passed 2 of
+    // 2 — home storefronts rate these apps *higher*, so a foreign card must
+    // print at least a half-star below the ceiling to still be worth a fetch.
+    expect(FOREIGN_RATING_WINDOW).toBe(-0.5);
+    expect(cardCanStillQualify({ rating: 2.4, installs: 10_000 }, filters, false)).toBe(true);
+    expect(cardCanStillQualify({ rating: 3.0, installs: 10_000 }, filters, false)).toBe(false);
     expect(cardCanStillQualify({ rating: 3.0, installs: 10_000 }, filters, true)).toBe(true);
     expect(cardCanStillQualify({ rating: 3.1, installs: 10_000 }, filters, true)).toBe(false);
     expect(cardCanStillQualify({ rating: null, installs: null }, filters, false)).toBe(true);

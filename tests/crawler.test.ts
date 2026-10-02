@@ -469,6 +469,94 @@ describe("runGenerationStep", () => {
     expect(result.cursor).toBeNull();
   });
 
+  it("never fetches a foreign match printed in the drift dead band", async () => {
+    const harness = collect();
+    const fetched: string[] = [];
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName: string) => {
+        fetched.push(packageName);
+        // No similar-app walk: the only way GOOD_TWO can enter the queues is
+        // the foreign search card that should now reject it outright.
+        const entry = [GOOD, GOOD_TWO, TOO_POPULAR_RATING, TOO_MANY_INSTALLS, IRRELEVANT].find(
+          (item) => item.packageName === packageName,
+        );
+        if (!entry) return searchHtml([]);
+        return detailHtml(
+          { ...entry, summary: entry.packageName === IRRELEVANT.packageName ? "Run from the undead horde" : "Track your budget" },
+          [],
+          entry.installs ?? "10,000+",
+        );
+      },
+    });
+
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "search";
+    // Index 1 of the sweep for country US is a foreign storefront (US owns
+    // index 0), so every search card is read abroad: GOOD_TWO printed 2.7
+    // sits in the dead band between the 2.5 half-star line and the 3.0
+    // ceiling (research R9: foreign cards there passed 0 of 2 at home).
+    cursor.planIndex = 1;
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 50 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    // GOOD_TWO's dead-band card must never verify into a row. (It may still
+    // be *fetched* as an expansion seed — rated relevant cards seed the
+    // similar-app walk — but a seed's detail never emits a lead by itself.)
+    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget"]);
+    expect(result.stats.matched).toBe(1);
+  });
+
+  it("verifies home-storefront matches ahead of foreign ones", async () => {
+    const harness = collect();
+    const fetched: string[] = [];
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName: string) => {
+        fetched.push(packageName);
+        // No similar-app walk: only the two hand-queued matches are fetched,
+        // so the fetch order below is exactly the verify order.
+        const entry = [GOOD, TOO_POPULAR_RATING].find((item) => item.packageName === packageName);
+        if (!entry) return searchHtml([]);
+        return detailHtml({ ...entry, summary: "Track your budget" }, [], entry.installs ?? "10,000+");
+      },
+    });
+
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "enrich";
+    // Foreign match queued first, home match second: the home card's rating
+    // is already final (research R6b: 2 of 2 verified), so it must be pulled
+    // before the foreign one still carrying drift risk.
+    cursor.pendingQueue = [
+      { p: "com.example.famous", i: 10_000, s: "Track your budget" },
+      { p: "com.example.budget", i: 10_000, s: "Track your budget", h: true },
+    ];
+    cursor.seen = ["com.example.famous", "com.example.budget"];
+    cursor.counters.discovered = 2;
+    cursor.counters.evaluated = 2;
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 50 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(fetched[0]).toBe("com.example.budget");
+    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget"]);
+    expect(result.stats.matched).toBe(1);
+    expect(cursor.pendingQueue).toHaveLength(0);
+    expect(result.reason).toBe("plan-exhausted");
+    expect(result.cursor).toBeNull();
+  });
+
   it("keeps every shown lead when a step wraps up and the next one resumes", async () => {
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
     const first = collect();

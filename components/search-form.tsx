@@ -102,7 +102,7 @@ export function SearchForm({
             value={values.maxInstalls}
             onChange={set("maxInstalls")}
             inputMode="text"
-            placeholder="500000"
+            placeholder="5000000"
           />
         </Field>
 

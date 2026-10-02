@@ -23,6 +23,14 @@ export interface Evaluation {
    * fetch — the description may carry the missing term) from no hit at all.
    */
   matchedTerms: string[];
+  /**
+   * The subset of {@link matchedTerms} found in the title or description.
+   * The crawler only queues a *partial* hit for a detail fetch when it comes
+   * from here: developer- and category-only hits proved unable to complete
+   * into a match (the detail re-check reads title + description only), so
+   * they would burn a request on a rejection the card already predicted.
+   */
+  primaryTerms: string[];
 }
 
 export const PLAY_BASE_URL = "https://play.google.com";
@@ -79,7 +87,7 @@ export function evaluateApp(
   const reasons: RejectReason[] = [];
 
   if (seen.has(app.packageName)) {
-    return { status: "reject", reasons: ["duplicate"], lead: null, matchedTerms: [] };
+    return { status: "reject", reasons: ["duplicate"], lead: null, matchedTerms: [], primaryTerms: [] };
   }
 
   const tokens = tokenizeKeyword(filters.keyword);
@@ -121,10 +129,16 @@ export function evaluateApp(
   if (reasons.length > 0 && status === "match") status = "reject";
 
   if (status === "match") {
-    return { status: "match", reasons: [], lead: toLead(app, filters), matchedTerms: relevance.matchedTerms };
+    return {
+      status: "match",
+      reasons: [],
+      lead: toLead(app, filters),
+      matchedTerms: relevance.matchedTerms,
+      primaryTerms: relevance.primaryTerms,
+    };
   }
 
-  return { status, reasons, lead: null, matchedTerms: relevance.matchedTerms };
+  return { status, reasons, lead: null, matchedTerms: relevance.matchedTerms, primaryTerms: relevance.primaryTerms };
 }
 
 /**
@@ -180,24 +194,28 @@ export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean
 }
 
 /**
- * How far above the ceiling a **foreign** storefront's printed rating may sit
- * and still be worth a detail-page fetch from the run's own country.
+ * Slack a **foreign** storefront's printed rating gets before the crawler
+ * stops spending a detail fetch on it.
  *
- * Measured live (research R6): cards printed 3.6–4.5 abroad landed at 3.9–4.9
- * at home — 0 of 10 passed, because home storefronts rate these apps *higher*,
- * not lower. A foreign card printed above the ceiling is therefore a known
- * miss: only cards at or below the ceiling earn a fetch (those still pass
- * 12–100% depending on the storefront, R6b).
+ * Negative by half a star. Measured live (research R9): at a 4.0 ceiling,
+ * foreign cards printed 3.6–4.0 passed 0 of 2 verifications at home, cards
+ * printed 3.1–3.5 passed 1 of 2, and home-storefront cards passed 2 of 2 —
+ * home storefronts rate these apps *higher* than foreign ones, so a foreign
+ * card printed just under the ceiling is a near-certain miss. Only cards at
+ * or below `maxRating - 0.5` earn a foreign fetch; home cards (final
+ * storefront) keep the full ceiling.
  */
-export const FOREIGN_RATING_WINDOW = 0.0;
+export const FOREIGN_RATING_WINDOW = -0.5;
 
 /**
  * Decides whether fetching this card's detail page could still change its
  * verdict. `countryFinal` means the card already shows the run's own
  * storefront: its rating is final, and anything above the ceiling can only be
- * repeated by the detail page. Foreign cards get {@link FOREIGN_RATING_WINDOW}
- * of slack for cross-storefront drift. Install buckets are global (Play prints
- * the same bucket everywhere), so an over-cap bucket is always final.
+ * repeated by the detail page. Foreign cards must sit a half-star **below**
+ * the ceiling ({@link FOREIGN_RATING_WINDOW} is negative) because home
+ * storefronts rate the same apps higher (research R9). Install buckets are
+ * global (Play prints the same bucket everywhere), so an over-cap bucket is
+ * always final.
  */
 export function cardCanStillQualify(
   app: Pick<StoreApp, "rating" | "installs">,

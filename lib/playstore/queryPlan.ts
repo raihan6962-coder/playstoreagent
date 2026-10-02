@@ -350,9 +350,10 @@ export function planSize(queries: PlanQuery[]): number {
  * country's detail page (see crawler.ts `runVerifyTask`). Sweeping only
  * foreign storefronts therefore matches cards on ratings the user's Play Store
  * never shows and rejects them at verification — under a strict ceiling the
- * table stays empty while the plan burns queries. Putting the country's own
- * storefront into the rotation (first, then in every cycle) is what produces
- * cards whose rating is already the number the run will verify.
+ * table stays empty while the plan burns queries. Home cards are also worth
+ * far more than a foreign one (research R9: home 2 of 2 verified vs foreign
+ * 0 of 2 in the top band), and since the cross product walks this list once
+ * per query, the front position gives *every* query one home search first.
  *
  * If the country already appears in the list it is moved to the front; if it
  * never appears, it swaps into the last plain-English slot (the language

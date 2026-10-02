@@ -17,13 +17,13 @@ import type {
 
 export const maxDuration = 300;
 
-/** Longest step: leaves 60s of headroom below `maxDuration` for the platform. */
-const DEFAULT_BUDGET_MS = 240_000;
+/** Longest step: leaves 35s of headroom below `maxDuration` for the platform. */
+const DEFAULT_BUDGET_MS = 265_000;
 const MIN_BUDGET_MS = 5_000;
-const MAX_BUDGET_MS = 240_000;
+const MAX_BUDGET_MS = 265_000;
 
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 6;
+const RATE_LIMIT = 12;
 
 const encoder = new TextEncoder();
 

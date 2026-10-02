@@ -84,6 +84,7 @@ function parsePending(value: unknown, cap: number): PendingVerify[] | null {
             ? summary.slice(0, MAX_PENDING_SUMMARY)
             : summary
           : null,
+      ...(item.h === true ? { h: true } : {}),
     });
   }
   return out;

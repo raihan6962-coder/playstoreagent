@@ -141,6 +141,12 @@ export interface PendingVerify {
   i: number | null;
   /** Search-card summary (fallback when the detail page carries no text). */
   s: string | null;
+  /**
+   * True when the card was read from the run's own storefront — its rating is
+   * already final (research R6b: home cards verify 100%), so these entries
+   * are pulled ahead of foreign ones while both queues wait.
+   */
+  h?: boolean;
 }
 
 export interface SessionCursor {

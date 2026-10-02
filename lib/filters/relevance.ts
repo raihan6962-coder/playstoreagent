@@ -68,7 +68,7 @@ function commonPrefixLength(a: string, b: string): number {
  * Matches lightly inflected forms of the same word: "wallet"/"wallets",
  * "tracker"/"tracking", "crypto"/"cryptocurrency".
  *
- * From five characters up the shared prefix must reach five characters.
+ * From six characters up the shared prefix must reach five characters.
  * Below that the shorter word must be fully consumed *and* the leftover on
  * the longer one must be a plain inflection ending (-s, -ed, -ing, ...):
  * an earlier rule that accepted any fully shared prefix let "wall" match
@@ -91,7 +91,15 @@ export function wordsMatch(keywordWord: string, textWord: string): boolean {
 
 export interface RelevanceResult {
   score: number;
+  /** Terms found in *any* field — developer and category hits included. */
   matchedTerms: string[];
+  /**
+   * Terms found in the title or description — the fields that describe the
+   * app itself. A partial hit qualifies for a detail-page fetch only when it
+   * comes from here; a developer-domain hit can never complete into a match,
+   * so queueing it would only burn a request on a known text rejection.
+   */
+  primaryTerms: string[];
   relevant: boolean;
 }
 
@@ -163,6 +171,7 @@ export function scoreRelevance(
   return {
     score,
     matchedTerms,
+    primaryTerms,
     relevant: score >= RELEVANCE_THRESHOLD && allTermsMatched,
   };
 }

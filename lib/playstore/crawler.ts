@@ -382,13 +382,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         // for its canonical detail page — the lead is emitted only after that
         // page confirms both ceilings, so rows that appear never have to be
         // retracted when the foreign storefront's rating turns out to differ.
-        if (cursor.pendingQueue.length < MAX_PENDING_QUEUE) {
+        // The card must also leave room for cross-storefront drift: a foreign
+        // card printed just under the ceiling is a near-certain miss at home
+        // (research R9: 0 of 2 passed), and home cards jump the verify queue
+        // via their `h` flag (research R6b: home cards verify 100%).
+        const stillQualifies = cardCanStillQualify(app, filters, countryFinal);
+        if (stillQualifies && cursor.pendingQueue.length < MAX_PENDING_QUEUE) {
           if (!queuedPending.has(lead.packageName)) {
             queuedPending.add(lead.packageName);
             cursor.pendingQueue.push({
               p: lead.packageName,
               i: lead.installs,
               s: clipSummary(lead.summary),
+              ...(countryFinal ? { h: true } : {}),
             });
             cursor.counters.candidates += 1;
             if (countryFinal) cursor.counters.homePending += 1;
@@ -398,8 +404,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         // Safety valve: the verify queue is overflowing (hundreds of matches
         // inside one window). Show the card-verified lead instead of silently
         // discarding a candidate that already passed every card-side rule.
-        if (emitLead(lead)) return true;
-        continue;
+        if (stillQualifies) {
+          if (emitLead(lead)) return true;
+          continue;
+        }
+        // Foreign card inside the drift dead band: the card already predicted
+        // the rejection. Falls through so the rated card can still seed an
+        // expansion walk without ever spending a verify fetch on itself.
       }
 
       const relevant = !evaluation.reasons.includes("not-relevant");
@@ -430,18 +441,25 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           reason === "missing-installs" ||
           reason === "unparseable-installs",
       );
+      // A partial hit is only worth a detail fetch when the missing term may
+      // still appear in the description the card could not show — i.e. the
+      // hit that *did* land came from the title or description. A hit found
+      // only in the developer or category can never complete that way (the
+      // verify re-reads title + description), so it falls through to the
+      // rescue below instead of burning a fetch on a predicted text reject.
+      const primaryPartial = evaluation.primaryTerms.length > 0;
       const descriptionRescue =
-        evaluation.matchedTerms.length === 0 &&
+        evaluation.primaryTerms.length === 0 &&
         app.rating !== null &&
         roundRating(app.rating) <= filters.maxRating &&
         (app.installs === null || app.installs <= filters.maxInstalls);
       if (
-        ((!relevant && evaluation.matchedTerms.length > 0) ||
+        ((!relevant && primaryPartial) ||
           undecidedNumbers ||
           descriptionRescue) &&
         cardCanStillQualify(app, filters, countryFinal)
       ) {
-        queueCandidate(app, countryFinal);
+        queueCandidate(app, countryFinal, descriptionRescue && !primaryPartial && !undecidedNumbers);
       }
     }
     return false;
@@ -484,8 +502,16 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * gates as a match. Cards read from the run's own storefront jump the queue:
    * their printed rating *is* the verified number (100% pass measured, R6b),
    * so they are the first requests worth spending.
+   *
+   * `rescue` entries are the exception: they carry *no* card-side keyword hit
+   * at all and only bet on the full description mentioning it — a bet most
+   * lose (one step measured 600 of 709 rejections that way once the install
+   * cap widened and every numbers-passing zero-hit card qualified). They still
+   * queue, but at the very back: a partial hit that already shows one term in
+   * the title or description is a far likelier completion and must never wait
+   * behind a blind gamble.
    */
-  function queueCandidate(app: StoreApp, homeFirst = false): void {
+  function queueCandidate(app: StoreApp, homeFirst = false, rescue = false): void {
     if (cursor.candidateQueue.length >= MAX_CANDIDATE_QUEUE) return;
     if (queuedCandidates.has(app.packageName)) return;
     if (queuedPending.has(app.packageName)) return;
@@ -498,12 +524,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     // page carries) but must never spend the budget ahead of cards that can
     // pass today. One step measured 521 unrated fetches in front of rated
     // candidates this way.
-    if (homeFirst && app.rating !== null) {
+    if (rescue) {
+      cursor.candidateQueue.push(entry);
+    } else if (homeFirst && app.rating !== null) {
       cursor.candidateQueue.unshift(entry);
     } else {
       cursor.candidateQueue.push(entry);
     }
-    if (homeFirst) cursor.counters.homeQueued += 1;
+    if (homeFirst && !rescue) cursor.counters.homeQueued += 1;
     cursor.counters.candidates += 1;
   }
 
@@ -869,16 +897,26 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   const verifyFlight = new Set<string>();
-  /** Pulls the next unverified match, skipping ones already retried. */
+  /**
+   * Pulls the next unverified match, skipping ones already retried. Cards read
+   * from the run's own storefront go first: their printed rating is already
+   * the number the detail page will confirm (research R6b: 2 of 2 passed),
+   * while a foreign match still has cross-storefront drift to survive (R9:
+   * 0 of 2 in the top band) — verifying home first keeps a scarce verify
+   * slot from being spent on the likelier miss.
+   */
   const pullPendingTask = (): Promise<TaskOutcome> | null => {
     if (pendingRequests >= MAX_PENDING_PER_STEP) return null;
-    for (const entry of cursor.pendingQueue) {
-      if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
-      verifyFlight.add(entry.p);
-      return runVerifyTask(entry, "pending").then((outcome) => {
-        verifyFlight.delete(entry.p);
-        return outcome;
-      });
+    for (const pass of [true, false]) {
+      for (const entry of cursor.pendingQueue) {
+        if ((entry.h === true) !== pass) continue;
+        if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
+        verifyFlight.add(entry.p);
+        return runVerifyTask(entry, "pending").then((outcome) => {
+          verifyFlight.delete(entry.p);
+          return outcome;
+        });
+      }
     }
     return null;
   };

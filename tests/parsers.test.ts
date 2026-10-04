@@ -96,6 +96,34 @@ describe("parseDetailPage", () => {
     const result = parseDetailPage(html, "com.example.townwallet");
     expect(result.app?.packageName).toBe("com.example.townwallet");
     expect(result.app?.rating).toBe(4.5);
+    expect(result.app?.ratingSource).toBe("visible");
+  });
+
+  it("reads the rating under the app's own heading, not an earlier label", () => {
+    // Live layout variant: a neighbour's "Rated 4.5" label rendered before
+    // the app's own heading while this listing prints 2.9. Reading the first
+    // label on the page handed 4.5 to applyDetail, which dropped the lead.
+    const html = `<html><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Town Wallet","author":{"@type":"Person","name":"Town Dev"}}</script>
+</head><body>
+<div aria-label="Rated 4.5 stars out of five stars">4.5</div>
+<h1><span itemprop="name">Town Wallet</span></h1>
+<div aria-label="Rated 2.9 stars out of five stars">2.9</div>
+<div class="WsMG1c">1,000+</div><div class="ClM7O">Downloads</div>
+</body></html>`;
+
+    const result = parseDetailPage(html, "com.example.townwallet");
+    expect(result.app?.rating).toBe(2.9);
+    expect(result.app?.ratingSource).toBe("visible");
+  });
+
+  it("tags a JSON-LD rating as package-scoped", () => {
+    const html = detailHtml({
+      packageName: "com.example.budget",
+      title: "Budget Tracker",
+      ratingValue: 2.4,
+    });
+    expect(parseDetailPage(html, "com.example.budget").app?.ratingSource).toBe("jsonld");
   });
 
   it("reads the developer's published contact email from the support anchor", () => {

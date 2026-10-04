@@ -654,9 +654,18 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
 
     // No rating to judge by: the original verification stands. A rating or
-    // install bucket that now breaches the ceiling is real and drops the row.
+    // install bucket that now breaches the ceiling removes the row — but a
+    // rating only counts when its source is package-scoped (JSON-LD or this
+    // package's data blob). The visible "Rated … stars" markup is
+    // positional: a live layout variant put a similar app's 4.5 label first
+    // while this listing prints 2.9, and dropping on that number made a lead
+    // disappear seconds after it arrived. Install buckets are label-anchored
+    // ("… Downloads"), so they always count.
     if (app.rating === null) return;
-    dropLead(pkg);
+    const ratingBreach = roundRating(app.rating) > filters.maxRating;
+    const packageScoped = app.ratingSource === "jsonld" || app.ratingSource === "af";
+    const installsBreach = app.installs !== null && app.installs > filters.maxInstalls;
+    if (installsBreach || (ratingBreach && packageScoped)) dropLead(pkg);
   }
 
   async function runSearchTask(entry: QueryPlanEntry): Promise<TaskOutcome> {

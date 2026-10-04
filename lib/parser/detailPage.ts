@@ -30,8 +30,15 @@ const VISIBLE_RATING_PATTERNS = [
 ];
 
 function readVisibleRating(html: string): { rating: number; raw: string } | null {
+  // Anchor the read at the app's own heading: the rating widget sits under
+  // the <h1>, while earlier page chrome and the "similar apps" carousel
+  // carry their own "Rated … stars" labels. A live probe of one layout
+  // variant found a neighbour's "Rated 4.5" before this listing's own 2.9
+  // block, and the lead was dropped on that number.
+  const heading = /<h1[\s>]/i.exec(html);
+  const region = heading ? html.slice(heading.index) : html;
   for (const pattern of VISIBLE_RATING_PATTERNS) {
-    const match = pattern.exec(html);
+    const match = pattern.exec(region);
     if (!match) continue;
     const raw = match[1].trim();
     const rating = parseRating(raw);
@@ -106,16 +113,35 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
   if (packageName) {
     const title = jsonLd?.name ?? fromAf?.title ?? null;
     if (title) {
+      // Rating provenance decides whether a follow-up read may retract a lead
+      // (see `applyDetail`): JSON-LD and this package's data blob are
+      // package-scoped, the visible markup is positional. An AF entry that
+      // exists without a rating means the storefront prints none — never
+      // borrow a neighbour's label for an unrated listing.
+      let rating: number | null = null;
+      let ratingRaw: string | null = null;
+      let ratingSource: StoreApp["ratingSource"] = undefined;
+      if (jsonLd && jsonLd.rating !== null && jsonLd.rating !== undefined) {
+        rating = jsonLd.rating;
+        ratingRaw = String(jsonLd.rating);
+        ratingSource = "jsonld";
+      } else if (fromAf) {
+        if (fromAf.rating !== null) {
+          rating = fromAf.rating;
+          ratingRaw = fromAf.ratingRaw;
+          ratingSource = "af";
+        }
+      } else if (visible) {
+        rating = visible.rating;
+        ratingRaw = visible.raw;
+        ratingSource = "visible";
+      }
       app = {
         packageName,
         title,
         developer: jsonLd?.author ?? fromAf?.developer ?? null,
-        rating: jsonLd?.rating ?? visible?.rating ?? fromAf?.rating ?? null,
-        ratingRaw:
-          fromAf?.ratingRaw ??
-          (jsonLd?.rating !== null && jsonLd?.rating !== undefined
-            ? String(jsonLd.rating)
-            : visible?.raw ?? null),
+        rating,
+        ratingRaw,
         ratingsCount: jsonLd?.ratingsCount ?? null,
         installsRaw: installs.ok ? installs.raw : null,
         installs: installs.value,
@@ -126,6 +152,7 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
         icon: jsonLd?.image ?? fromAf?.icon ?? null,
         urlPath: fromAf?.urlPath ?? `/store/apps/details?id=${encodeURIComponent(packageName)}`,
         email: readDeveloperEmail(html),
+        ratingSource,
       };
     }
   }

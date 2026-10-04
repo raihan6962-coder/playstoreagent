@@ -19,6 +19,15 @@ export interface StoreApp {
    * optional until a detail page fills it in.
    */
   email?: string | null;
+  /**
+   * Which parse source produced `rating` on a detail page: the page's own
+   * JSON-LD or this package's data blob (both scoped to this package), or the
+   * visible "Rated … stars" markup (positional — a live layout variant served
+   * a *similar* app's label first while the listing printed 2.9). Search
+   * cards leave it unset; `applyDetail` only retracts a lead on a
+   * package-scoped number.
+   */
+  ratingSource?: "jsonld" | "af" | "visible";
 }
 
 export type InstallCertainty = "exact" | "bucket" | "unknown";

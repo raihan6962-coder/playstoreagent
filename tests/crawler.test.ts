@@ -215,6 +215,98 @@ describe("runGenerationStep", () => {
     expect(result.message).toContain("Only 1 matching app was found");
   });
 
+  it("keeps a lead when a follow-up page only shows a positional rating", async () => {
+    // Live production report: a lead arrived, then "turned off" seconds
+    // later. The follow-up fetch hit a layout variant with no JSON-LD
+    // aggregate where the first "Rated … stars" label on the page belonged
+    // to a similar app (4.5) while this listing prints 2.1 — a positional
+    // number must never retract a row the package-scoped read confirmed.
+    const harness = collect();
+    let budgetFetches = 0;
+    // First read: JSON-LD without an aggregate (ratings stay null, so the
+    // lead is queued for an enriching re-read) + this package's data blob.
+    const firstRead = detailHtml({ ...GOOD, summary: "Track your budget" }, [], "10,000+").replace(
+      /"aggregateRating":\{[^}]+\},?/,
+      "",
+    );
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName) => {
+        if (packageName === GOOD.packageName) {
+          budgetFetches += 1;
+          if (budgetFetches === 1) return firstRead;
+          return `<html><body>
+<h1>${GOOD.title}</h1>
+<div aria-label="Rated 4.5 stars out of five stars">4.5</div>
+<div class="WsMG1c">10,000+</div><div class="ClM7O">Downloads</div>
+</body></html>`;
+        }
+        return detailRoute(packageName);
+      },
+    });
+
+    await runGenerationStep({
+      filters: filters({ limit: 5 }),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads().map((lead) => lead.packageName)).toContain(GOOD.packageName);
+    expect(harness.events.filter((event) => event.type === "lead-remove")).toHaveLength(0);
+    expect(budgetFetches).toBeGreaterThan(1);
+  });
+
+  it("removes a lead whose package-scoped rating climbs above the ceiling", async () => {
+    const harness = collect();
+    let budgetFetches = 0;
+    const firstRead = detailHtml({ ...GOOD, summary: "Track your budget" }, [], "10,000+").replace(
+      /"aggregateRating":\{[^}]+\},?/,
+      "",
+    );
+    const client = makeFakeClient({
+      search: () => searchRoutes(),
+      detail: (packageName) => {
+        if (packageName === GOOD.packageName) {
+          budgetFetches += 1;
+          if (budgetFetches === 1) return firstRead;
+          // The listing's own JSON-LD now reports 4.6 — package-scoped and
+          // above the ceiling, so the row has to go.
+          return detailHtml(
+            { ...GOOD, ratingValue: 4.6, summary: "Track your budget" },
+            [GOOD_TWO, TOO_POPULAR_RATING, TOO_MANY_INSTALLS, IRRELEVANT].map((entry) => ({
+              ...entry,
+            })),
+            "10,000+",
+          );
+        }
+        return detailRoute(packageName);
+      },
+    });
+
+    await runGenerationStep({
+      filters: filters({ limit: 5 }),
+      cursor: createInitialCursor(KEYWORD),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(
+      harness.events.filter(
+        (event) => event.type === "lead-remove" && event.packageName === GOOD.packageName,
+      ),
+    ).toHaveLength(1);
+    // The event log keeps the original lead record; what the table shows is
+    // leads minus removals, same as the client renders it.
+    const removed = new Set(
+      harness.events.filter((event) => event.type === "lead-remove").map((event) => event.packageName),
+    );
+    const visible = harness.leads().filter((lead) => !removed.has(lead.packageName));
+    expect(visible.map((lead) => lead.packageName)).not.toContain(GOOD.packageName);
+  });
+
   it("hands back a resumable cursor when the time budget is already spent", async () => {
     const harness = collect();
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });

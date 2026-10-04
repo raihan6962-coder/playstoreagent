@@ -31,7 +31,7 @@ describe("secondary keyword generation", () => {
   });
 
   it("caps the number of phrases", () => {
-    const raw = Array.from({ length: 60 }, (_, index) => `phrase number ${index}`);
+    const raw = Array.from({ length: MAX_SECONDARY + 20 }, (_, index) => `phrase number ${index}`);
     expect(normalizeSecondary(raw, "budget tracker")).toHaveLength(MAX_SECONDARY);
   });
 

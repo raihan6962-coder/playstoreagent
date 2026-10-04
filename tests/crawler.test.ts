@@ -493,9 +493,12 @@ describe("runGenerationStep", () => {
     const cursor = createInitialCursor(KEYWORD);
     cursor.phase = "search";
     // Index 1 of the sweep for country US is a foreign storefront (US owns
-    // index 0), so every search card is read abroad: GOOD_TWO printed 2.7
-    // sits in the dead band between the 2.5 half-star line and the 3.0
-    // ceiling (research R9: foreign cards there passed 0 of 2 at home).
+    // index 0), so the first searches read every card abroad: GOOD_TWO
+    // printed 2.7 sits between the 2.0 fetch gate and the 3.0 ceiling —
+    // the drift band where foreign cards burned verify budget and rejected
+    // at home 9 of 10 times. The card must wait for its home visit instead
+    // of verifying from abroad (and must not be remembered as seen, or the
+    // home visit would hit the duplicate path and the lead would be lost).
     cursor.planIndex = 1;
 
     const result = await runGenerationStep({
@@ -506,11 +509,14 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    // GOOD_TWO's dead-band card must never verify into a row. (It may still
-    // be *fetched* as an expansion seed — rated relevant cards seed the
-    // similar-app walk — but a seed's detail never emits a lead by itself.)
-    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget"]);
-    expect(result.stats.matched).toBe(1);
+    // Both budget apps eventually convert — on their own storefront, where
+    // the printed rating is the verified one (5 of 5 agreed) — while the
+    // over-ceiling, over-install and irrelevant cards never lead.
+    expect(harness.leads().map((lead) => lead.packageName).sort()).toEqual([
+      "com.example.budget",
+      "com.example.budget.mini",
+    ]);
+    expect(result.stats.matched).toBe(2);
   });
 
   it("verifies home-storefront matches ahead of foreign ones", async () => {

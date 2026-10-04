@@ -133,7 +133,16 @@ describe("storefront sweep plan", () => {
   });
 
   it("appends each wave without moving earlier plan entries", () => {
-    const suggestions = ["crypto wallet app", "old crypto wallet"];
+    // Enough suggestions that the deterministic wave pool can fill a whole
+    // wave (the pool is finite; two suggestions alone cannot reach the batch).
+    const suggestions = [
+      "crypto wallet app",
+      "old crypto wallet",
+      "cold crypto wallet",
+      "green crypto wallet",
+      "hardware crypto wallet",
+      "paper crypto wallet",
+    ];
     const wave0 = buildPlanQueries(KEYWORD, suggestions);
     const wave1 = buildPlanQueries(KEYWORD, suggestions, 1);
     const wave2 = buildPlanQueries(KEYWORD, suggestions, 2);

@@ -17,7 +17,7 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODEL = "openai/gpt-oss-120b";
 
 /** Hard cap on how many secondary phrases one run may add to the plan. */
-export const MAX_SECONDARY = 24;
+export const MAX_SECONDARY = 100;
 /** Per-phrase length cap (matches the suggestion length budget in cursor.ts). */
 export const MAX_SECONDARY_LENGTH = 80;
 
@@ -26,6 +26,7 @@ function promptFor(keyword: string): string {
     `You are an app-marketplace keyword planner.`,
     `The main search keyword is: "${keyword}".`,
     `List ${MAX_SECONDARY} distinct search phrases a Play Store user would type to find apps in the same app category or product neighbourhood as this keyword.`,
+    `Prefer niche long-tail phrases over the main keyword: specific features, use cases, adjectives and platforms (for example "offline budget tracker", "budget tracker for students", "tiny expense tracker").`,
     `Each phrase must be 1-4 words, plain search-box style, no quotes, no punctuation, and must not be the main keyword itself.`,
     `Return ONLY a JSON array of strings, nothing else.`,
   ].join(" ");
@@ -82,7 +83,7 @@ export async function generateSecondaryKeywords(keyword: string): Promise<string
         model: MODEL,
         messages: [{ role: "user", content: promptFor(keyword) }],
         temperature: 0.4,
-        max_completion_tokens: 800,
+        max_completion_tokens: 6000,
       }),
       signal: AbortSignal.timeout(10_000),
     });

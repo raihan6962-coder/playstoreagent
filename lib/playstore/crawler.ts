@@ -363,7 +363,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         continue;
       }
 
-      if (seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
+      // A card seen abroad may still qualify at home: the BD detail page
+      // never prints *lower* than the foreign card (probe: 10 of 10 agreed or
+      // rose), so a foreign card at or under the ceiling but above the fetch
+      // gate — or one that printed no rating at all — still owes a home
+      // evaluation. Marking those as seen here made its later home search hit
+      // the duplicate path, and the lead was lost forever. Foreign cards
+      // printed above the ceiling can never pass at home and stay marked.
+      const owedHomeCheck =
+        !countryFinal &&
+        (app.rating === null ||
+          (roundRating(app.rating) <= filters.maxRating &&
+            !cardCanStillQualify(app, filters, countryFinal)));
+      if (!owedHomeCheck && seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
       cursor.counters.discovered += 1;
       cursor.counters.evaluated += 1;
       if (countryFinal) cursor.counters.homeDiscovered += 1;
@@ -450,18 +462,24 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // verify re-reads title + description), so it falls through to the
       // rescue below instead of burning a fetch on a predicted text reject.
       const primaryPartial = evaluation.primaryTerms.length > 0;
+      // A foreign card that prints no rating never earns a fetch: the BD
+      // detail page answers "no rating" for these far more often than it
+      // rescues one, and every such fetch is a verify slot not spent on a
+      // rated home card that passes for certain.
+      const foreignUnrated = !countryFinal && app.rating === null;
       const descriptionRescue =
         evaluation.primaryTerms.length === 0 &&
         app.rating !== null &&
         roundRating(app.rating) <= filters.maxRating &&
         (app.installs === null || app.installs <= filters.maxInstalls);
       if (
+        !foreignUnrated &&
         ((!relevant && primaryPartial) ||
           undecidedNumbers ||
           descriptionRescue) &&
         cardCanStillQualify(app, filters, countryFinal)
       ) {
-        queueCandidate(app, countryFinal, descriptionRescue && !primaryPartial && !undecidedNumbers);
+        queueCandidate(app, countryFinal);
       }
     }
     return false;
@@ -501,39 +519,45 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * a missing number, or a description-only rescue — for one authoritative
    * detail-page fetch. The fetch re-runs every rule on the full text and this
    * run's country data, so nothing is ever shown that has not passed the same
-   * gates as a match. Cards read from the run's own storefront jump the queue:
-   * their printed rating *is* the verified number (100% pass measured, R6b),
-   * so they are the first requests worth spending.
-   *
-   * `rescue` entries are the exception: they carry *no* card-side keyword hit
-   * at all and only bet on the full description mentioning it — a bet most
-   * lose (one step measured 600 of 709 rejections that way once the install
-   * cap widened and every numbers-passing zero-hit card qualified). They still
-   * queue, but at the very back: a partial hit that already shows one term in
-   * the title or description is a far likelier completion and must never wait
-   * behind a blind gamble.
+   * gates as a match. Rated cards read from the run's own storefront jump the
+   * queue: their printed rating *is* the verified number (100% pass measured,
+   * R6b), and a home description-rescue is nearly as good — Play matched the
+   * listing on a description the card never showed, which only happens when
+   * the full text really carries the term. Unrated cards and foreign entries
+   * go to the back: unrated fetches measured 521 of 521 wasted verifies, and
+   * foreign cards still carry cross-storefront drift to survive.
    */
-  function queueCandidate(app: StoreApp, homeFirst = false, rescue = false): void {
-    if (cursor.candidateQueue.length >= MAX_CANDIDATE_QUEUE) return;
+  function queueCandidate(app: StoreApp, homeFirst = false): void {
+    const front = homeFirst && app.rating !== null;
+    if (cursor.candidateQueue.length >= MAX_CANDIDATE_QUEUE) {
+      // A full queue must never drop a card from the run's own storefront
+      // whose printed number is already final: those are the entries that
+      // actually convert. Evict from the back (a foreign or rescue entry) so
+      // the home card takes its place instead of being lost at the cap.
+      if (!front) return;
+      const evicted = cursor.candidateQueue.pop();
+      if (evicted) queuedCandidates.delete(evicted.p);
+      else return;
+    }
     if (queuedCandidates.has(app.packageName)) return;
     if (queuedPending.has(app.packageName)) return;
     if (emitted.has(app.packageName)) return;
     queuedCandidates.add(app.packageName);
     const entry = { p: app.packageName, i: app.installs, s: clipSummary(app.summary) };
-    // Rated home cards jump the queue: their printed number is final. Unrated
-    // cards (home or foreign) go to the back — they are still worth one
-    // authoritative fetch (search cards sometimes hide a rating the detail
-    // page carries) but must never spend the budget ahead of cards that can
-    // pass today. One step measured 521 unrated fetches in front of rated
-    // candidates this way.
-    if (rescue) {
-      cursor.candidateQueue.push(entry);
-    } else if (homeFirst && app.rating !== null) {
+    // Rated home cards jump the queue: their printed number is final and the
+    // detail page answers the same storefront, so both ceilings and the text
+    // are known-good (research R6b: home cards verify 100%). Home
+    // description-rescues go to the front too — Play matched them on a
+    // description the card never showed, which is the strongest signal a
+    // rescue has. Unrated cards (home or foreign) and every foreign entry go
+    // to the back: unrated fetches measured 521 of 521 wasted verifies, and
+    // foreign cards carry cross-storefront drift.
+    if (front) {
       cursor.candidateQueue.unshift(entry);
     } else {
       cursor.candidateQueue.push(entry);
     }
-    if (homeFirst && !rescue) cursor.counters.homeQueued += 1;
+    if (homeFirst) cursor.counters.homeQueued += 1;
     cursor.counters.candidates += 1;
   }
 
@@ -612,10 +636,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * removed again.
    */
   function applyDetail(pkg: string, app: StoreApp | null): void {
-    if (!app || app.packageName !== pkg) {
-      dropLead(pkg);
-      return;
-    }
+    // Play serves page variants: a fetch can come back with no readable app
+    // at all, or with the listing but no rating block. The verification fetch
+    // already confirmed this lead against the same storefront, so an
+    // unreadable follow-up is *no information* — dropping the row made leads
+    // blink out of the table minutes after arriving (live report: "one lead
+    // comes, then turns off"). Only a page that explicitly contradicts the
+    // filters removes the lead.
+    if (!app || app.packageName !== pkg) return;
 
     const qualifies = detailAppQualifies(app, filters);
     if (qualifies) {
@@ -625,6 +653,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       return;
     }
 
+    // No rating to judge by: the original verification stands. A rating or
+    // install bucket that now breaches the ceiling is real and drops the row.
+    if (app.rating === null) return;
     dropLead(pkg);
   }
 

@@ -197,15 +197,17 @@ export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean
  * Slack a **foreign** storefront's printed rating gets before the crawler
  * stops spending a detail fetch on it.
  *
- * Negative by half a star. Measured live (research R9): at a 4.0 ceiling,
- * foreign cards printed 3.6–4.0 passed 0 of 2 verifications at home, cards
- * printed 3.1–3.5 passed 1 of 2, and home-storefront cards passed 2 of 2 —
- * home storefronts rate these apps *higher* than foreign ones, so a foreign
- * card printed just under the ceiling is a near-certain miss. Only cards at
- * or below `maxRating - 0.5` earn a foreign fetch; home cards (final
- * storefront) keep the full ceiling.
+ * Negative by a full star. Measured live twice: research R9 at a 4.0
+ * ceiling (foreign 3.6-4.0 passed 0 of 2 at home, 3.1-3.5 passed 1 of 2,
+ * home 2 of 2) and a fresh niche-query probe at a 3.5 ceiling where 9 of 10
+ * foreign cards at or below 3.5 rejected against the BD detail page —
+ * US 3.2 -> BD 4.0, KR 3.3 -> BD 4.4, KR 2.1 -> BD 4.3, KR 1.3 -> BD 3.6,
+ * KR 3.0 -> BD 4.7, with only a stable-rated app agreeing (3.3 -> 3.3).
+ * The drift runs about +1.0 stars, so a foreign card must sit a full star
+ * **below** the ceiling to be worth fetching; home storefront cards (final
+ * storefront, 5 of 5 agreed card-to-detail) keep the full ceiling.
  */
-export const FOREIGN_RATING_WINDOW = -0.5;
+export const FOREIGN_RATING_WINDOW = -1.0;
 
 /**
  * Decides whether fetching this card's detail page could still change its

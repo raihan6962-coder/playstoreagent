@@ -18,7 +18,7 @@ const MAX_ENRICH_QUEUE = 1_000;
 const MAX_PENDING = 1_000;
 const MAX_CANDIDATES = 2_500;
 const MAX_PENDING_SUMMARY = 1_000;
-const MAX_SECONDARY = 24;
+const MAX_SECONDARY = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

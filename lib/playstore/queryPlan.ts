@@ -13,8 +13,8 @@ export const MAX_SUGGESTION_QUERIES = 400;
  * to {@link MAX_WAVES} so the run continues until the lead limit or real
  * supply exhaustion.
  */
-export const WAVE_QUERIES_PER_WAVE = 60;
-export const MAX_WAVES = 8;
+export const WAVE_QUERIES_PER_WAVE = 120;
+export const MAX_WAVES = 16;
 
 const VARIANT_SUFFIXES = [
   "app",
@@ -136,19 +136,29 @@ export const PLAN_LOCALES: PlanLocale[] = [
 ];
 
 /**
- * Storefronts swept for every query after the head ones. Measured on 175
- * requests (research2.test.ts R6): a dozen en-country storefronts plus the paid
- * storefront and the non-English storefronts cover ~97% of the unique apps a
- * full sweep finds, at a fraction of the request cost — the paid and
- * non-English storefronts are the ones that keep returning apps the en-US/GB
- * results never surface.
+ * Storefronts swept for every query after the head ones. Trimmed from the
+ * original dozen en-country list: measured (research2.test.ts R6) the
+ * en-countries mostly return the same apps, so every extra one delays the
+ * *next* query — and at a strict rating ceiling the head-page results carry
+ * almost no qualifying cards, so covering more distinct queries beats
+ * re-covering the same apps in one more country (a live probe found zero
+ * cards at or below 3.5 stars in the first 25 results of a head query on both
+ * the BD and KR storefronts). The non-English storefronts stay: measured
+ * (research R7) they surface genuinely unique card sets.
  */
 export const CORE_LOCALES: PlanLocale[] = [
-  ...["US", "GB", "CA", "AU", "IN", "PK", "ID", "BR", "NG", "DE", "JP", "FR"].map(
-    (gl) => ({ hl: "en", gl }),
-  ),
+  ...["US", "GB", "IN", "PK", "ID", "NG"].map((gl) => ({ hl: "en", gl })),
   { hl: "en", gl: "US", price: "paid" },
-  ...LANGUAGE_STOREFRONTS,
+  { hl: "es", gl: "MX" },
+  { hl: "pt", gl: "BR" },
+  { hl: "de", gl: "DE" },
+  { hl: "hi", gl: "IN" },
+  { hl: "bn", gl: "BD" },
+  { hl: "id", gl: "ID" },
+  { hl: "fr", gl: "FR" },
+  { hl: "ja", gl: "JP" },
+  { hl: "ar", gl: "EG" },
+  { hl: "tr", gl: "TR" },
 ];
 
 /** Head queries that receive the full storefront sweep. */
@@ -271,6 +281,20 @@ export function buildPlanQueries(
 
   const budget = out.length + MAX_SUGGESTION_QUERIES;
 
+  // Secondary phrases run right after the deterministic main-keyword block
+  // and before the Play suggestions: both are main-keyword-derived, but the
+  // AI phrases are the ones that surface a different neighbourhood, and at a
+  // strict rating ceiling they must be searched in the first steps instead of
+  // waiting behind up to 400 suggestions. Deduped against every earlier query
+  // but deliberately not filtered by keepsKeyword — that is the point of a
+  // secondary keyword.
+  for (const phrase of secondary) {
+    const key = phrase.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ query: phrase.trim(), kind: "suggestion" });
+  }
+
   for (const suggestion of suggestions) {
     if (out.length >= budget) break;
     const key = suggestion.trim().toLowerCase();
@@ -278,19 +302,6 @@ export function buildPlanQueries(
     if (!keepsKeyword(keyword, key)) continue;
     seen.add(key);
     out.push({ query: suggestion.trim(), kind: "suggestion" });
-  }
-
-  // Secondary phrases run after everything the primary keyword produced, so
-  // one run first drains the main keyword's plan and then repeats the same
-  // scrape over the AI-generated neighbours. Deduped against every earlier
-  // query but deliberately not filtered by keepsKeyword — that is the point
-  // of a secondary keyword. Appended before the waves so a cursor that later
-  // gains waves keeps its secondary block at a stable position.
-  for (const phrase of secondary) {
-    const key = phrase.trim().toLowerCase();
-    if (key.length === 0 || seen.has(key)) continue;
-    seen.add(key);
-    out.push({ query: phrase.trim(), kind: "suggestion" });
   }
 
   const targetWave = Math.min(wave, MAX_WAVES);

@@ -1062,6 +1062,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
 
     let expandCredit = 0;
+    let pullsWithoutSearch = 0;
     const enrichFlight = new Set<string>();
     const pullSearchTask = (): Promise<TaskOutcome> | null => {
       // Queued verifications come first: that detail page is the only gate
@@ -1069,47 +1070,66 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // the table as soon as it is confirmed — and never before. On transient
       // failures the package stays queued for the next step, so a null return
       // here just falls through to the queues below.
-      const verify = pullVerifyTask();
-      if (verify) return verify;
+      //
+      // Exception: once three pulls in a row went to verify/enrich/expand,
+      // the plan gets the next slot while it still has queries left.
+      // Measured in production: without that reserve a fresh run spent its
+      // whole first minute on detail fetches — the query counter sat at 37
+      // while 866 pages were fetched — which delays the niche queries that
+      // produce most matches, and with them the first lead.
+      const planRemains = entryAt(queries, cursor.planIndex, filters.country) !== null;
+      if (pullsWithoutSearch < 3 || !planRemains) {
+        const verify = pullVerifyTask();
+        if (verify) {
+          pullsWithoutSearch += 1;
+          return verify;
+        }
 
-      // Then backfill metadata for leads already on screen (their ratings
-      // count, if the detail page carried none at verification time).
-      if (enrichRequests + enrichFlight.size < MAX_ENRICH_PER_STEP) {
-        for (const pkg of cursor.enrichQueue) {
-          if (enrichFlight.has(pkg)) continue;
-          enrichFlight.add(pkg);
-          return runEnrichTask(pkg).then((outcome) => {
-            enrichFlight.delete(pkg);
-            return outcome;
-          });
+        // Then backfill metadata for leads already on screen (their ratings
+        // count, if the detail page carried none at verification time).
+        if (enrichRequests + enrichFlight.size < MAX_ENRICH_PER_STEP) {
+          for (const pkg of cursor.enrichQueue) {
+            if (enrichFlight.has(pkg)) continue;
+            enrichFlight.add(pkg);
+            pullsWithoutSearch += 1;
+            return runEnrichTask(pkg).then((outcome) => {
+              enrichFlight.delete(pkg);
+              return outcome;
+            });
+          }
+        }
+
+        const seedsAvailable =
+          cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
+        if (seedsAvailable) {
+          expandCredit +=
+            (cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
+              ? EXPAND_SLOTS_FULL
+              : EXPAND_SLOTS_SPARSE) / SEARCH_CONCURRENCY;
+        }
+        if (expandCredit >= 1) {
+          const [seed] = takeSeeds(1);
+          if (seed) {
+            expandCredit = Math.min(expandCredit - 1, 1);
+            pullsWithoutSearch += 1;
+            return runExpandTask(seed);
+          }
+          expandCredit = 0;
         }
       }
 
       const seedsAvailable =
         cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
-      if (seedsAvailable) {
-        expandCredit +=
-          (cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
-            ? EXPAND_SLOTS_FULL
-            : EXPAND_SLOTS_SPARSE) / SEARCH_CONCURRENCY;
-      }
-      if (expandCredit >= 1) {
-        const [seed] = takeSeeds(1);
-        if (seed) {
-          expandCredit = Math.min(expandCredit - 1, 1);
-          return runExpandTask(seed);
-        }
-        expandCredit = 0;
-      }
-
-      const entry = entryAt(queries, cursor.planIndex, filters.country);
+      const entry = planRemains ? entryAt(queries, cursor.planIndex, filters.country) : null;
       if (!entry) {
         if (!seedsAvailable) return null;
         const [seed] = takeSeeds(1);
         if (!seed) return null;
+        pullsWithoutSearch += 1;
         return runExpandTask(seed);
       }
       cursor.planIndex += 1;
+      pullsWithoutSearch = 0;
       currentQuery = entry.query;
       emit({
         type: "progress",

@@ -1,3 +1,4 @@
+import { generateSecondaryKeywords } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
 import { sanitizeCursor } from "@/lib/validation/cursor";
@@ -111,7 +112,7 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     ...cursor.counters,
     keyword: filters.keyword,
     target: filters.limit,
-    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.wave)),
+    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.wave, cursor.secondary)),
     currentQuery: null,
     phase: cursor.phase,
     wave: cursor.wave,
@@ -172,6 +173,29 @@ export async function POST(request: Request): Promise<Response> {
           stats: initialStats(cursor, filters),
           message: `Searching Play Store for “${filters.keyword}”…`,
         });
+
+        // Phase two of the pipeline: once per run, ask Groq for the search
+        // phrases that find apps in the same category neighbourhood. The plan
+        // appends them after the primary queries, so this run scrapes the main
+        // keyword first and then repeats the exact same filter flow over the
+        // secondary phrases. A failure simply leaves the list empty — the run
+        // continues with the primary plan only.
+        if (cursor.secondary.length === 0 && !cursor.secondaryTried) {
+          cursor.secondaryTried = true;
+          send({
+            type: "progress",
+            stats: initialStats(cursor, filters),
+            message: `Generating related search keywords for “${filters.keyword}”…`,
+          });
+          cursor.secondary = await generateSecondaryKeywords(filters.keyword);
+          if (cursor.secondary.length > 0) {
+            send({
+              type: "progress",
+              stats: initialStats(cursor, filters),
+              message: `Queued ${cursor.secondary.length} related keywords to search as well.`,
+            });
+          }
+        }
 
         await runGenerationStep({
           filters,

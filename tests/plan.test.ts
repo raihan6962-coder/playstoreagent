@@ -102,6 +102,27 @@ describe("storefront sweep plan", () => {
     );
   });
 
+  it("appends AI secondary phrases after the primary plan, unfiltered and deduplicated", () => {
+    const base = buildPlanQueries(KEYWORD);
+    const secondary = ["expense manager", "CRYPTO WALLET APP", "  money tracker  ", "crypto wallet"];
+    const queries = buildPlanQueries(KEYWORD, [], 0, secondary);
+
+    // The whole primary plan keeps its exact positions.
+    for (let index = 0; index < planSize(base); index += 1) {
+      expect(entryAt(queries, index)).toEqual(entryAt(base, index));
+    }
+
+    // Deduplicated against the primary plan and against itself, trimmed, the
+    // main keyword itself excluded, and deliberately NOT filtered by
+    // keepsKeyword — "expense manager" is the point of a secondary keyword.
+    expect(keepsKeyword(KEYWORD, "expense manager")).toBe(false);
+    expect(queries.slice(base.length).map((item) => item.query)).toEqual([
+      "expense manager",
+      "money tracker",
+    ]);
+    expect(planSize(queries)).toBeGreaterThan(planSize(base));
+  });
+
   it("generates suggest prefixes that all keep the keyword", () => {
     const prefixes = suggestPrefixes(KEYWORD);
     expect(prefixes[0]).toBe(KEYWORD);

@@ -244,7 +244,9 @@ export function keepsKeyword(keyword: string, suggestion: string): boolean {
 /**
  * Ordered query list: deterministic base queries first, then the locally
  * generated topic-consistent variants (every one embeds the full keyword),
- * then Play suggestions appended in discovery order, and finally (when
+ * then Play suggestions appended in discovery order, then the AI-generated
+ * secondary phrases (same app category, no keyword-contains requirement —
+ * they are a different way into the same neighbourhood), and finally (when
  * `wave > 0`) the deterministic long-tail wave batch. Appending is what makes
  * `planIndex` stable across resumes and across waves — earlier entries never
  * move, so wave K's queries are always the first K ×
@@ -254,6 +256,7 @@ export function buildPlanQueries(
   keyword: string,
   suggestions: string[] = [],
   wave = 0,
+  secondary: string[] = [],
 ): PlanQuery[] {
   const base = baseQuerySpecs(keyword);
   const out = [...base];
@@ -275,6 +278,19 @@ export function buildPlanQueries(
     if (!keepsKeyword(keyword, key)) continue;
     seen.add(key);
     out.push({ query: suggestion.trim(), kind: "suggestion" });
+  }
+
+  // Secondary phrases run after everything the primary keyword produced, so
+  // one run first drains the main keyword's plan and then repeats the same
+  // scrape over the AI-generated neighbours. Deduped against every earlier
+  // query but deliberately not filtered by keepsKeyword — that is the point
+  // of a secondary keyword. Appended before the waves so a cursor that later
+  // gains waves keeps its secondary block at a stable position.
+  for (const phrase of secondary) {
+    const key = phrase.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ query: phrase.trim(), kind: "suggestion" });
   }
 
   const targetWave = Math.min(wave, MAX_WAVES);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildBasePlan, buildPlan, dedupePlan, MAX_PLAN_SIZE } from "@/lib/playstore/queryPlan";
+import { buildBasePlan, buildPlan, buildPlanQueries, dedupePlan, MAX_PLAN_SIZE, planSize } from "@/lib/playstore/queryPlan";
 import { leadsToCsv, csvFilename, leadRow } from "@/lib/csv/export";
 import { mergeLead } from "@/lib/client/generation";
 import {
@@ -122,10 +122,10 @@ describe("sanitizeCursor", () => {
 
   it("trims an oversized verify queue instead of rejecting the whole cursor", () => {
     // A cap mismatch between the crawler that fills the queue and the parser
-    // that reads it (800 vs 1200) once rejected the cursor outright, silently
-    // restarting every step and re-running the same plan region.
+    // that reads it once rejected the cursor outright, silently restarting
+    // every step and re-running the same plan region.
     const cursor = createInitialCursor("budget tracker");
-    cursor.candidateQueue = Array.from({ length: 1_500 }, (_, n) => ({
+    cursor.candidateQueue = Array.from({ length: 3_000 }, (_, n) => ({
       p: `com.example.app${n}`,
       i: 10_000,
       s: null,
@@ -133,8 +133,41 @@ describe("sanitizeCursor", () => {
 
     const restored = sanitizeCursor(cursor, "budget tracker");
     expect(restored).not.toBeNull();
-    expect(restored?.candidateQueue).toHaveLength(1_200);
+    expect(restored?.candidateQueue).toHaveLength(2_500);
     expect(restored?.candidateQueue[0].p).toBe("com.example.app0");
+  });
+
+  it("keeps AI secondary phrases across a resume and restarts on a malformed list", () => {
+    const cursor = createInitialCursor("budget tracker");
+    cursor.secondary = ["expense manager", "money tracker"];
+    cursor.secondaryTried = true;
+
+    const restored = sanitizeCursor(cursor, "budget tracker");
+    expect(restored?.secondary).toEqual(["expense manager", "money tracker"]);
+    expect(restored?.secondaryTried).toBe(true);
+
+    expect(
+      sanitizeCursor({ ...cursor, secondary: "nope" }, "budget tracker"),
+    ).toBeNull();
+
+    // Cursors minted before the field existed resume with empty defaults.
+    const legacy = createInitialCursor("budget tracker") as unknown as Record<string, unknown>;
+    delete legacy.secondary;
+    delete legacy.secondaryTried;
+    expect(sanitizeCursor(legacy, "budget tracker")?.secondary).toEqual([]);
+    expect(sanitizeCursor(legacy, "budget tracker")?.secondaryTried).toBe(false);
+  });
+
+  it("accepts a planIndex that only fits once secondary phrases are included", () => {
+    const cursor = createInitialCursor("budget tracker");
+    cursor.suggestions = ["budget tracker app"];
+    cursor.secondary = ["expense manager", "money tracker", "bill splitter"];
+    const withSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, 0, cursor.secondary));
+    const withoutSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, 0));
+    cursor.planIndex = withoutSecondary + 1;
+
+    expect(cursor.planIndex).toBeLessThanOrEqual(withSecondary);
+    expect(sanitizeCursor(cursor, "budget tracker")?.planIndex).toBe(withoutSecondary + 1);
   });
 });
 

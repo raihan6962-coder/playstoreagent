@@ -197,6 +197,15 @@ export interface SessionCursor {
    * leads uncollected for multi-term keywords.
    */
   candidateQueue: PendingVerify[];
+  /**
+   * AI-generated secondary search phrases (Groq) for the same app category as
+   * the main keyword. The plan appends them after the primary queries, so the
+   * run first scrapes with the main keyword and then repeats the same
+   * scrape → filter → verify flow over these phrases.
+   */
+  secondary: string[];
+  /** Secondary-keyword generation was attempted already (success or failure). */
+  secondaryTried: boolean;
   counters: SessionCounters;
 }
 

@@ -15,9 +15,10 @@ const MAX_EMITTED = 1_000;
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
 const MAX_ENRICH_QUEUE = 1_000;
-const MAX_PENDING = 500;
-const MAX_CANDIDATES = 1_200;
+const MAX_PENDING = 1_000;
+const MAX_CANDIDATES = 2_500;
 const MAX_PENDING_SUMMARY = 1_000;
+const MAX_SECONDARY = 24;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -161,7 +162,18 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     : asIndex(waveDiscoveredRaw, Number.MAX_SAFE_INTEGER);
   if (waveDiscovered === null) return null;
 
-  const queries = buildPlanQueries(keyword, suggestions, wave);
+  // AI-generated secondary phrases. Optional so cursors minted before this
+  // field existed still resume (they generate them on the next step).
+  // Strict when present, like suggestions: a malformed list would corrupt the
+  // rebuilt plan, so the cursor restarts instead.
+  const secondaryRaw = input.secondary;
+  const secondary = secondaryRaw === undefined || secondaryRaw === null
+    ? []
+    : asStringArray(secondaryRaw, MAX_SECONDARY, MAX_SUGGESTION_LENGTH);
+  if (!secondary) return null;
+  const secondaryTried = input.secondaryTried === true;
+
+  const queries = buildPlanQueries(keyword, suggestions, wave, secondary);
   const total = planSize(queries);
 
   const suggestIndex = asIndex(input.suggestIndex, suggestPrefixes(keyword).length);
@@ -196,6 +208,8 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     enrichQueue,
     pendingQueue,
     candidateQueue,
+    secondary,
+    secondaryTried,
     counters,
   };
 }

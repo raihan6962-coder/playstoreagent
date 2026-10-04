@@ -88,9 +88,9 @@ const MAX_ENRICH_PER_STEP = 200;
  * of matches inside a single window); overflow falls back to showing the
  * card-verified lead rather than silently discarding a passing candidate.
  */
-const MAX_PENDING_QUEUE = 500;
+const MAX_PENDING_QUEUE = 1_000;
 /** Detail verifications per step before the step reports back to the caller. */
-const MAX_PENDING_PER_STEP = 500;
+const MAX_PENDING_PER_STEP = 700;
 /**
  * Undecided cards waiting for their detail page: partial keyword hits (the
  * card's text proves some but not all significant terms) and cards missing
@@ -102,9 +102,9 @@ const MAX_PENDING_PER_STEP = 500;
  * every entry costs a request; overflow simply leaves the app at its card
  * verdict.
  */
-const MAX_CANDIDATE_QUEUE = 1200;
+const MAX_CANDIDATE_QUEUE = 2500;
 /** Detail fetches per step spent on undecided cards. */
-const MAX_CANDIDATE_PER_STEP = 700;
+const MAX_CANDIDATE_PER_STEP = 1000;
 /**
  * Package names kept for dedupe. Past this point repeats may be re-evaluated;
  * `emitted` still guarantees a lead is only counted once. The cap also keeps
@@ -244,6 +244,8 @@ export function createInitialCursor(keyword: string): SessionCursor {
     enrichQueue: [],
     pendingQueue: [],
     candidateQueue: [],
+    secondary: [],
+    secondaryTried: false,
     counters: emptyCounters(),
   };
 }
@@ -322,7 +324,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
   // `let` because the search loop appends a new query wave when the plan runs
   // out before the lead limit is reached (see below).
-  let queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave);
+  let queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave, cursor.secondary);
   let totalPlan = planSize(queries);
 
   const stats = () =>
@@ -1108,7 +1110,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (cursor.wave < MAX_WAVES && cursor.counters.discovered > cursor.waveDiscovered) {
         cursor.wave += 1;
         cursor.waveDiscovered = cursor.counters.discovered;
-        queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave);
+        queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave, cursor.secondary);
         totalPlan = planSize(queries);
         emit({
           type: "progress",

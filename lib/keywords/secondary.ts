@@ -30,11 +30,19 @@ export const MAX_SECONDARY_LENGTH = 80;
 /**
  * Total keyword-generation rounds per run, round one included. The first
  * round is primed before the first search; the crawler fires the remaining
- * rounds whenever the plan runs dry and the lead target is still open — each
- * attempt counts even when the model returns nothing, so a dead keyword
- * degrades into the deterministic query waves instead of looping forever.
+ * rounds whenever the plan runs dry and the lead target is still open — the
+ * run keeps generating as long as rounds keep producing fresh phrases, stops
+ * early after {@link MAX_CONSECUTIVE_DRY_ROUNDS} dead rounds, and this cap is
+ * the final backstop so a pathological keyword cannot loop forever.
  */
-export const MAX_SECONDARY_ROUNDS = 5;
+export const MAX_SECONDARY_ROUNDS = 15;
+/**
+ * Consecutive rounds that returned nothing new before generation gives up
+ * (productive rounds reset the count). With the hard cap at
+ * {@link MAX_SECONDARY_ROUNDS}, this is what makes "run until the target"
+ * stop paying for a model that has run out of ideas.
+ */
+export const MAX_CONSECUTIVE_DRY_ROUNDS = 3;
 
 function promptFor(keyword: string): string {
   return [
@@ -132,5 +140,8 @@ export async function primeRoundOne(
   cursor.secondaryTried = true;
   cursor.secondaryRounds = Math.max(cursor.secondaryRounds, 1);
   cursor.secondary = await generateSecondaryKeywords(cursor.keyword);
+  // A dry round one counts toward the consecutive-dry budget the crawler
+  // enforces on rounds 2..MAX.
+  cursor.dryRounds = cursor.secondary.length > 0 ? 0 : 1;
   return { attempted: true, generated: cursor.secondary.length };
 }

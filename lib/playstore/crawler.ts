@@ -1,5 +1,5 @@
 import { cardCanStillQualify, detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
-import { MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
+import { MAX_CONSECUTIVE_DRY_ROUNDS, MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import { MAX_DESCRIPTION_LENGTH } from "@/lib/parser/appEntries";
 import { roundRating } from "@/lib/parser/rating";
 import type {
@@ -288,6 +288,7 @@ export function createInitialCursor(keyword: string): SessionCursor {
     secondaryTried: false,
     extraTail: [],
     secondaryRounds: 0,
+    dryRounds: 0,
     counters: emptyCounters(),
   };
 }
@@ -310,6 +311,13 @@ export interface StepOptions {
    * goes straight to waves.
    */
   generateSecondary?: (keyword: string) => Promise<string[]>;
+  /**
+   * Safety backstop: stop with `query-cap` once `counters.queriesRun`
+   * reaches this many queries. Granted per run by the state store and topped
+   * up on every Resume, so an unproductive niche can never spin forever
+   * while an explicit Resume still extends the search.
+   */
+  queryBudget?: number;
 }
 
 export interface StepResult {
@@ -398,7 +406,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.suggestions = suggestions.slice(0, MAX_SUGGESTION_QUERIES);
     cursor.counters.requests += client.requests;
     cursor.counters.rateLimitHits += client.rateLimitHits;
-    if (reason !== "budget-exhausted" && reason !== "rate-limited") {
+    // `budget-exhausted` and `rate-limited` keep their phase so the next
+    // tick resumes mid-flow; `query-cap` does too — a Resume grants the next
+    // query tranche and the run must pick up exactly where it stopped.
+    if (reason !== "budget-exhausted" && reason !== "rate-limited" && reason !== "query-cap") {
       cursor.phase = "done";
     }
     const finalStats = buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
@@ -406,6 +417,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     emit({ type: "done", reason, message, stats: finalStats, cursor: result });
     return { reason, message, cursor: result, stats: finalStats };
   };
+
+  // Safety backstop — checked before anything is scheduled so a resumed run
+  // at its cap stops immediately instead of burning one more batch.
+  if (
+    options.queryBudget !== undefined &&
+    cursor.counters.queriesRun >= options.queryBudget
+  ) {
+    return finish(
+      "query-cap",
+      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${cursor.counters.matched}/${filters.limit} leads — press Resume to grant another tranche and continue.`,
+      true,
+    );
+  }
 
   /**
    * Returns true when the lead target has been reached. `cardGl` is the
@@ -1308,7 +1332,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // search phase ends honestly.
       const generate = options.generateSecondary;
       const wantsRound =
-        generate !== undefined && cursor.secondaryRounds < MAX_SECONDARY_ROUNDS;
+        generate !== undefined &&
+        cursor.secondaryRounds < MAX_SECONDARY_ROUNDS &&
+        cursor.dryRounds < MAX_CONSECUTIVE_DRY_ROUNDS;
 
       // A round is one Groq call (10s). Only gate on it — appending a wave
       // or advancing the phase is pure CPU and must keep working even when
@@ -1345,6 +1371,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           .filter((phrase) => phrase.length >= 2 && !used.has(phrase.toLowerCase()))
           .slice(0, room);
         if (added.length > 0) {
+          cursor.dryRounds = 0;
           for (const phrase of added) {
             cursor.extraTail.push({ query: phrase, kind: "suggestion" });
           }
@@ -1362,6 +1389,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           });
           continue;
         }
+        cursor.dryRounds += 1;
         emit({
           type: "progress",
           stats: stats(),

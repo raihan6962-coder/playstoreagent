@@ -208,6 +208,30 @@ export function writeJson(path: string, value: unknown, message: string): Promis
   return next;
 }
 
+/**
+ * Read-modify-write a file *inside* its path queue, so two updaters of the
+ * same file (create appending to the active index, the sweep pruning it)
+ * can never lose each other's changes. `mutate` returns the next value, or
+ * null/undefined to skip the write.
+ */
+export function mutateJson<T>(
+  path: string,
+  mutate: (current: T | null) => T | null | undefined,
+  message: string,
+): Promise<void> {
+  const previous = pathQueues.get(path) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const current = await readJson<T>(path, true);
+      const updated = mutate(current);
+      if (updated === undefined || updated === null) return;
+      await writeOne(path, updated, message);
+    });
+  pathQueues.set(path, next);
+  return next;
+}
+
 async function writeOne(path: string, value: unknown, message: string): Promise<void> {
   // A PUT must never run inside a squash window: the squash force-updates the
   // ref onto the pre-write tree, which would silently revert the PUT. Every

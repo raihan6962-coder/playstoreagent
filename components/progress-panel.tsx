@@ -27,9 +27,11 @@ function hintFor(reason: DoneReason): string | null {
     case "no-results":
       return "Nothing was indexed for that keyword. Try a broader or shorter keyword.";
     case "rate-limited":
-      return "Play Store throttled the requests. Wait a minute, then press Resume search.";
+      return "Play Store throttled the requests — the runner resumes itself once the window clears.";
     case "budget-exhausted":
       return "The step ran out of time — the search continues automatically.";
+    case "query-cap":
+      return "Safety cap so an unproductive keyword cannot spin forever. Press Resume to grant another 50,000 queries and keep searching.";
     case "failed":
       return "The run stopped because the Play Store could no longer be read.";
     default:
@@ -58,7 +60,9 @@ export function ProgressPanel({
   const tone =
     error || done?.reason === "failed"
       ? "border-rose-500/40 bg-rose-500/5"
-      : done?.reason === "plan-exhausted" || done?.reason === "no-results"
+      : done?.reason === "plan-exhausted" ||
+          done?.reason === "no-results" ||
+          done?.reason === "query-cap"
         ? "border-amber-500/40 bg-amber-500/5"
         : done
           ? "border-emerald-500/40 bg-emerald-500/5"

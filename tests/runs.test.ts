@@ -2,16 +2,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   beginTick,
   createRun,
+  DEFAULT_QUERY_BUDGET,
   isValidRunId,
   kickTick,
   resumeRun,
   snapshotRun,
   stopRun,
+  sweepStalledRuns,
 } from "@/lib/server/runs";
 import type { RunMeta, RunState } from "@/lib/server/runs";
 import { readJson, writeJson } from "@/lib/server/stateStore";
 import type { LeadFilters } from "@/types/lead";
-import { installGitHubMock, storedJson, type GitHubMock } from "./helpers/githubMock";
+import {
+  installGitHubMock,
+  storedJson,
+  type GitHubMock,
+  type MockFile,
+} from "./helpers/githubMock";
 
 const ORIGIN = "http://run.test";
 
@@ -180,5 +187,120 @@ describe("run orchestration", () => {
 
     await kickTick(ORIGIN, runId, token);
     expect(tickCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  /** Age a run's state file so the sweep sees it as quiet. */
+  async function ageRun(runId: string, patch: Partial<RunState> = {}): Promise<void> {
+    const statePath = `runs/${runId}.state.json`;
+    const state = (await readJson<RunState>(statePath, true))!;
+    Object.assign(state, { updatedAt: Date.now() - 120_000, leaseUntil: 0 }, patch);
+    await writeJson(statePath, state, "psa: age");
+  }
+
+  async function setMeta(runId: string, patch: Partial<RunMeta>): Promise<void> {
+    const metaPath = `runs/${runId}.meta.json`;
+    const meta = (await readJson<RunMeta>(metaPath, true))!;
+    Object.assign(meta, patch);
+    await writeJson(metaPath, meta, "psa: patch");
+  }
+
+  function indexIds(files: Map<string, MockFile>): string[] {
+    return (storedJson(files, "runs/_active.json") as { ids: string[] }).ids;
+  }
+
+  function tickCallsFor(mock: GitHubMock, runId: string): number {
+    return mock.fetchMock.mock.calls.filter(([url]) => String(url).includes(`/api/runs/${runId}/tick`))
+      .length;
+  }
+
+  it("registers every created run on the sweep's watch list", async () => {
+    const { runId } = await createRun(filters());
+    expect(indexIds(mock.files)).toContain(runId);
+  });
+
+  it("sweeps stalled runs, waits out held leases and prunes finished ones", async () => {
+    const stalled = await createRun(filters());
+    const held = await createRun(filters());
+    const finished = await createRun(filters());
+    const fresh = await createRun(filters());
+
+    await ageRun(stalled.runId); // quiet + no lease ⇒ kick
+    await ageRun(held.runId, { leaseUntil: Date.now() + 60_000 }); // step may still be alive
+    await ageRun(finished.runId);
+    await setMeta(finished.runId, { status: "stopped" });
+
+    const before = tickCallsFor(mock, stalled.runId);
+    const result = await sweepStalledRuns(ORIGIN);
+
+    expect(result.store).toBe("ok");
+    expect(tickCallsFor(mock, stalled.runId)).toBe(before + 1);
+    expect(tickCallsFor(mock, held.runId)).toBe(0);
+    expect(result.leaseHeld).toBeGreaterThanOrEqual(1);
+    expect(result.kicked).toBeGreaterThanOrEqual(1);
+    expect(result.pruned).toBeGreaterThanOrEqual(1);
+
+    const ids = indexIds(mock.files);
+    expect(ids).toContain(stalled.runId);
+    expect(ids).toContain(held.runId);
+    expect(ids).toContain(fresh.runId);
+    expect(ids).not.toContain(finished.runId);
+  });
+
+  it("revives a rate-limited run once its window has aged out, and not before", async () => {
+    const due = await createRun(filters());
+    const waiting = await createRun(filters());
+
+    await ageRun(due.runId);
+    await setMeta(due.runId, { status: "done", reason: "rate-limited", updatedAt: Date.now() - 11 * 60_000 });
+    await ageRun(waiting.runId);
+    await setMeta(waiting.runId, { status: "done", reason: "rate-limited", updatedAt: Date.now() - 60_000 });
+
+    const result = await sweepStalledRuns(ORIGIN);
+
+    expect(result.revived).toBeGreaterThanOrEqual(1);
+    expect(tickCallsFor(mock, due.runId)).toBeGreaterThanOrEqual(1);
+    expect(tickCallsFor(mock, waiting.runId)).toBe(0);
+    expect(indexIds(mock.files)).toContain(waiting.runId); // still watched
+
+    const revived = (storedJson(mock.files, `runs/${due.runId}.meta.json`) as RunMeta);
+    expect(revived.status).toBe("running");
+    expect(revived.reason).toBeNull();
+  });
+
+  it("reports a rate-limited store instead of pruning on failed reads", async () => {
+    const run = await createRun(filters());
+    await ageRun(run.runId);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response("rate limited", {
+            status: 403,
+            headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "123" },
+          }),
+      ),
+    );
+
+    const result = await sweepStalledRuns(ORIGIN);
+    expect(result.store).toBe("rate-limited");
+    expect(result.kicked).toBe(0);
+    expect(indexIds(mock.files)).toContain(run.runId);
+  });
+
+  it("grants another query tranche when resuming a query-capped run", async () => {
+    const { runId, token } = await createRun(filters());
+    await setMeta(runId, { status: "done", reason: "query-cap", message: "Safety cap reached." });
+    const statePath = `runs/${runId}.state.json`;
+    const state = (await readJson<RunState>(statePath, true))!;
+    expect(state.queryBudget).toBe(DEFAULT_QUERY_BUDGET);
+    state.updatedAt = Date.now() - 120_000;
+    await writeJson(statePath, state, "psa: age");
+
+    const result = await resumeRun(runId, token, ORIGIN);
+    expect(result).toEqual({ ok: true, status: "running" });
+
+    const after = (storedJson(mock.files, statePath) as RunState);
+    expect(after.queryBudget).toBe(DEFAULT_QUERY_BUDGET * 2);
+    expect((storedJson(mock.files, `runs/${runId}.meta.json`) as RunMeta).status).toBe("running");
   });
 });

@@ -25,7 +25,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
-import { readJson, StoreError, writeJson } from "@/lib/server/stateStore";
+import { mutateJson, readJson, StoreError, writeJson } from "@/lib/server/stateStore";
 import type {
   DoneReason,
   GenerationEvent,
@@ -49,6 +49,33 @@ const HEARTBEAT_MS = 20_000;
 const LOG_MAX = 300;
 /** No writes for this long while claiming `running` ⇒ the step is gone. */
 const STALLED_MS = 60_000;
+/**
+ * Queries a run may spend before the `query-cap` backstop stops it. Every
+ * Resume of a query-capped run grants the next tranche of the same size, so
+ * the cap bounds *unattended* spinning, not a user who keeps pressing Resume.
+ */
+export const DEFAULT_QUERY_BUDGET = 50_000;
+export const QUERY_BUDGET_GRANT = 50_000;
+/**
+ * How long a run that ended on a storage rate limit waits before the sweep
+ * restarts it unattended. Long enough that the window has usually moved,
+ * self-limiting because a fresh rate-limit just re-ends the run and restarts
+ * this clock.
+ */
+const RATE_LIMIT_REVIVE_MS = 10 * 60_000;
+
+/**
+ * Ids of runs the sweep should watch. Create appends; the sweep prunes
+ * (finished runs) and adds nothing else — one writer at a time is enforced
+ * by the store's per-path queue inside `mutateJson`.
+ */
+const ACTIVE_INDEX_PATH = "runs/_active.json";
+const ACTIVE_INDEX_CAP = 100;
+
+interface ActiveIndex {
+  ids: string[];
+  updatedAt: number;
+}
 
 /**
  * Per-app progress lines the live log deliberately drops: they would flood the
@@ -113,6 +140,8 @@ export interface RunState {
   updatedAt: number;
   startedAt: number;
   stepCount: number;
+  /** Query tranche granted to this run; topped up on Resume after `query-cap`. */
+  queryBudget: number;
 }
 
 function emptyStats(filters: LeadFilters, cursor: SessionCursor): GenerationStats {
@@ -187,6 +216,7 @@ export async function createRun(filters: LeadFilters): Promise<CreateRunResult> 
     updatedAt: now,
     startedAt: now,
     stepCount: 0,
+    queryBudget: DEFAULT_QUERY_BUDGET,
   };
   appendLog(
     state,
@@ -204,7 +234,30 @@ export async function createRun(filters: LeadFilters): Promise<CreateRunResult> 
   };
   await writeJson(metaPath(runId), meta, `psa: create ${runId}`);
   await writeJson(statePath(runId), state, `psa: create ${runId}`);
+  // Best-effort: without the index entry the sweep would never notice this
+  // run if its chain died — but a failing store has already failed the create
+  // writes above, so this only guards a partial outage.
+  await addToActiveIndex(runId);
   return { runId, token };
+}
+
+/** Append a run to the sweep's watch list (serialized against sweep prunes). */
+async function addToActiveIndex(runId: string): Promise<void> {
+  try {
+    await mutateJson<ActiveIndex>(
+      ACTIVE_INDEX_PATH,
+      (current) => {
+        const ids = Array.isArray(current?.ids)
+          ? current.ids.filter((id) => isValidRunId(id))
+          : [];
+        if (!ids.includes(runId)) ids.push(runId);
+        return { ids: ids.slice(-ACTIVE_INDEX_CAP), updatedAt: Date.now() };
+      },
+      "psa: index add",
+    );
+  } catch (error) {
+    console.error("active index add failed", error);
+  }
 }
 
 export type TickBegin =
@@ -399,6 +452,7 @@ export async function executeTick(
       emit,
       generateSecondary: generateSecondaryKeywords,
       aborted: () => stopSeen,
+      queryBudget: state.queryBudget ?? DEFAULT_QUERY_BUDGET,
     });
 
     if (checkpointTimer) clearInterval(checkpointTimer);
@@ -581,6 +635,7 @@ export async function resumeRun(
       await writeJson(statePath(runId), state, `psa: resume ${runId}`);
     }
   } else {
+    const priorReason = meta.reason;
     meta.status = "running";
     meta.reason = null;
     meta.message = null;
@@ -594,12 +649,17 @@ export async function resumeRun(
       state.updatedAt = Date.now();
       state.version += 1;
       state.seq += 1;
+      // Resuming a query-capped run is the explicit approval to keep going:
+      // grant the next query tranche so the backstop never blocks a user.
+      if (priorReason === "query-cap") {
+        state.queryBudget = (state.queryBudget ?? DEFAULT_QUERY_BUDGET) + QUERY_BUDGET_GRANT;
+      }
       await writeJson(statePath(runId), state, `psa: resume ${runId}`);
     }
   }
 
   try {
-    if (!(await postTick(origin, runId, token))) {
+    if (!(await postTick(origin, runId, token, RESUME_POLICY))) {
       return { ok: false, code: 409, error: "Could not reach the runner — try again." };
     }
   } catch {
@@ -608,9 +668,28 @@ export async function resumeRun(
   return { ok: true, status: "running" };
 }
 
-const CHAIN_ATTEMPTS = 3;
-const CHAIN_BACKOFF_MS = [2_000, 5_000] as const;
-const CHAIN_FETCH_TIMEOUT_MS = 12_000;
+/**
+ * Retry policies per call site — each must fit the window its caller runs in
+ * (create's `after()` 60s, tick's 300s, a button click, the sweep's 60s).
+ */
+interface TickPolicy {
+  attempts: number;
+  backoffsMs: number[];
+  timeoutMs: number;
+}
+
+/** executeTick's chain, inside the tick route's maxDuration window. */
+const CHAIN_POLICY: TickPolicy = {
+  attempts: 5,
+  backoffsMs: [2_000, 5_000, 15_000, 30_000],
+  timeoutMs: 12_000,
+};
+/** The create route's after() window (60s) — keep the first kick inside it. */
+const KICK_POLICY: TickPolicy = { attempts: 3, backoffsMs: [2_000, 5_000], timeoutMs: 12_000 };
+/** Resume answers a button click — fail fast; sweep and client retry anyway. */
+const RESUME_POLICY: TickPolicy = { attempts: 2, backoffsMs: [2_000], timeoutMs: 8_000 };
+/** The sweep's own 60s route budget. */
+const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 10_000 };
 
 /**
  * One self-chain hop: POST the tick route, retrying briefly on transient
@@ -619,15 +698,22 @@ const CHAIN_FETCH_TIMEOUT_MS = 12_000;
  * `stalled`). 401/404 are permanent and return immediately; success is any
  * 2xx (202 = step scheduled or busy, 200 = run already final).
  */
-async function postTick(origin: string, runId: string, token: string): Promise<boolean> {
-  for (let attempt = 0; attempt < CHAIN_ATTEMPTS; attempt += 1) {
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, CHAIN_BACKOFF_MS[attempt - 1]));
+async function postTick(
+  origin: string,
+  runId: string,
+  token: string,
+  policy: TickPolicy = CHAIN_POLICY,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, policy.backoffsMs[attempt - 1] ?? 5_000));
+    }
     try {
       const response = await fetch(`${origin}/api/runs/${runId}/tick`, {
         method: "POST",
         headers: { "x-run-token": token },
         cache: "no-store",
-        signal: AbortSignal.timeout(CHAIN_FETCH_TIMEOUT_MS),
+        signal: AbortSignal.timeout(policy.timeoutMs),
       });
       await response.body?.cancel();
       if (response.ok) return true;
@@ -643,11 +729,135 @@ async function postTick(origin: string, runId: string, token: string): Promise<b
   return false;
 }
 
-/** First kick after createRun; also the chain primitive for resume. */
+/** First kick after createRun. */
 export async function kickTick(origin: string, runId: string, token: string): Promise<void> {
-  // Retries inside; if every attempt fails the snapshot ages into `stalled`
-  // and Resume re-kicks.
-  await postTick(origin, runId, token);
+  // Retries inside; if every attempt fails the external sweep (and the
+  // client's auto-resume) re-kicks once the checkpoints age out.
+  await postTick(origin, runId, token, KICK_POLICY);
+}
+
+export interface SweepResult {
+  /** Runs examined (present in the index with a readable state file). */
+  checked: number;
+  /** Checkpoints still fresh — the chain is alive, nothing to do. */
+  healthy: number;
+  /** Quiet runs whose lease is still held: wait for expiry, then kick. */
+  leaseHeld: number;
+  /** Stalled runs whose tick was kicked this sweep. */
+  kicked: number;
+  /** Rate-limited runs revived this sweep. */
+  revived: number;
+  /** Index entries dropped (files gone or run finished). */
+  pruned: number;
+  store: "ok" | "rate-limited" | "error";
+}
+
+/**
+ * The external watchdog (a GitHub Actions schedule hits `/api/cron/sweep`
+ * every five minutes): for every watched run whose checkpoints went quiet,
+ * restart the self-chain. This is what makes "the automation keeps going
+ * until the target" hold across instance deaths, exhausted in-process
+ * retries and storage rate limits — cases no in-process retry can outlive.
+ * Healthy runs cost one conditional read (304 ⇒ free); finished runs are
+ * pruned; a run that ended on a rate limit is revived once its window has
+ * had ten minutes to move.
+ */
+export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
+  const result: SweepResult = {
+    checked: 0,
+    healthy: 0,
+    leaseHeld: 0,
+    kicked: 0,
+    revived: 0,
+    pruned: 0,
+    store: "ok",
+  };
+
+  let kept: string[];
+  try {
+    const index = await readJson<ActiveIndex>(ACTIVE_INDEX_PATH, true);
+    kept = Array.isArray(index?.ids) ? index.ids.filter((id) => isValidRunId(id)) : [];
+  } catch (error) {
+    result.store =
+      error instanceof StoreError && error.kind === "rate-limit" ? "rate-limited" : "error";
+    return result;
+  }
+
+  const remove = new Set<string>();
+  for (const runId of kept) {
+    try {
+      const state = await readJson<RunState>(statePath(runId), true);
+      if (!state) {
+        remove.add(runId);
+        continue;
+      }
+      result.checked += 1;
+      if (Date.now() - state.updatedAt <= STALLED_MS) {
+        result.healthy += 1;
+        continue;
+      }
+
+      const meta = await readJson<RunMeta>(metaPath(runId), true);
+      if (!meta || meta.runId !== runId) {
+        remove.add(runId);
+        continue;
+      }
+
+      if (meta.status !== "running") {
+        if (meta.status === "done" && meta.reason === "rate-limited") {
+          if (Date.now() - meta.updatedAt < RATE_LIMIT_REVIVE_MS) continue; // keep watching
+          // Ten quiet minutes: restart unattended. If the limit is still on,
+          // the run re-ends as rate-limited and this clock starts over — the
+          // attempt loop is self-limiting.
+          meta.status = "running";
+          meta.reason = null;
+          meta.message = null;
+          meta.updatedAt = Date.now();
+          await writeJson(metaPath(runId), meta, `psa: revive ${runId}`);
+          state.updatedAt = Date.now();
+          state.version += 1;
+          state.seq += 1;
+          await writeJson(statePath(runId), state, `psa: revive ${runId}`);
+          if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) result.revived += 1;
+        } else {
+          remove.add(runId); // stopped or finished for good
+        }
+        continue;
+      }
+
+      // Claimed `running` but quiet. A live step keeps updatedAt fresh AND
+      // its lease held, so a held lease here means the step may still be
+      // finishing (or just died) — wait for expiry instead of risking two
+      // writers on one state file.
+      if (state.leaseUntil > Date.now()) {
+        result.leaseHeld += 1;
+        continue;
+      }
+
+      if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) result.kicked += 1;
+    } catch (error) {
+      // The store stopped answering (typically rate-limited): abort without
+      // pruning — the next sweep retries everything from a healthy store.
+      result.store =
+        error instanceof StoreError && error.kind === "rate-limit" ? "rate-limited" : "error";
+      return result;
+    }
+  }
+
+  if (remove.size > 0) {
+    const ids = kept.filter((id) => !remove.has(id));
+    try {
+      await mutateJson<ActiveIndex>(
+        ACTIVE_INDEX_PATH,
+        () => ({ ids, updatedAt: Date.now() }),
+        "psa: index prune",
+      );
+      result.pruned = remove.size;
+    } catch {
+      // Best-effort: stale entries are re-pruned next sweep.
+    }
+  }
+  return result;
 }
 
 /** Map storage failures onto HTTP responses. */

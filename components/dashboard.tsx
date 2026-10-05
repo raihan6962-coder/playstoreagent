@@ -29,8 +29,12 @@ const POLL_ACTIVE_MS = 3_000;
 const POLL_IDLE_MS = 15_000;
 /** Client-side cap; the server log already caps at 300 curated entries. */
 const LOG_CLIENT_MAX = 500;
+/** Throttle for the automatic Resume of a stalled run (browser open case). */
+const AUTO_RESUME_MS = 45_000;
+/** Rate-limited runs retry much less often — the window only moves hourly. */
+const RATE_LIMITED_RESUME_MS = 10 * 60_000;
 
-const STALLED_TEXT = "The runner stalled — press Resume to continue.";
+const STALLED_TEXT = "The runner stalled — resuming it automatically…";
 
 interface Versions {
   state: number;
@@ -101,6 +105,36 @@ export function Dashboard() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let inFlight = false;
     let failures = 0;
+    let lastAutoResume = 0;
+
+    /**
+     * "Keep going until the target" while the tab is open: a stalled chain
+     * or a run that ended on a rate limit resumes itself (throttled). The
+     * external sweep covers the tab-closed case; the Resume button stays as
+     * the manual fallback for both.
+     */
+    const maybeAutoResume = (snapshot: Awaited<ReturnType<typeof fetchSnapshot>>): void => {
+      const stalled = snapshot.status === "stalled";
+      const rateLimited = snapshot.status === "done" && snapshot.reason === "rate-limited";
+      if (!stalled && !rateLimited) return;
+      const wait = stalled ? AUTO_RESUME_MS : RATE_LIMITED_RESUME_MS;
+      const now = Date.now();
+      if (now - lastAutoResume < wait) return;
+      lastAutoResume = now;
+      void runAction(run, "resume")
+        .then((result) => {
+          if (cancelled || result.status !== "running") return;
+          setError(null);
+          setMessage(
+            stalled
+              ? "The runner stalled — resuming it automatically…"
+              : "The rate limit cleared — resuming automatically…",
+          );
+        })
+        .catch(() => {
+          // Keep the notice up; the next poll (or the external sweep) retries.
+        });
+    };
 
     const applySnapshot = (snapshot: Awaited<ReturnType<typeof fetchSnapshot>>): void => {
       setStats(snapshot.stats);
@@ -160,6 +194,7 @@ export function Dashboard() {
           });
           if (!cancelled) {
             applySnapshot(snapshot);
+            maybeAutoResume(snapshot);
             failures = 0;
           }
         } catch (caught) {

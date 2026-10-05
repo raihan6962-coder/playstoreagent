@@ -1,4 +1,4 @@
-import { MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
+import { MAX_CONSECUTIVE_DRY_ROUNDS, MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import {
   buildPlanQueries,
   legacyWaveTail,
@@ -213,6 +213,16 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
       : asIndex(secondaryRoundsRaw, MAX_SECONDARY_ROUNDS);
   if (secondaryRounds === null) return null;
 
+  // Consecutive dry generation rounds: optional for older cursors, clamped
+  // to the policy cap — a value above the cap already means "stop asking the
+  // model", so clamping preserves that intent instead of restarting the run.
+  const dryRoundsRaw = input.dryRounds;
+  let dryRounds = 0;
+  if (dryRoundsRaw !== undefined && dryRoundsRaw !== null) {
+    if (typeof dryRoundsRaw !== "number" || !Number.isFinite(dryRoundsRaw)) return null;
+    dryRounds = Math.min(Math.max(0, Math.floor(dryRoundsRaw)), MAX_CONSECUTIVE_DRY_ROUNDS);
+  }
+
   // Append-only plan tail (post-search AI rounds + wave slices). Older
   // cursors stored waves only as a count and derived them at rebuild time —
   // replay that derivation once so their plan (and planIndex) stays identical.
@@ -274,6 +284,7 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     secondaryTried,
     extraTail,
     secondaryRounds,
+    dryRounds,
     counters,
   };
 }

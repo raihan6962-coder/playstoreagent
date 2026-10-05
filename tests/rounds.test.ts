@@ -3,7 +3,7 @@ import {
   createInitialCursor,
   runGenerationStep,
 } from "@/lib/playstore/crawler";
-import { MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
+import { MAX_CONSECUTIVE_DRY_ROUNDS, MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
@@ -80,7 +80,9 @@ describe("AI keyword rounds", () => {
       expect.arrayContaining(["budget planner", "expense log"]),
     );
     expect(cursor.secondaryRounds).toBeGreaterThanOrEqual(1);
-    expect(harness.messages().some((message) => message.includes("round 1 of 5"))).toBe(true);
+    expect(harness.messages().some((message) => message.includes(`round 1 of ${MAX_SECONDARY_ROUNDS}`))).toBe(
+      true,
+    );
     expect(harness.messages().some((message) => message.includes("Queued 2 related keywords"))).toBe(true);
     // The generated phrases are actually requested from Play.
     expect(
@@ -154,5 +156,80 @@ describe("AI keyword rounds", () => {
     expect(cursor.extraTail).toEqual([]);
     expect(cursor.secondaryRounds).toBeGreaterThanOrEqual(1);
     expect(harness.messages().some((message) => message.includes("Queued"))).toBe(false);
+  });
+
+  it("stops generating after three consecutive dry rounds even with rounds left", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: searchRoutes, detail: detailRoute });
+    const cursor = dryCursor();
+    cursor.dryRounds = MAX_CONSECUTIVE_DRY_ROUNDS;
+    const generate = vi.fn();
+
+    const result = await runGenerationStep({
+      filters: filters(),
+      cursor,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+      generateSecondary: generate,
+    });
+
+    expect(generate).not.toHaveBeenCalled();
+    expect(cursor.secondaryRounds).toBe(0);
+    expect(harness.messages().some((message) => message.includes("generating related keywords"))).toBe(
+      false,
+    );
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("resets the dry counter when a round produces fresh keywords", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: searchRoutes, detail: detailRoute });
+    const cursor = dryCursor();
+    cursor.dryRounds = MAX_CONSECUTIVE_DRY_ROUNDS - 1; // one round left before the dry stop
+    const generate = vi
+      .fn()
+      .mockResolvedValueOnce(["budget planner"])
+      .mockResolvedValue([]);
+
+    await runGenerationStep({
+      filters: filters(),
+      cursor,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+      generateSecondary: generate,
+    });
+
+    expect(cursor.extraTail.map((entry) => entry.query)).toContain("budget planner");
+    // Round two firing at all proves the productive round reset the counter
+    // (without the reset, dryRounds would have blocked it at MAX); the dry
+    // second round then counts up from zero again.
+    expect(cursor.secondaryRounds).toBeGreaterThanOrEqual(2);
+    expect(cursor.dryRounds).toBeGreaterThanOrEqual(1);
+    expect(cursor.dryRounds).toBeLessThan(MAX_CONSECUTIVE_DRY_ROUNDS);
+  });
+
+  it("stops immediately at the query safety cap without issuing requests", async () => {
+    const harness = collect();
+    const client = makeFakeClient({ search: searchRoutes, detail: detailRoute });
+    const cursor = dryCursor();
+    cursor.counters.queriesRun = 12;
+
+    const result = await runGenerationStep({
+      filters: filters(),
+      cursor,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+      queryBudget: 12,
+    });
+
+    expect(result.reason).toBe("query-cap");
+    expect(result.message).toContain("safety cap");
+    expect(result.message).toContain("Resume");
+    // The phase is preserved so the granted Resume continues, not restarts.
+    expect(result.cursor?.phase).toBe("search");
+    expect(harness.messages().some((message) => message.includes("Searching Play Store"))).toBe(false);
   });
 });

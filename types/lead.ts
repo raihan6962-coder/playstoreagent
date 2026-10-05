@@ -260,10 +260,19 @@ export interface SessionCursor {
   extraTail: PlanQuery[];
   /**
    * How many AI keyword-generation rounds this session attempted (round one
-   * included). Bounded so an unproductive keyword cannot loop generation
-   * forever — after the cap the plan falls back to deterministic waves.
+   * included). Rounds keep firing while they still produce fresh phrases —
+   * the run stops earlier when {@link dryRounds} says generation went quiet,
+   * and at the hard cap so a pathological keyword cannot loop forever.
    */
   secondaryRounds: number;
+  /**
+   * Consecutive keyword-generation rounds that produced no new search
+   * phrases. Reset to 0 by any productive round; at
+   * {@link MAX_CONSECUTIVE_DRY_ROUNDS} the plan stops asking the model and
+   * falls back to the deterministic waves — "keep going until the target"
+   * without paying for a generator that has nothing left to give.
+   */
+  dryRounds: number;
   counters: SessionCounters;
 }
 
@@ -273,6 +282,8 @@ export type DoneReason =
   | "budget-exhausted"
   | "no-results"
   | "rate-limited"
+  /** Hit the run's query safety cap; a Resume grants the next tranche. */
+  | "query-cap"
   | "failed";
 
 export type GenerationEvent =

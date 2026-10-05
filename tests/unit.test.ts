@@ -12,6 +12,7 @@ import {
 } from "@/lib/validation/input";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import { createInitialCursor } from "@/lib/playstore/crawler";
+import { MAX_CONSECUTIVE_DRY_ROUNDS } from "@/lib/keywords/secondary";
 import type { Lead } from "@/types/lead";
 
 describe("query plan", () => {
@@ -156,6 +157,23 @@ describe("sanitizeCursor", () => {
     delete legacy.secondaryTried;
     expect(sanitizeCursor(legacy, "budget tracker")?.secondary).toEqual([]);
     expect(sanitizeCursor(legacy, "budget tracker")?.secondaryTried).toBe(false);
+  });
+
+  it("defaults, clamps and rejects malformed dry-round counters", () => {
+    const cursor = createInitialCursor("budget tracker");
+
+    // Missing field (older cursor): start counting from zero.
+    const legacy = { ...cursor } as unknown as Record<string, unknown>;
+    delete legacy.dryRounds;
+    expect(sanitizeCursor(legacy, "budget tracker")?.dryRounds).toBe(0);
+
+    // Above the policy cap already means "stop generating": clamp, don't restart.
+    expect(sanitizeCursor({ ...cursor, dryRounds: 99 }, "budget tracker")?.dryRounds).toBe(
+      MAX_CONSECUTIVE_DRY_ROUNDS,
+    );
+    expect(sanitizeCursor({ ...cursor, dryRounds: -3 }, "budget tracker")?.dryRounds).toBe(0);
+
+    expect(sanitizeCursor({ ...cursor, dryRounds: "lots" }, "budget tracker")).toBeNull();
   });
 
   it("accepts a planIndex that only fits once secondary phrases are included", () => {

@@ -1,45 +1,41 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { mergeLead, runGeneration } from "@/lib/client/generation";
+import { useEffect, useRef, useState } from "react";
+import {
+  clearAttachedRun,
+  createRun,
+  fetchSnapshot,
+  loadAttachedRun,
+  runAction,
+  RunRequestError,
+  type AttachedRun,
+} from "@/lib/client/runs";
 import { csvFilename, leadsToCsv } from "@/lib/csv/export";
-import { leadPassesFilters } from "@/lib/filters/leadFilter";
 import {
   parseInstallInput,
-  validateCountry,
   validateKeyword,
   validateLimit,
   validateMaxRating,
 } from "@/lib/validation/input";
-import type {
-  DoneReason,
-  GenerationEvent,
-  GenerationStats,
-  Lead,
-  LeadFilters,
-  SessionCursor,
-} from "@/types/lead";
+import type { DoneReason, GenerationStats, Lead } from "@/types/lead";
+import type { LogEntry, SnapshotStatus } from "@/types/run";
 import { LeadTable } from "./lead-table";
+import { LogPanel } from "./log-panel";
 import { ProgressPanel } from "./progress-panel";
 import { SearchForm, type SearchValues } from "./search-form";
 
-/**
- * Each step streams for up to ~4 minutes server-side; these bound a full run.
- * The server keeps appending query waves until the lead limit or the supply
- * runs out, so the client budget has to comfortably cover the whole run —
- * 48 passes × ~4 min ≈ 3 hours of continuous generation.
- */
-const MAX_AUTO_RESUMES = 48;
-const MAX_AUTO_MS = 180 * 60_000;
+/** Active run: keep the dashboard live. Finished/stalled: poll cheaply. */
+const POLL_ACTIVE_MS = 3_000;
+const POLL_IDLE_MS = 15_000;
+/** Client-side cap; the server log already caps at 300 curated entries. */
+const LOG_CLIENT_MAX = 500;
 
-function sameFilters(a: LeadFilters, b: LeadFilters): boolean {
-  return (
-    a.keyword === b.keyword &&
-    a.maxRating === b.maxRating &&
-    a.maxInstalls === b.maxInstalls &&
-    a.limit === b.limit &&
-    a.country === b.country
-  );
+const STALLED_TEXT = "The runner stalled — press Resume to continue.";
+
+interface Versions {
+  state: number;
+  leads: number;
+  logLastId: number;
 }
 
 export function Dashboard() {
@@ -53,37 +49,164 @@ export function Dashboard() {
     // being searched.
     maxRating: "4",
     maxInstalls: "5000000",
-    country: "BD",
     limit: "1000",
   });
   const [errors, setErrors] = useState<Partial<Record<keyof SearchValues, string>>>({});
-  const [running, setRunning] = useState(false);
+  const [attached, setAttached] = useState<AttachedRun | null>(null);
+  const [status, setStatus] = useState<SnapshotStatus | null>(null);
+  const [creating, setCreating] = useState(false);
   const [leads, setLeads] = useState<Lead[]>([]);
+  const [log, setLog] = useState<LogEntry[]>([]);
   const [stats, setStats] = useState<GenerationStats | null>(null);
   const [message, setMessage] = useState("");
-  const [warnings, setWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ reason: DoneReason; message: string } | null>(null);
 
-  const cursorRef = useRef<SessionCursor | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const runningRef = useRef(false);
-  /** Filters the leads currently on screen were qualified with. */
-  const filtersRef = useRef<LeadFilters | null>(null);
+  const versionsRef = useRef<Versions>({ state: 0, leads: 0, logLastId: 0 });
+  const statusRef = useRef<SnapshotStatus | null>(null);
 
-  function validate(): LeadFilters | null {
+  const applyStatus = (next: SnapshotStatus | null): void => {
+    statusRef.current = next;
+    setStatus(next);
+  };
+
+  /**
+   * Reattach after a reload: the run kept collecting with the tab closed,
+   * and the first snapshot replaces the optimistic state below. Deferred a
+   * tick so the effect body itself stays free of synchronous setState.
+   */
+  useEffect(() => {
+    const run = loadAttachedRun();
+    if (!run) return;
+    const timer = window.setTimeout(() => {
+      setAttached(run);
+      applyStatus("running");
+      setMessage("Reattached to your previous run — it kept working while you were away.");
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  /**
+   * The polling loop — the only thing driving the dashboard now. Adaptive
+   * cadence: 3s while the server reports progress, 15s when it is idle or
+   * done. Log/leads ship only when their versions moved, so a quiet poll is
+   * a few hundred bytes.
+   */
+  useEffect(() => {
+    if (!attached) return;
+    const run = attached;
+    versionsRef.current = { state: 0, leads: 0, logLastId: 0 };
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let inFlight = false;
+    let failures = 0;
+
+    const applySnapshot = (snapshot: Awaited<ReturnType<typeof fetchSnapshot>>): void => {
+      setStats(snapshot.stats);
+      applyStatus(snapshot.status);
+      setDone(
+        snapshot.status === "done" && snapshot.reason
+          ? { reason: snapshot.reason, message: snapshot.message ?? "Run finished." }
+          : null,
+      );
+
+      if (snapshot.status === "stalled") {
+        setError(STALLED_TEXT);
+      } else if (failures >= 2) {
+        // Only poll failures clear here — errors set elsewhere (e.g. a failed
+        // create) must not be wiped by a healthy poll.
+        setError(null);
+      }
+      if (snapshot.status === "done" || snapshot.status === "stopped") {
+        if (snapshot.message) setMessage(snapshot.message);
+      }
+
+      if (snapshot.log) {
+        setLog((previous) => {
+          const lastId = previous[previous.length - 1]?.id ?? 0;
+          const fresh = snapshot.log!.filter((entry) => entry.id > lastId);
+          if (fresh.length === 0) return previous;
+          const latest = fresh[fresh.length - 1];
+          if (
+            snapshot.status !== "done" &&
+            snapshot.status !== "stopped" &&
+            snapshot.status !== "stalled"
+          ) {
+            setMessage(latest.message);
+          }
+          return [...previous, ...fresh].slice(-LOG_CLIENT_MAX);
+        });
+      }
+
+      if (snapshot.leads) setLeads(snapshot.leads);
+      versionsRef.current = {
+        state: snapshot.versions.state,
+        leads: snapshot.versions.leads,
+        logLastId: snapshot.versions.logLastId,
+      };
+    };
+
+    const poll = async (): Promise<void> => {
+      if (cancelled) return;
+      const active =
+        statusRef.current === "running" || statusRef.current === "stop-requested";
+      if (!inFlight) {
+        inFlight = true;
+        try {
+          const snapshot = await fetchSnapshot(run, {
+            logSince: versionsRef.current.logLastId,
+            leadsSince: versionsRef.current.leads,
+          });
+          if (!cancelled) {
+            applySnapshot(snapshot);
+            failures = 0;
+          }
+        } catch (caught) {
+          if (!cancelled) {
+            failures += 1;
+            if (caught instanceof RunRequestError && (caught.code === 401 || caught.code === 404)) {
+              clearAttachedRun();
+              setAttached(null);
+              applyStatus(null);
+              setMessage("This run is no longer available.");
+              setError(null);
+              return;
+            }
+            if (failures >= 2) {
+              setError(
+                caught instanceof RunRequestError
+                  ? caught.message
+                  : "Connection issue — retrying…",
+              );
+            }
+          }
+        } finally {
+          inFlight = false;
+        }
+      }
+      if (!cancelled) timer = setTimeout(() => void poll(), active ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attached?.runId, attached?.token]);
+
+  function validate(): { keyword: string; maxRating: number; maxInstalls: number; limit: number } | null {
     const keyword = validateKeyword(values.keyword);
     const maxRating = validateMaxRating(values.maxRating);
     const maxInstalls = parseInstallInput(values.maxInstalls);
-    const country = validateCountry(values.country);
     const limit = validateLimit(values.limit);
 
-    if (!keyword.ok || !maxRating.ok || !maxInstalls.ok || !country.ok || !limit.ok) {
+    if (!keyword.ok || !maxRating.ok || !maxInstalls.ok || !limit.ok) {
       const next: Partial<Record<keyof SearchValues, string>> = {};
       if (!keyword.ok) next.keyword = keyword.error;
       if (!maxRating.ok) next.maxRating = maxRating.error;
       if (!maxInstalls.ok) next.maxInstalls = maxInstalls.error;
-      if (!country.ok) next.country = country.error;
       if (!limit.ok) next.limit = limit.error;
       setErrors(next);
       return null;
@@ -94,175 +217,88 @@ export function Dashboard() {
       keyword: keyword.value,
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
-      country: country.value,
       limit: limit.value,
     };
   }
 
-  function handleEvent(event: GenerationEvent): void {
-    const active = filtersRef.current;
+  async function start(): Promise<void> {
+    const parsed = validate();
+    if (!parsed || creating) return;
 
-    switch (event.type) {
-      case "progress":
-        setStats(event.stats);
-        setMessage(event.message);
-        break;
-      case "lead":
-        // Last line of defence: a row only ever reaches the table (and the CSV)
-        // if it satisfies the filters the run was started with.
-        if (active && !leadPassesFilters(event.lead, active)) break;
-        setLeads((previous) =>
-          previous.some((lead) => lead.packageName === event.lead.packageName)
-            ? previous
-            : [...previous, event.lead],
-        );
-        break;
-      case "lead-update":
-        setLeads((previous) =>
-          previous.flatMap((lead) => {
-            if (lead.packageName !== event.app.packageName) return [lead];
-            const merged = mergeLead(lead, event.app);
-            return active && !leadPassesFilters(merged, active) ? [] : [merged];
-          }),
-        );
-        break;
-      case "lead-remove":
-        setLeads((previous) =>
-          previous.filter((lead) => lead.packageName !== event.packageName),
-        );
-        break;
-      case "warning":
-        setWarnings((previous) => [...previous, event.message]);
-        break;
-      case "done":
-        setStats(event.stats);
-        setMessage(event.message);
-        setDone({ reason: event.reason, message: event.message });
-        cursorRef.current = event.cursor;
-        break;
-      case "error":
-        setError(event.message);
-        setMessage(event.message);
-        break;
-    }
-  }
-
-  async function execute(resume: boolean): Promise<void> {
-    const filters = validate();
-    if (!filters || runningRef.current) return;
-
-    // The leads on screen were qualified with the previous settings. If those
-    // settings changed, restart instead of resuming: a resume would keep rows
-    // that no longer match and would skip packages the old rules already saw.
-    if (resume && filtersRef.current && !sameFilters(filters, filtersRef.current)) {
-      resume = false;
-    }
-    filtersRef.current = filters;
-
-    runningRef.current = true;
-    setRunning(true);
+    setCreating(true);
     setError(null);
     setDone(null);
-    if (!resume) {
-      setLeads([]);
-      setStats(null);
-      setWarnings([]);
-      cursorRef.current = null;
-      setMessage(`Searching Play Store for “${filters.keyword}”…`);
-    }
 
-    const controller = new AbortController();
-    abortRef.current = controller;
-    let activeCursor = resume ? cursorRef.current : null;
-    let autoResumes = 0;
-    let droppedWithoutDone = 0;
-    const startedAt = Date.now();
+    // Starting a new search detaches the old run: ask it to stop (fire and
+    // forget — its step observes the flag at the next checkpoint), then reset
+    // the screen. The new run replaces the localStorage attachment.
+    if (attached) {
+      void runAction(attached, "stop").catch(() => undefined);
+    }
+    clearAttachedRun();
+    setAttached(null);
+    applyStatus(null);
+    setLeads([]);
+    setLog([]);
+    setStats(null);
+    setMessage("");
 
     try {
-      for (;;) {
-        const terminal = await runGeneration({
-          request: {
-            ...filters,
-            cursor: activeCursor ?? undefined,
-          },
-          onEvent: handleEvent,
-          signal: controller.signal,
-        });
-
-        if (controller.signal.aborted) break;
-
-        if (terminal && terminal.type === "error") break;
-
-        if (terminal && terminal.type === "done") {
-          droppedWithoutDone = 0;
-          activeCursor = terminal.cursor;
-          const withinTime = Date.now() - startedAt < MAX_AUTO_MS;
-          const canContinue =
-            terminal.reason === "budget-exhausted" &&
-            terminal.cursor !== null &&
-            autoResumes < MAX_AUTO_RESUMES &&
-            withinTime;
-
-          if (!canContinue) break;
-
-          autoResumes += 1;
-          setDone(null);
-          setMessage(`Continuing automatically (pass ${autoResumes + 1})…`);
-          continue;
-        }
-
-        // The stream closed without a terminal event: a network drop or a
-        // platform timeout. One retry keeps a long run alive without risking
-        // an endless loop of steps that never make progress.
-        droppedWithoutDone += 1;
-        const nextCursor = cursorRef.current ?? activeCursor;
-        const withinTime = Date.now() - startedAt < MAX_AUTO_MS;
-        if (
-          nextCursor &&
-          droppedWithoutDone < 2 &&
-          autoResumes < MAX_AUTO_RESUMES &&
-          withinTime
-        ) {
-          autoResumes += 1;
-          activeCursor = nextCursor;
-          setDone(null);
-          setMessage(`Connection dropped — resuming (pass ${autoResumes + 1})…`);
-          continue;
-        }
-
-        const text = nextCursor
-          ? "The connection dropped before the step finished. Resume to pick up from the last checkpoint."
-          : "The connection dropped before the search finished. Please try again.";
-        setError(text);
-        setMessage(text);
-        break;
-      }
+      const run = await createRun({
+        keyword: parsed.keyword,
+        maxRating: parsed.maxRating,
+        maxInstalls: parsed.maxInstalls,
+        limit: parsed.limit,
+      });
+      setAttached(run);
+      applyStatus("running");
+      setMessage(`Run created for “${parsed.keyword}” — the server takes it from here.`);
     } catch (caught) {
-      const text = caught instanceof Error ? caught.message : "Unexpected client error.";
-      setError(text);
-      setMessage(text);
+      setError(caught instanceof Error ? caught.message : "Could not start the run.");
     } finally {
-      runningRef.current = false;
-      setRunning(false);
-      abortRef.current = null;
+      setCreating(false);
     }
   }
 
-  function stop(): void {
-    abortRef.current?.abort();
+  async function requestStop(): Promise<void> {
+    if (!attached) return;
+    try {
+      const result = await runAction(attached, "stop");
+      applyStatus(result.status);
+      if (result.status === "stopped") {
+        setDone(null);
+        setMessage("Stopped.");
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not stop the run.");
+    }
+  }
+
+  async function requestResume(): Promise<void> {
+    if (!attached) return;
+    try {
+      const result = await runAction(attached, "resume");
+      applyStatus(result.status);
+      setDone(null);
+      setError(null);
+      setMessage("Resumed — the runner picks up from its last checkpoint.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not resume the run.");
+    }
   }
 
   function reset(): void {
-    if (runningRef.current) stop();
+    if (attached) void runAction(attached, "stop").catch(() => undefined);
+    clearAttachedRun();
+    setAttached(null);
+    applyStatus(null);
     setLeads([]);
+    setLog([]);
     setStats(null);
-    setWarnings([]);
+    setMessage("");
     setError(null);
     setDone(null);
-    setMessage("");
-    cursorRef.current = null;
     setErrors({});
-    filtersRef.current = null;
   }
 
   function exportCsv(): void {
@@ -280,7 +316,35 @@ export function Dashboard() {
     URL.revokeObjectURL(url);
   }
 
-  const canResume = !running && cursorRef.current !== null;
+  const resumable =
+    !creating &&
+    attached !== null &&
+    (status === "stopped" ||
+      status === "stalled" ||
+      (status === "done" && (done?.reason === "rate-limited" || done?.reason === "failed")));
+
+  // While the server is mid-query this shows the live request instead of the
+  // curated log's last line, which intentionally skips per-query spam.
+  const headline =
+    status === "running" && stats?.currentQuery
+      ? `Searching Play Store for “${stats.currentQuery}”…`
+      : message;
+
+  const warnings = log.filter((entry) => entry.kind === "warn").map((entry) => entry.message);
+
+  const statusChip = creating
+    ? "Starting…"
+    : status === "running"
+      ? "Running"
+      : status === "stop-requested"
+        ? "Stopping…"
+        : status === "stalled"
+          ? "Stalled"
+          : status === "stopped"
+            ? "Stopped"
+            : status === "done"
+              ? "Finished"
+              : null;
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-8 sm:px-6 lg:py-12">
@@ -293,42 +357,49 @@ export function Dashboard() {
           Find low-rated, low-install apps worth building for
         </h1>
         <p className="max-w-2xl text-sm leading-relaxed text-zinc-400">
-          The server searches the Google Play Store in real time, keeps every app that matches your
-          keyword, rating ceiling and install ceiling, and streams them here as it works. No
-          database, no third-party APIs — just server-side Play Store scraping.
+          The server searches the Google Play Store, keeps every app that matches your keyword,
+          rating ceiling and install ceiling, and keeps collecting — even after you close this tab.
+          No database, no third-party APIs — just server-side Play Store scraping.
         </p>
       </header>
 
       <SearchForm
         values={values}
         errors={errors}
-        running={running}
-        canResume={canResume}
+        running={creating || status === "running" || status === "stop-requested"}
+        canResume={resumable}
         onChange={setValues}
-        onSubmit={() => void execute(false)}
-        onStop={stop}
-        onResume={() => void execute(true)}
+        onSubmit={() => void start()}
+        onStop={() => void requestStop()}
+        onResume={() => void requestResume()}
         onReset={reset}
       />
 
       <ProgressPanel
-        running={running}
+        running={status === "running" || status === "stop-requested"}
         stats={stats}
-        message={message}
+        message={headline}
         warnings={warnings}
         error={error}
         done={done}
       />
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-zinc-400">
-          <span className="font-medium text-zinc-200">{leads.length}</span> lead
-          {leads.length === 1 ? "" : "s"} collected
-          {values.keyword.trim() && (
-            <>
-              {" "}
-              for <span className="text-zinc-200">“{values.keyword.trim()}”</span>
-            </>
+        <p className="flex items-center gap-3 text-sm text-zinc-400">
+          <span>
+            <span className="font-medium text-zinc-200">{leads.length}</span> lead
+            {leads.length === 1 ? "" : "s"} collected
+            {values.keyword.trim() && (
+              <>
+                {" "}
+                for <span className="text-zinc-200">“{values.keyword.trim()}”</span>
+              </>
+            )}
+          </span>
+          {statusChip && (
+            <span className="rounded-full border border-zinc-700 px-2.5 py-0.5 text-xs text-zinc-400">
+              {statusChip}
+            </span>
           )}
         </p>
         <button
@@ -340,6 +411,8 @@ export function Dashboard() {
           Export CSV
         </button>
       </div>
+
+      <LogPanel entries={log} />
 
       <LeadTable leads={leads} />
 

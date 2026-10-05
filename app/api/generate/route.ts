@@ -1,6 +1,7 @@
-import { generateSecondaryKeywords } from "@/lib/keywords/secondary";
+import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
+import { allowRequest, clientIp } from "@/lib/server/rateLimit";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
   parseInstallInput,
@@ -23,42 +24,10 @@ const DEFAULT_BUDGET_MS = 265_000;
 const MIN_BUDGET_MS = 5_000;
 const MAX_BUDGET_MS = 265_000;
 
-const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 12;
-
 const encoder = new TextEncoder();
 
 function jsonError(status: number, error: string): Response {
   return Response.json({ error }, { status });
-}
-
-function clientIp(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0].trim();
-  return request.headers.get("x-real-ip") ?? "unknown";
-}
-
-/**
- * Best-effort, in-memory rate limiter. There is no database in this project by
- * design, so this protects a single warm instance rather than the whole fleet.
- */
-const hits = new Map<string, number[]>();
-
-function allowRequest(ip: string): boolean {
-  const now = Date.now();
-  const recent = (hits.get(ip) ?? []).filter((at) => now - at < RATE_WINDOW_MS);
-  if (recent.length >= RATE_LIMIT) {
-    hits.set(ip, recent);
-    return false;
-  }
-  recent.push(now);
-  hits.set(ip, recent);
-  if (hits.size > 1_000) {
-    for (const [key, timestamps] of hits) {
-      if (timestamps.every((at) => now - at >= RATE_WINDOW_MS)) hits.delete(key);
-    }
-  }
-  return true;
 }
 
 function resolveBudgetMs(): number {
@@ -112,7 +81,9 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     ...cursor.counters,
     keyword: filters.keyword,
     target: filters.limit,
-    queriesTotal: planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.wave, cursor.secondary)),
+    queriesTotal: planSize(
+      buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.secondary, cursor.extraTail),
+    ),
     currentQuery: null,
     phase: cursor.phase,
     wave: cursor.wave,
@@ -174,25 +145,26 @@ export async function POST(request: Request): Promise<Response> {
           message: `Searching Play Store for “${filters.keyword}”…`,
         });
 
-        // Phase two of the pipeline: once per run, ask Groq for the search
-        // phrases that find apps in the same category neighbourhood. The plan
-        // appends them after the primary queries, so this run scrapes the main
-        // keyword first and then repeats the exact same filter flow over the
-        // secondary phrases. A failure simply leaves the list empty — the run
-        // continues with the primary plan only.
+        // Round one of the keyword-generation loop: once per run, ask Groq
+        // for the search phrases that find apps in the same category
+        // neighbourhood. The plan puts them right after the primary queries,
+        // so this run scrapes the main keyword first and then repeats the
+        // exact same filter flow over the secondary phrases. While the target
+        // is still open and the plan runs dry, the crawler fires the remaining
+        // rounds itself (see StepOptions.generateSecondary). A failure simply
+        // leaves the list empty — the run continues with the primary plan.
         if (cursor.secondary.length === 0 && !cursor.secondaryTried) {
-          cursor.secondaryTried = true;
           send({
             type: "progress",
             stats: initialStats(cursor, filters),
             message: `Generating related search keywords for “${filters.keyword}”…`,
           });
-          cursor.secondary = await generateSecondaryKeywords(filters.keyword);
-          if (cursor.secondary.length > 0) {
+          const roundOne = await primeRoundOne(cursor);
+          if (roundOne.generated > 0) {
             send({
               type: "progress",
               stats: initialStats(cursor, filters),
-              message: `Queued ${cursor.secondary.length} related keywords to search as well.`,
+              message: `Queued ${roundOne.generated} related keywords to search as well.`,
             });
           }
         }
@@ -203,6 +175,7 @@ export async function POST(request: Request): Promise<Response> {
           budgetMs,
           emit: send,
           aborted: () => cancelled,
+          generateSecondary: generateSecondaryKeywords,
         });
       } catch (error) {
         send({

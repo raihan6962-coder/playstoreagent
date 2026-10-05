@@ -4,7 +4,6 @@ export interface SearchValues {
   keyword: string;
   maxRating: string;
   maxInstalls: string;
-  country: string;
   limit: string;
 }
 
@@ -61,7 +60,7 @@ export function SearchForm({
   const set = (key: keyof SearchValues) => (event: React.ChangeEvent<HTMLInputElement>) =>
     onChange({
       ...values,
-      [key]: key === "country" ? event.target.value.toUpperCase() : event.target.value,
+      [key]: event.target.value,
     });
 
   return (
@@ -103,21 +102,6 @@ export function SearchForm({
             onChange={set("maxInstalls")}
             inputMode="text"
             placeholder="5000000"
-          />
-        </Field>
-
-        <Field
-          label="Play Store country"
-          error={errors.country}
-          hint="Two-letter code — ratings match this storefront"
-        >
-          <input
-            className={fieldClass}
-            value={values.country}
-            onChange={set("country")}
-            inputMode="text"
-            placeholder="BD"
-            maxLength={2}
           />
         </Field>
 

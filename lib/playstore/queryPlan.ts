@@ -1,6 +1,8 @@
 import { tokenizeKeyword } from "@/lib/filters/relevance";
 import { keywordVariants } from "@/lib/playstore/keywords";
-import type { PriceFilter, QueryKind, QueryPlanEntry } from "@/types/lead";
+import type { PlanQuery, PriceFilter, QueryKind, QueryPlanEntry } from "@/types/lead";
+
+export type { PlanQuery };
 
 /** Cap on the legacy single-locale plan helpers. */
 export const MAX_PLAN_SIZE = 48;
@@ -15,6 +17,15 @@ export const MAX_SUGGESTION_QUERIES = 400;
  */
 export const WAVE_QUERIES_PER_WAVE = 120;
 export const MAX_WAVES = 16;
+/**
+ * Cap on the append-only plan tail (AI related-keyword rounds + wave slices,
+ * in the order they were generated). The tail is the only part of the plan
+ * that grows after a session starts searching — everything before it is fixed
+ * while `planIndex > 0`, which is what keeps that index valid: growth at the
+ * end only ever extends the plan, never shifts already-searched entries.
+ * Sized for 16 waves × 120 + 5 keyword rounds × 100 phrases with headroom.
+ */
+export const MAX_EXTRA_TAIL = 3_000;
 
 const VARIANT_SUFFIXES = [
   "app",
@@ -195,11 +206,6 @@ export function dedupePlan(plan: QueryPlanEntry[], limit = MAX_PLAN_SIZE): Query
   return output;
 }
 
-export interface PlanQuery {
-  query: string;
-  kind: QueryKind;
-}
-
 /** Deterministic queries used when the suggest endpoint is unavailable. */
 function baseQuerySpecs(keyword: string): PlanQuery[] {
   const tokens = tokenizeKeyword(keyword);
@@ -254,22 +260,50 @@ export function keepsKeyword(keyword: string, suggestion: string): boolean {
 /**
  * Ordered query list: deterministic base queries first, then the locally
  * generated topic-consistent variants (every one embeds the full keyword),
- * then Play suggestions appended in discovery order, then the AI-generated
- * secondary phrases (same app category, no keyword-contains requirement —
- * they are a different way into the same neighbourhood), and finally (when
- * `wave > 0`) the deterministic long-tail wave batch. Appending is what makes
- * `planIndex` stable across resumes and across waves — earlier entries never
- * move, so wave K's queries are always the first K ×
- * {@link WAVE_QUERIES_PER_WAVE} candidates beyond the base plan.
+ * then the AI-generated secondary phrases of the first round, then Play
+ * suggestions appended in discovery order, and finally the session's append
+ * tail — AI related-keyword rounds and deterministic wave slices, in the order
+ * they were generated (see {@link MAX_EXTRA_TAIL}).
+ *
+ * Appending is what makes `planIndex` stable: entries before the tail never
+ * move, and the tail only grows at its end, so a cursor that has consumed N
+ * requests keeps pointing at the right query no matter how many rounds or
+ * waves arrive later.
  */
 export function buildPlanQueries(
   keyword: string,
   suggestions: string[] = [],
-  wave = 0,
   secondary: string[] = [],
+  extraTail: PlanQuery[] = [],
 ): PlanQuery[] {
+  const { out, seen } = buildHead(keyword, suggestions, secondary);
+
+  // The append-only tail: AI phrases and wave slices pushed chronologically.
+  // Deduped against everything earlier (and within the tail itself) but
+  // otherwise taken as-is — no keyword-contains filter, because a secondary
+  // phrase deliberately is a different way into the same neighbourhood.
+  for (const spec of extraTail) {
+    const key = spec.query.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ query: spec.query.trim(), kind: spec.kind });
+  }
+
+  return out;
+}
+
+/**
+ * Base + variants + round-one secondary + Play suggestions, with the dedupe
+ * set they were built against. Shared by {@link buildPlanQueries} and the
+ * legacy wave migration so both replay the exact historic order.
+ */
+function buildHead(
+  keyword: string,
+  suggestions: string[],
+  secondary: string[],
+): { out: PlanQuery[]; seen: Set<string> } {
   const base = baseQuerySpecs(keyword);
-  const out = [...base];
+  const out: PlanQuery[] = [...base];
   const seen = new Set(out.map((item) => item.query.toLowerCase()));
 
   for (const variant of keywordVariants(keyword)) {
@@ -304,21 +338,7 @@ export function buildPlanQueries(
     out.push({ query: suggestion.trim(), kind: "suggestion" });
   }
 
-  const targetWave = Math.min(wave, MAX_WAVES);
-  if (targetWave > 0) {
-    const limit = targetWave * WAVE_QUERIES_PER_WAVE;
-    let added = 0;
-    for (const spec of waveCandidates(keyword, suggestions)) {
-      if (added >= limit) break;
-      const key = spec.query.trim().toLowerCase();
-      if (key.length === 0 || seen.has(key)) continue;
-      seen.add(key);
-      out.push(spec);
-      added += 1;
-    }
-  }
-
-  return out;
+  return { out, seen };
 }
 
 /**
@@ -360,6 +380,75 @@ function waveCandidates(keyword: string, suggestions: string[]): PlanQuery[] {
     push(`"${label}"`, "suggestion");
   }
   return specs;
+}
+
+/**
+ * The full ordered wave-candidate list. Appendable to a session's plan tail
+ * in {@link WAVE_QUERIES_PER_WAVE}-sized slices; duplicates against earlier
+ * plan entries are dropped later by {@link buildPlanQueries}.
+ */
+export function waveCandidatesFor(keyword: string, suggestions: string[]): PlanQuery[] {
+  return waveCandidates(keyword, suggestions);
+}
+
+/**
+ * Fresh wave entries `[from, from + count)` of the same head-skipped kept
+ * scan the pre-tail waves used: walk the candidate pool in order, drop
+ * anything already in the plan head, count the survivors, keep the requested
+ * window. Counting kept entries (not raw pool positions) means every wave
+ * delivers `WAVE_QUERIES_PER_WAVE` genuinely new queries, and the window is
+ * a pure function of `from` — so a cursor only has to remember its wave
+ * number for the next slice to line up with the previous one.
+ *
+ * `secondary` is part of the head because round-one phrases sit in front of
+ * the waves in the plan; slicing against that same head keeps slices
+ * disjoint from the head and from each other, which is what lets
+ * {@link buildPlanQueries} append them without renumbering anything.
+ */
+export function waveTailSlice(
+  keyword: string,
+  suggestions: string[],
+  secondary: string[],
+  from: number,
+  count: number,
+): PlanQuery[] {
+  if (from < 0 || count <= 0) return [];
+  const { seen } = buildHead(keyword, suggestions, secondary);
+  const out: PlanQuery[] = [];
+  let kept = 0;
+  for (const spec of waveCandidates(keyword, suggestions)) {
+    const key = spec.query.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    if (kept >= from && kept < from + count) out.push(spec);
+    kept += 1;
+    if (kept >= from + count) break;
+  }
+  return out;
+}
+
+/**
+ * Reproduces the wave block older cursors carried inside their plans (waves
+ * used to be derived from `cursor.wave` on every rebuild instead of stored in
+ * the tail). It is the kept-scan window `[0, wave × WAVE_QUERIES_PER_WAVE)`,
+ * so replaying it yields byte-identical query order and a saved `planIndex`
+ * still points at the same request.
+ */
+export function legacyWaveTail(
+  keyword: string,
+  suggestions: string[],
+  secondary: string[],
+  wave: number,
+): PlanQuery[] {
+  const targetWave = Math.min(wave, MAX_WAVES);
+  if (targetWave <= 0) return [];
+  return waveTailSlice(
+    keyword,
+    suggestions,
+    secondary,
+    0,
+    targetWave * WAVE_QUERIES_PER_WAVE,
+  );
 }
 
 /** Total number of search requests the plan can issue. */

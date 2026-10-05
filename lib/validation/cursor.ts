@@ -1,15 +1,29 @@
+import { MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import {
   buildPlanQueries,
+  legacyWaveTail,
+  MAX_EXTRA_TAIL,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
   planSize,
   suggestPrefixes,
 } from "@/lib/playstore/queryPlan";
-import type { PendingVerify, SessionCursor, SimilarSeed } from "@/types/lead";
+import type { PendingVerify, PlanQuery, SessionCursor, SimilarSeed } from "@/types/lead";
 
 const PHASES = new Set(["suggest", "search", "expand", "enrich", "done"]);
+const QUERY_KINDS = new Set([
+  "primary",
+  "suggestion",
+  "variant",
+  "token",
+  "modifier",
+  "locale",
+  "price",
+]);
 
 const MAX_SUGGESTION_LENGTH = 80;
+/** Tail entries may combine a keyword with two modifiers — longer than a bare suggestion. */
+const MAX_TAIL_QUERY_LENGTH = 160;
 const MAX_SEEN = 40_000;
 const MAX_EMITTED = 1_000;
 const MAX_SIMILAR_QUEUE = 2_000;
@@ -190,10 +204,41 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
   if (!secondary) return null;
   const secondaryTried = input.secondaryTried === true;
 
-  const queries = buildPlanQueries(keyword, suggestions, wave, secondary);
+  // Generation rounds attempted so far. Optional so older cursors resume
+  // (they start counting from zero on the next plan-dry extension).
+  const secondaryRoundsRaw = input.secondaryRounds;
+  const secondaryRounds =
+    secondaryRoundsRaw === undefined || secondaryRoundsRaw === null
+      ? 0
+      : asIndex(secondaryRoundsRaw, MAX_SECONDARY_ROUNDS);
+  if (secondaryRounds === null) return null;
+
+  // Append-only plan tail (post-search AI rounds + wave slices). Older
+  // cursors stored waves only as a count and derived them at rebuild time —
+  // replay that derivation once so their plan (and planIndex) stays identical.
+  const extraTailRaw = input.extraTail;
+  let extraTail: PlanQuery[];
+  if (extraTailRaw === undefined || extraTailRaw === null) {
+    extraTail = legacyWaveTail(keyword, suggestions, secondary, wave);
+  } else {
+    if (!Array.isArray(extraTailRaw)) return null;
+    extraTail = [];
+    for (const item of extraTailRaw.slice(0, MAX_EXTRA_TAIL)) {
+      if (!isRecord(item)) return null;
+      if (typeof item.query !== "string") return null;
+      const query = item.query;
+      if (query.length === 0 || query.length > MAX_TAIL_QUERY_LENGTH) return null;
+      if (typeof item.kind !== "string" || !QUERY_KINDS.has(item.kind)) return null;
+      extraTail.push({ query, kind: item.kind as PlanQuery["kind"] });
+    }
+  }
+
+  const queries = buildPlanQueries(keyword, suggestions, secondary, extraTail);
   const total = planSize(queries);
 
   const suggestIndex = asIndex(input.suggestIndex, suggestPrefixes(keyword).length);
+  // Strict: the tail is capped at push time, so a saved planIndex past the
+  // rebuilt plan can only mean a tampered or corrupted cursor — restart it.
   const planIndex = asIndex(input.planIndex, total);
   if (suggestIndex === null || planIndex === null) return null;
 
@@ -227,6 +272,8 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     candidateQueue,
     secondary,
     secondaryTried,
+    extraTail,
+    secondaryRounds,
     counters,
   };
 }

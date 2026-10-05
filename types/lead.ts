@@ -70,6 +70,12 @@ export type QueryKind =
   | "locale"
   | "price";
 
+/** One entry of the resolved query list the plan walks (see queryPlan.ts). */
+export interface PlanQuery {
+  query: string;
+  kind: QueryKind;
+}
+
 export interface QueryPlanEntry {
   query: string;
   hl: string;
@@ -245,6 +251,19 @@ export interface SessionCursor {
   secondary: string[];
   /** Secondary-keyword generation was attempted already (success or failure). */
   secondaryTried: boolean;
+  /**
+   * Append-only plan tail: AI related-keyword rounds generated *after*
+   * searching began, plus deterministic wave slices, in generation order.
+   * Everything in here sits at the very end of the plan, so growing it never
+   * shifts entries `planIndex` already walked past (see {@link PlanQuery}).
+   */
+  extraTail: PlanQuery[];
+  /**
+   * How many AI keyword-generation rounds this session attempted (round one
+   * included). Bounded so an unproductive keyword cannot loop generation
+   * forever — after the cap the plan falls back to deterministic waves.
+   */
+  secondaryRounds: number;
   counters: SessionCounters;
 }
 

@@ -1,4 +1,5 @@
 import { cardCanStillQualify, detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
+import { MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import { MAX_DESCRIPTION_LENGTH } from "@/lib/parser/appEntries";
 import { roundRating } from "@/lib/parser/rating";
 import type {
@@ -25,10 +26,13 @@ import {
   buildPlanQueries,
   entryAt,
   keepsKeyword,
+  MAX_EXTRA_TAIL,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
   planSize,
   suggestPrefixes,
+  waveTailSlice,
+  WAVE_QUERIES_PER_WAVE,
 } from "./queryPlan";
 import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
@@ -137,6 +141,12 @@ const MAX_TRANSPORT_FAILURES = 8;
 const REQUEST_HEADROOM_MS = 1_500;
 /** A parallel batch needs more slack than a single request. */
 const BATCH_HEADROOM_MS = 5_000;
+/**
+ * An AI keyword round is one Groq call (10s timeout). We only start a round
+ * when a whole round still fits inside the step budget, so generation can
+ * never be the thing that blows past `maxDuration`.
+ */
+const ROUND_HEADROOM_MS = 15_000;
 /**
  * Detail pages and searches share every window: walking "similar apps"
  * measured ~6x the qualified leads per request of a fresh search (see
@@ -276,6 +286,8 @@ export function createInitialCursor(keyword: string): SessionCursor {
     candidateQueue: [],
     secondary: [],
     secondaryTried: false,
+    extraTail: [],
+    secondaryRounds: 0,
     counters: emptyCounters(),
   };
 }
@@ -288,6 +300,16 @@ export interface StepOptions {
   client?: PlayClient;
   /** Return true when the caller went away; the step then wraps up early. */
   aborted?: () => boolean;
+  /**
+   * Keyword-generation round supplier (Groq). When present, every time the
+   * plan runs dry with the target still open the step asks it for a fresh
+   * batch of related search phrases before falling back to the deterministic
+   * waves — the "generate a related keyword, search it, repeat" loop. The
+   * step filters the result against everything already in the plan and caps
+   * the attempt count itself; when absent (unit tests, no API key) the run
+   * goes straight to waves.
+   */
+  generateSecondary?: (keyword: string) => Promise<string[]>;
 }
 
 export interface StepResult {
@@ -353,9 +375,16 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let suggestFailed = false;
   let currentQuery: string | null = null;
 
-  // `let` because the search loop appends a new query wave when the plan runs
-  // out before the lead limit is reached (see below).
-  let queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave, cursor.secondary);
+  // `let` because the search loop extends the plan when it runs dry: first
+  // with AI keyword rounds (while the generator is available), then with
+  // deterministic wave slices — both append to the cursor's tail, never
+  // reordering what `planIndex` already walked past.
+  let queries = buildPlanQueries(
+    cursor.keyword,
+    suggestions,
+    cursor.secondary,
+    cursor.extraTail,
+  );
   let totalPlan = planSize(queries);
 
   const stats = () =>
@@ -1269,15 +1298,97 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       break;
     }
     if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex, filters.country) === null) {
-      // The plan ran out before the lead limit: keep generating. Each wave
-      // appends a fresh deterministic batch of long-tail queries (appended
-      // only, so `planIndex` stays valid). A wave that finds no new app means
-      // the reachable supply under these ceilings is genuinely exhausted —
-      // then (and only then) the search phase ends honestly.
+      // The plan ran out before the lead limit: keep generating. Two
+      // append-only extension paths, priority order — first the AI rounds
+      // ("generate a related keyword from the main keyword and search it,
+      // repeat"), then the deterministic long-tail waves. Both push onto
+      // `cursor.extraTail`, the plan's monotonic tail, so `planIndex` stays
+      // valid; a wave that finds no new app means the reachable supply under
+      // these ceilings is genuinely exhausted — then (and only then) the
+      // search phase ends honestly.
+      const generate = options.generateSecondary;
+      const wantsRound =
+        generate !== undefined && cursor.secondaryRounds < MAX_SECONDARY_ROUNDS;
+
+      // A round is one Groq call (10s). Only gate on it — appending a wave
+      // or advancing the phase is pure CPU and must keep working even when
+      // the step's budget is nearly spent, so a run with no generator (or
+      // with rounds spent) never turns a wave decision into a timeout.
+      if (wantsRound && !hasTimeForRequest(ROUND_HEADROOM_MS)) {
+        // Keep `phase = "search"`: the next step resumes this exact decision
+        // instead of advancing phases on a plan that was never extended.
+        return finish(
+          "budget-exhausted",
+          "Time budget reached for this step — resume to continue.",
+          true,
+        );
+      }
+
+      if (wantsRound && generate !== undefined) {
+        const round = cursor.secondaryRounds + 1;
+        emit({
+          type: "progress",
+          stats: stats(),
+          message: `Main keyword swept without hitting the target — generating related keywords (round ${round} of ${MAX_SECONDARY_ROUNDS})…`,
+        });
+        let fresh: string[] = [];
+        try {
+          fresh = await generate(cursor.keyword);
+        } catch {
+          fresh = [];
+        }
+        cursor.secondaryRounds = round;
+        const used = new Set(queries.map((item) => item.query.toLowerCase()));
+        const room = Math.max(0, MAX_EXTRA_TAIL - cursor.extraTail.length);
+        const added = fresh
+          .map((phrase) => phrase.trim())
+          .filter((phrase) => phrase.length >= 2 && !used.has(phrase.toLowerCase()))
+          .slice(0, room);
+        if (added.length > 0) {
+          for (const phrase of added) {
+            cursor.extraTail.push({ query: phrase, kind: "suggestion" });
+          }
+          queries = buildPlanQueries(
+            cursor.keyword,
+            suggestions,
+            cursor.secondary,
+            cursor.extraTail,
+          );
+          totalPlan = planSize(queries);
+          emit({
+            type: "progress",
+            stats: stats(),
+            message: `Queued ${added.length} related keywords (round ${round}) — searching and filtering them now…`,
+          });
+          continue;
+        }
+        emit({
+          type: "progress",
+          stats: stats(),
+          message: `Round ${round} produced no new keywords — continuing with the built-in query plan.`,
+        });
+      }
+
       if (cursor.wave < MAX_WAVES && cursor.counters.discovered > cursor.waveDiscovered) {
+        const slice = waveTailSlice(
+          cursor.keyword,
+          suggestions,
+          cursor.secondary,
+          cursor.wave * WAVE_QUERIES_PER_WAVE,
+          WAVE_QUERIES_PER_WAVE,
+        );
+        const room = Math.max(0, MAX_EXTRA_TAIL - cursor.extraTail.length);
+        if (slice.length > 0) {
+          cursor.extraTail.push(...slice.slice(0, room));
+        }
         cursor.wave += 1;
         cursor.waveDiscovered = cursor.counters.discovered;
-        queries = buildPlanQueries(cursor.keyword, suggestions, cursor.wave, cursor.secondary);
+        queries = buildPlanQueries(
+          cursor.keyword,
+          suggestions,
+          cursor.secondary,
+          cursor.extraTail,
+        );
         totalPlan = planSize(queries);
         emit({
           type: "progress",
@@ -1286,6 +1397,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         });
         continue;
       }
+
       cursor.phase = "expand";
       break;
     }

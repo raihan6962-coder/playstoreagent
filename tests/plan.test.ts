@@ -4,12 +4,14 @@ import {
   CORE_LOCALES,
   entryAt,
   keepsKeyword,
+  legacyWaveTail,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
   PLAN_LOCALES,
   planSize,
   storefrontsFor,
   suggestPrefixes,
+  waveTailSlice,
   WAVE_QUERIES_PER_WAVE,
 } from "@/lib/playstore/queryPlan";
 import { sanitizeCursor } from "@/lib/validation/cursor";
@@ -105,7 +107,7 @@ describe("storefront sweep plan", () => {
   it("appends AI secondary phrases after the primary plan, unfiltered and deduplicated", () => {
     const base = buildPlanQueries(KEYWORD);
     const secondary = ["expense manager", "CRYPTO WALLET APP", "  money tracker  ", "crypto wallet"];
-    const queries = buildPlanQueries(KEYWORD, [], 0, secondary);
+    const queries = buildPlanQueries(KEYWORD, [], secondary);
 
     // The whole primary plan keeps its exact positions.
     for (let index = 0; index < planSize(base); index += 1) {
@@ -143,16 +145,31 @@ describe("storefront sweep plan", () => {
       "hardware crypto wallet",
       "paper crypto wallet",
     ];
+    const slice1 = waveTailSlice(KEYWORD, suggestions, [], 0, WAVE_QUERIES_PER_WAVE);
+    const slice2 = waveTailSlice(
+      KEYWORD,
+      suggestions,
+      [],
+      WAVE_QUERIES_PER_WAVE,
+      WAVE_QUERIES_PER_WAVE,
+    );
     const wave0 = buildPlanQueries(KEYWORD, suggestions);
-    const wave1 = buildPlanQueries(KEYWORD, suggestions, 1);
-    const wave2 = buildPlanQueries(KEYWORD, suggestions, 2);
+    const wave1 = buildPlanQueries(KEYWORD, suggestions, [], slice1);
+    const wave2 = buildPlanQueries(KEYWORD, suggestions, [], [...slice1, ...slice2]);
 
+    expect(slice1).toHaveLength(WAVE_QUERIES_PER_WAVE);
     expect(wave1.length).toBe(wave0.length + WAVE_QUERIES_PER_WAVE);
     // Later waves keep growing while unique candidates last (the pool is
     // finite when there are no Play suggestions to draw from).
     expect(wave2.length).toBeGreaterThan(wave1.length);
     expect(wave1.slice(0, wave0.length)).toEqual(wave0);
     expect(wave2.slice(0, wave1.length)).toEqual(wave1);
+
+    // Slices are disjoint from each other: appending wave N+1 can never
+    // renumber what wave N already placed in the plan.
+    expect(slice2.some((item) => slice1.some((first) => first.query === item.query))).toBe(
+      false,
+    );
 
     // A planIndex minted in wave 0 must still resolve to the same storefront
     // request after later waves are appended — that is what keeps resumes safe.
@@ -164,10 +181,41 @@ describe("storefront sweep plan", () => {
   });
 
   it("stops growing waves at the wave cap", () => {
-    const capped = buildPlanQueries(KEYWORD, [], MAX_WAVES);
-    const beyond = buildPlanQueries(KEYWORD, [], MAX_WAVES + 5);
+    // The cap is enforced where the count still exists: cursors saved before
+    // tails (and their replayed migrations) clamp at MAX_WAVES.
+    const capped = buildPlanQueries(KEYWORD, [], [], legacyWaveTail(KEYWORD, [], [], MAX_WAVES));
+    const beyond = buildPlanQueries(
+      KEYWORD,
+      [],
+      [],
+      legacyWaveTail(KEYWORD, [], [], MAX_WAVES + 5),
+    );
     expect(beyond.length).toBe(capped.length);
     expect(beyond.length).toBeGreaterThan(buildPlanQueries(KEYWORD).length);
+  });
+
+  it("replays a legacy cursor's wave block with stable prefix and head disjointness", () => {
+    // A cursor saved by the old code carried `wave` only; migration has to
+    // rebuild a tail that (a) never overlaps the head it is appended to and
+    // (b) nests prefix-wise as the wave count grows — otherwise the cursor's
+    // saved planIndex would point at a different request on resume.
+    const suggestions = ["crypto wallet app", "old crypto wallet", "cold crypto wallet"];
+    const secondary = ["expense manager"];
+    const head = buildPlanQueries(KEYWORD, suggestions, secondary);
+    const headKeys = new Set(head.map((item) => item.query.toLowerCase()));
+
+    let previous: ReturnType<typeof legacyWaveTail> = [];
+    for (let wave = 1; wave <= 3; wave += 1) {
+      const tail = legacyWaveTail(KEYWORD, suggestions, secondary, wave);
+      expect(tail.length).toBeLessThanOrEqual(wave * WAVE_QUERIES_PER_WAVE);
+      expect(tail.some((item) => headKeys.has(item.query.toLowerCase()))).toBe(false);
+      expect(tail.slice(0, previous.length)).toEqual(previous);
+      previous = tail;
+
+      const plan = buildPlanQueries(KEYWORD, suggestions, secondary, tail);
+      expect(plan.slice(0, head.length)).toEqual(head);
+    }
+    expect(legacyWaveTail(KEYWORD, suggestions, secondary, 0)).toEqual([]);
   });
 });
 
@@ -240,19 +288,27 @@ describe("resume cursor", () => {
     const cursor = createInitialCursor(KEYWORD);
     const total = planSize(buildPlanQueries(KEYWORD, cursor.suggestions));
     expect(sanitizeCursor({ ...cursor, planIndex: total }, KEYWORD)).not.toBeNull();
+    // The tail is capped at push time, so an index past the rebuilt plan can
+    // only come from a corrupted cursor: restart rather than resume blind.
     expect(sanitizeCursor({ ...cursor, planIndex: total + 1 }, KEYWORD)).toBeNull();
     expect(sanitizeCursor({ ...cursor, planIndex: -1 }, KEYWORD)).toBeNull();
   });
 
-  it("rebuilds the plan for the cursor's wave and rejects impossible waves", () => {
+  it("replays a legacy cursor's waves into the tail and rejects impossible waves", () => {
     const cursor = createInitialCursor(KEYWORD);
     cursor.phase = "search";
     cursor.wave = 2;
-    cursor.planIndex = planSize(buildPlanQueries(KEYWORD, [], 2));
+    // Simulate a cursor minted by the old code: waves existed only as a
+    // count, so no tail was stored yet.
+    delete (cursor as unknown as Record<string, unknown>).extraTail;
+    cursor.planIndex = planSize(
+      buildPlanQueries(KEYWORD, [], [], legacyWaveTail(KEYWORD, [], [], 2)),
+    );
 
     const restored = sanitizeCursor(JSON.parse(JSON.stringify(cursor)), KEYWORD);
     expect(restored?.wave).toBe(2);
     expect(restored?.planIndex).toBe(cursor.planIndex);
+    expect(restored?.extraTail.length).toBeGreaterThan(0);
 
     expect(sanitizeCursor({ ...cursor, wave: MAX_WAVES + 1 }, KEYWORD)).toBeNull();
     expect(sanitizeCursor({ ...cursor, wave: -1 }, KEYWORD)).toBeNull();

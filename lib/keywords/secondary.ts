@@ -6,12 +6,19 @@
  * category neighbourhood, and the crawler runs the exact same scrape → filter
  * → verify flow over those phrases as well. One run therefore covers the main
  * keyword first and the AI-generated phrases afterwards, because
- * {@link buildPlanQueries} appends them after the primary queries.
+ * {@link buildPlanQueries} puts round one right after the primary block and
+ * later rounds in the append-only plan tail.
+ *
+ * Rounds keep firing while the plan is dry and the target is still open
+ * (see {@link MAX_SECONDARY_ROUNDS}) — search → collect → filter → generate
+ * → search again, until the target is hit or generation gives out.
  *
  * Every failure mode (no API key, timeout, non-2xx, unparseable body) returns
  * an empty list: a keyword-generation hiccup must never fail a run, the run
  * simply continues with the primary plan.
  */
+
+import type { SessionCursor } from "@/types/lead";
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODEL = "openai/gpt-oss-120b";
@@ -20,6 +27,14 @@ const MODEL = "openai/gpt-oss-120b";
 export const MAX_SECONDARY = 100;
 /** Per-phrase length cap (matches the suggestion length budget in cursor.ts). */
 export const MAX_SECONDARY_LENGTH = 80;
+/**
+ * Total keyword-generation rounds per run, round one included. The first
+ * round is primed before the first search; the crawler fires the remaining
+ * rounds whenever the plan runs dry and the lead target is still open — each
+ * attempt counts even when the model returns nothing, so a dead keyword
+ * degrades into the deterministic query waves instead of looping forever.
+ */
+export const MAX_SECONDARY_ROUNDS = 5;
 
 function promptFor(keyword: string): string {
   return [
@@ -99,4 +114,23 @@ export async function generateSecondaryKeywords(keyword: string): Promise<string
   } catch {
     return [];
   }
+}
+
+/**
+ * Round-one priming shared by every run entry point: ask Groq for the first
+ * batch of related phrases before any search starts, exactly once per
+ * session. Records the attempt on the cursor (`secondaryTried` +
+ * `secondaryRounds`) so a failed call is not retried at step start, and the
+ * crawler's later rounds pick up from there. Never rejects.
+ */
+export async function primeRoundOne(
+  cursor: SessionCursor,
+): Promise<{ attempted: boolean; generated: number }> {
+  if (cursor.secondary.length > 0 || cursor.secondaryTried) {
+    return { attempted: false, generated: 0 };
+  }
+  cursor.secondaryTried = true;
+  cursor.secondaryRounds = Math.max(cursor.secondaryRounds, 1);
+  cursor.secondary = await generateSecondaryKeywords(cursor.keyword);
+  return { attempted: true, generated: cursor.secondary.length };
 }

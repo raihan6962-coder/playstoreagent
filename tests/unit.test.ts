@@ -162,8 +162,8 @@ describe("sanitizeCursor", () => {
     const cursor = createInitialCursor("budget tracker");
     cursor.suggestions = ["budget tracker app"];
     cursor.secondary = ["expense manager", "money tracker", "bill splitter"];
-    const withSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, 0, cursor.secondary));
-    const withoutSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, 0));
+    const withSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions, cursor.secondary));
+    const withoutSecondary = planSize(buildPlanQueries(cursor.keyword, cursor.suggestions));
     cursor.planIndex = withoutSecondary + 1;
 
     expect(cursor.planIndex).toBeLessThanOrEqual(withSecondary);

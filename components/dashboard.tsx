@@ -93,6 +93,20 @@ export function Dashboard() {
   }, []);
 
   /**
+   * Precise task starts while any page is open: claim due tasks now and every
+   * 30s (the hourly cron is the headless backstop, ±59 min on Hobby). Errors
+   * are ignored — a 401/429 just means the next tick tries again.
+   */
+  useEffect(() => {
+    const kick = () => {
+      void fetch("/api/tasks/start-due", { method: "POST" }).catch(() => undefined);
+    };
+    kick();
+    const timer = window.setInterval(kick, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  /**
    * The polling loop — the only thing driving the dashboard now. Adaptive
    * cadence: 3s while the server reports progress, 15s when it is idle or
    * done. Log/leads ship only when their versions moved, so a quiet poll is

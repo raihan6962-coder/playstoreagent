@@ -105,6 +105,11 @@ function leadsPath(runId: string): string {
   return `runs/${runId}.leads.json`;
 }
 
+/** Storage path of a run's leads — shared with the task/email layer. */
+export function runLeadsPath(runId: string): string {
+  return leadsPath(runId);
+}
+
 function tokenMatches(expected: string, got: string): boolean {
   const a = Buffer.from(expected, "utf8");
   const b = Buffer.from(got, "utf8");
@@ -482,9 +487,11 @@ export async function executeTick(
     if (finished) {
       if (stopSeen) {
         await writeMetaStatus(runId, "stopped", null, "Stopped.");
+        await afterRunFinished(origin, runId, "stopped");
       } else {
         const message = lastDone.value?.message ?? result.message;
         await writeMetaStatus(runId, "done", result.reason, message);
+        await afterRunFinished(origin, runId, result.reason);
       }
       return;
     }
@@ -509,6 +516,25 @@ export async function executeTick(
       // unavailable/rate-limited: lease + updatedAt simply age out and the
       // run surfaces as `stalled`, resumable once the store recovers.
     }
+  }
+}
+
+/**
+ * Hand a finished run over to the task pipeline (lead run → emails). Loaded
+ * dynamically so the static module graph stays acyclic: tasks.ts imports this
+ * module for createRun/snapshotRun, so a static import back would loop.
+ * Manual dashboard runs simply find no task and return.
+ */
+async function afterRunFinished(
+  origin: string,
+  runId: string,
+  reason: DoneReason | "stopped",
+): Promise<void> {
+  try {
+    const { handleTaskRunFinished } = await import("@/lib/server/tasks");
+    await handleTaskRunFinished(origin, runId, reason);
+  } catch (error) {
+    console.error("task completion hook failed", error);
   }
 }
 

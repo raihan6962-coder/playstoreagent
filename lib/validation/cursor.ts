@@ -76,6 +76,8 @@ function parsePending(value: unknown, cap: number): PendingVerify[] | null {
     if (installs !== undefined && installs !== null && typeof installs !== "number") return null;
     const summary = item.s;
     if (summary !== undefined && summary !== null && typeof summary !== "string") return null;
+    const origin = item.o;
+    const reason = item.q;
     out.push({
       p: item.p,
       i: typeof installs === "number" ? installs : null,
@@ -86,6 +88,9 @@ function parsePending(value: unknown, cap: number): PendingVerify[] | null {
             : summary
           : null,
       ...(item.h === true ? { h: true } : {}),
+      ...(origin === "hr" || origin === "hu" || origin === "f" ? { o: origin } : {}),
+      ...(reason === "m" || reason === "n" || reason === "p" || reason === "r" ? { q: reason } : {}),
+      ...(item.v === true ? { v: true } : {}),
     });
   }
   return out;
@@ -127,6 +132,18 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {
     "verifyCeilingRating",
     "verifyCeilingInstalls",
     "verifyCeilingMissing",
+    "verifyFromPending",
+    "verifyFromCandidate",
+    "leadFromPending",
+    "leadFromCandidate",
+    "leadHomeUnrated",
+    "leadHomeOther",
+    "leadForeign",
+    "rejectHomeUnrated",
+    "rejectHomeOther",
+    "rejectForeign",
+    "rejectTextCardBad",
+    "rejectTextCardGood",
   ] as const;
   for (const key of optional) {
     const current = (value as Record<string, unknown>)[key];

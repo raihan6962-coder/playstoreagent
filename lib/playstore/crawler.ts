@@ -1,4 +1,5 @@
 import { cardCanStillQualify, detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
+import { MAX_DESCRIPTION_LENGTH } from "@/lib/parser/appEntries";
 import { roundRating } from "@/lib/parser/rating";
 import type {
   DoneReason,
@@ -106,6 +107,23 @@ const MAX_CANDIDATE_QUEUE = 2500;
 /** Detail fetches per step spent on undecided cards. */
 const MAX_CANDIDATE_PER_STEP = 1500;
 /**
+ * Home cards that print no rating share the per-step candidate budget at a
+ * hard cap instead of flooding it. Measured live at a 3.5 ceiling: 1360 of
+ * 1507 rejections in one step were unrated-home verifies, and a 42-card
+ * sample passed both ceilings on the detail page just once — while every one
+ * of those fetches displaced a search that produces the card-level matches
+ * from which all leads actually arrive (baseline step: 10 pending verifies →
+ * 2 leads, 1500 candidate verifies → 0).
+ */
+const MAX_UNRATED_VERIFY_PER_STEP = 250;
+/**
+ * A card summary shorter than this is treated as possibly incomplete (a stub
+ * or layout clip) rather than the listing's full text. Measured live: 169 of
+ * 170 BD search cards carried ≥300 chars — the description itself — so under
+ * 300 the detail page may still hold wording the card never showed.
+ */
+const CARD_TEXT_STUB_LENGTH = 300;
+/**
  * Package names kept for dedupe. Past this point repeats may be re-evaluated;
  * `emitted` still guarantees a lead is only counted once. The cap also keeps
  * the resume cursor small enough to round trip through the browser.
@@ -160,6 +178,18 @@ function emptyCounters(): SessionCounters {
     verifyCeilingInstalls: 0,
     verifyCeilingMissing: 0,
     lowestRatingSeen: null,
+    verifyFromPending: 0,
+    verifyFromCandidate: 0,
+    leadFromPending: 0,
+    leadFromCandidate: 0,
+    leadHomeUnrated: 0,
+    leadHomeOther: 0,
+    leadForeign: 0,
+    rejectHomeUnrated: 0,
+    rejectHomeOther: 0,
+    rejectForeign: 0,
+    rejectTextCardBad: 0,
+    rejectTextCardGood: 0,
   };
 }
 
@@ -315,6 +345,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let enrichRequests = 0;
   let pendingRequests = 0;
   let candidateRequests = 0;
+  let unratedRequests = 0;
   /** Verification packages that failed this step; retried on the next one instead. */
   const pendingRetried = new Set<string>();
   let parseFailures = 0;
@@ -409,6 +440,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
               i: lead.installs,
               s: clipSummary(lead.summary),
               ...(countryFinal ? { h: true } : {}),
+              o: countryFinal ? "hr" : "f",
+              q: "m",
+              v: true,
             });
             cursor.counters.candidates += 1;
             if (countryFinal) cursor.counters.homePending += 1;
@@ -419,7 +453,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         // inside one window). Show the card-verified lead instead of silently
         // discarding a candidate that already passed every card-side rule.
         if (stillQualifies) {
-          if (emitLead(lead)) return true;
+          if (
+            emitLead(lead, {
+              from: "card",
+              origin: countryFinal ? "homeOther" : "foreign",
+            })
+          )
+            return true;
           continue;
         }
         // Foreign card inside the drift dead band: the card already predicted
@@ -436,19 +476,22 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         pushSeed({ p: app.packageName, i: app.installs }, queuedSeeds);
       }
 
-      // The card could not settle the verdict on its own: either its text
-      // carries only part of the keyword (the listing's description may
-      // complete it), a decisive number is missing (the detail page reports
-      // it for this run's country), or the card's own text carries no keyword
-      // term at all while both printed numbers already pass (Play returned it
-      // for this query, so the full description may hold the terms the
-      // truncated card text lacks — the detail page is the first place that
-      // text can even be read). Cards the card already proves hopeless (rating
-      // over the ceiling on any storefront, install bucket over the cap) never
-      // queue: measured live, foreign cards printed above the ceiling passed
-      // 0 of 10 checks at home (research R6), so fetching them only burned the
-      // verify budget on rejections that were visible before the request went
-      // out.
+      // The card could not settle the verdict on its own: a partial keyword
+      // hit, a decisive number that is missing, or card text that carries no
+      // keyword term at all while the numbers pass.
+      //
+      // How much a detail fetch can still change depends on the text the card
+      // already showed. Measured live on the BD storefront, a search card
+      // carries the listing's own description (169 of 170 cards ≥300 chars)
+      // — the card text and the detail description are the same text, so a
+      // text verdict cannot change… unless the summary is missing, is a stub
+      // under one screen's worth (which may be a layout clip), or was clipped
+      // at MAX_DESCRIPTION_LENGTH, in each of which wording past what the
+      // card showed may still complete the keyword. A baseline step confirmed
+      // the cost of ignoring this: 255 of 260 text rejections were cards
+      // whose text had already failed at queue time. Cards the card already
+      // proves hopeless on the numbers (rating over the ceiling on any
+      // storefront, install bucket over the cap) never queue at all.
       const undecidedNumbers = evaluation.reasons.some(
         (reason) =>
           reason === "missing-rating" ||
@@ -456,11 +499,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           reason === "unparseable-installs",
       );
       // A partial hit is only worth a detail fetch when the missing term may
-      // still appear in the description the card could not show — i.e. the
-      // hit that *did* land came from the title or description. A hit found
-      // only in the developer or category can never complete that way (the
-      // verify re-reads title + description), so it falls through to the
-      // rescue below instead of burning a fetch on a predicted text reject.
+      // still appear past the card's clip — the hit that *did* land came from
+      // the title or description (developer/category-only hits can never
+      // complete that way either).
       const primaryPartial = evaluation.primaryTerms.length > 0;
       // A foreign card that prints no rating never earns a fetch: the BD
       // detail page answers "no rating" for these far more often than it
@@ -472,14 +513,25 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         app.rating !== null &&
         roundRating(app.rating) <= filters.maxRating &&
         (app.installs === null || app.installs <= filters.maxInstalls);
+      const textMayChange =
+        app.summary === null ||
+        app.summary.length < CARD_TEXT_STUB_LENGTH ||
+        app.summary.length >= MAX_DESCRIPTION_LENGTH;
+      const queueReason: "n" | "p" | "r" | null = undecidedNumbers
+        ? relevant || textMayChange
+          ? "n"
+          : null
+        : !relevant && primaryPartial && textMayChange
+          ? "p"
+          : descriptionRescue && textMayChange
+            ? "r"
+            : null;
       if (
         !foreignUnrated &&
-        ((!relevant && primaryPartial) ||
-          undecidedNumbers ||
-          descriptionRescue) &&
+        queueReason !== null &&
         cardCanStillQualify(app, filters, countryFinal)
       ) {
-        queueCandidate(app, countryFinal);
+        queueCandidate(app, countryFinal, queueReason, relevant);
       }
     }
     return false;
@@ -489,12 +541,27 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * Counts a verified lead, streams it to the client and returns true when
    * this lead reached the target. The only place a lead ever becomes visible.
    */
-  const emitLead = (lead: Lead): boolean => {
+  const emitLead = (
+    lead: Lead,
+    attribution?: {
+      from: "pending" | "candidate" | "card";
+      origin: "homeUnrated" | "homeOther" | "foreign";
+    },
+  ): boolean => {
     if (emitted.has(lead.packageName)) return cursor.counters.matched >= filters.limit;
     if (cursor.counters.matched >= filters.limit) return true;
 
     emitted.add(lead.packageName);
     cursor.counters.matched += 1;
+    if (attribution) {
+      // The card-verified overflow path produces what the pending queue would
+      // have held, so it counts as a pending lead without a fetch.
+      if (attribution.from !== "candidate") cursor.counters.leadFromPending += 1;
+      else cursor.counters.leadFromCandidate += 1;
+      if (attribution.origin === "homeUnrated") cursor.counters.leadHomeUnrated += 1;
+      else if (attribution.origin === "homeOther") cursor.counters.leadHomeOther += 1;
+      else cursor.counters.leadForeign += 1;
+    }
     if (
       lead.ratingsCount === null &&
       !queuedEnrich.has(lead.packageName) &&
@@ -527,7 +594,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * go to the back: unrated fetches measured 521 of 521 wasted verifies, and
    * foreign cards still carry cross-storefront drift to survive.
    */
-  function queueCandidate(app: StoreApp, homeFirst = false): void {
+  function queueCandidate(
+    app: StoreApp,
+    homeFirst = false,
+    reason: "n" | "p" | "r" = "n",
+    textValid = false,
+  ): void {
     const front = homeFirst && app.rating !== null;
     if (cursor.candidateQueue.length >= MAX_CANDIDATE_QUEUE) {
       // A full queue must never drop a card from the run's own storefront
@@ -543,7 +615,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     if (queuedPending.has(app.packageName)) return;
     if (emitted.has(app.packageName)) return;
     queuedCandidates.add(app.packageName);
-    const entry = { p: app.packageName, i: app.installs, s: clipSummary(app.summary) };
+    const entry: PendingVerify = {
+      p: app.packageName,
+      i: app.installs,
+      s: clipSummary(app.summary),
+      o: homeFirst ? (app.rating !== null ? "hr" : "hu") : "f",
+      q: reason,
+      ...(textValid ? { v: true as const } : {}),
+    };
     // Rated home cards jump the queue: their printed number is final and the
     // detail page answers the same storefront, so both ceilings and the text
     // are known-good (research R6b: home cards verify 100%). Home
@@ -827,8 +906,23 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     queue: "pending" | "candidate",
   ): Promise<TaskOutcome> {
     if (options.aborted?.()) return "ok";
-    if (queue === "pending") pendingRequests += 1;
-    else candidateRequests += 1;
+    if (queue === "pending") {
+      pendingRequests += 1;
+      cursor.counters.verifyFromPending += 1;
+    } else {
+      candidateRequests += 1;
+      cursor.counters.verifyFromCandidate += 1;
+    }
+    const origin: "homeUnrated" | "homeOther" | "foreign" =
+      queue === "pending"
+        ? entry.h === true
+          ? "homeOther"
+          : "foreign"
+        : entry.o === "hu"
+          ? "homeUnrated"
+          : entry.o === "hr"
+            ? "homeOther"
+            : "foreign";
     currentQuery = entry.p;
     emit({
       type: "progress",
@@ -876,7 +970,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           const evaluation = evaluateApp(app, filters, evalSeen);
           if (evaluation.status === "match" && evaluation.lead) {
             settled = true;
-            target = emitLead(evaluation.lead);
+            target = emitLead(evaluation.lead, { from: queue, origin });
           } else if (!evaluation.reasons.includes("not-relevant")) {
             // Kept the keyword but broke a ceiling: the closest misses make
             // the best expansion seeds (their neighborhood tends to match).
@@ -900,7 +994,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       }
       if (!settled) {
         cursor.counters.verifyRejected += 1;
-        if (textRejected) cursor.counters.verifyTextRejected += 1;
+        if (textRejected) {
+          cursor.counters.verifyTextRejected += 1;
+          if (entry.v === true) cursor.counters.rejectTextCardGood += 1;
+          else cursor.counters.rejectTextCardBad += 1;
+        }
+        if (origin === "homeUnrated") cursor.counters.rejectHomeUnrated += 1;
+        else if (origin === "homeOther") cursor.counters.rejectHomeOther += 1;
+        else cursor.counters.rejectForeign += 1;
       }
       if (target) return "target";
 
@@ -972,7 +1073,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     if (candidateRequests >= MAX_CANDIDATE_PER_STEP) return null;
     for (const entry of cursor.candidateQueue) {
       if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
+      // Unrated home cards get a capped slice of the step's budget: their
+      // measured conversion is a fraction of a percent while every fetch they
+      // take is a search that could produce the rated matches leads come
+      // from. Rated and foreign entries are unaffected — they pass the cap.
+      if (entry.o === "hu" && unratedRequests >= MAX_UNRATED_VERIFY_PER_STEP) continue;
       verifyFlight.add(entry.p);
+      if (entry.o === "hu") unratedRequests += 1;
       return runVerifyTask(entry, "candidate").then((outcome) => {
         verifyFlight.delete(entry.p);
         return outcome;

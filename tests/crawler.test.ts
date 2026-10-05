@@ -805,6 +805,88 @@ describe("runGenerationStep", () => {
     expect(result.reason).toBe("plan-exhausted");
   });
 
+  it("does not fetch a detail page when the card's full description already failed the keyword", async () => {
+    // Search cards carry the listing's description itself (measured live: 169
+    // of 170 BD cards ≥300 chars), so a text failure on such a card is final:
+    // the detail page repeats the same text. Only a stub or a clip leaves room
+    // for the wording to change.
+    const FULL_TEXT_FAILURE = {
+      packageName: "com.example.walletonly",
+      title: "Ledgerly Wallet",
+      rating: "2.9",
+      ratingValue: 2.9,
+      installs: "50,000+",
+      summary: "Keep your wallet safe and organized every day. ".repeat(8),
+    };
+    expect(FULL_TEXT_FAILURE.summary.length).toBeGreaterThanOrEqual(300);
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(FULL_TEXT_FAILURE)]),
+      detail: () =>
+        detailHtml({ ...FULL_TEXT_FAILURE, summary: "A crypto wallet for careful people" }),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.stats.candidates).toBe(0);
+    expect(result.stats.verifyFromCandidate).toBe(0);
+    expect(result.stats.verifyRejected).toBe(0);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("caps unrated home verifications at the per-step budget", async () => {
+    // Unrated cards queue for their one authoritative fetch — but past the
+    // per-step cap they wait for a later step instead of spending the whole
+    // window on the least likely verifies in the run.
+    const unrated = Array.from({ length: 260 }, (_, index) => ({
+      packageName: `com.example.crypto.wallet.dark${index}`,
+      title: `Crypto Wallet Dark ${index}`,
+      rating: null,
+      ratingValue: null,
+      installs: "10,000+",
+      summary: "Cold storage",
+    }));
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => searchHtml(unrated.map((entry) => makeAppEntry(entry))),
+      detail: (packageName) =>
+        detailHtml(
+          {
+            packageName,
+            title: "Crypto Wallet Dark",
+            rating: "4.9",
+            ratingValue: 4.9,
+            installs: "10,000+",
+            summary: "Cold storage",
+          },
+          [],
+          "10,000+",
+        ),
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor: createInitialCursor("crypto wallet"),
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(result.stats.candidates).toBe(260);
+    expect(result.stats.verifyFromCandidate).toBe(250);
+    expect(result.stats.rejectHomeUnrated).toBe(250);
+    expect(result.cursor?.candidateQueue).toHaveLength(10);
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.reason).toBe("budget-exhausted");
+  });
+
   it("never shows a partial match whose detail page still lacks the full keyword", async () => {
     const PARTIAL = {
       packageName: "com.example.cryptokeep",
@@ -865,6 +947,9 @@ describe("runGenerationStep", () => {
     expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget.dark"]);
     expect(result.stats.candidates).toBeGreaterThan(0);
     expect(result.stats.verifyRejected).toBe(0);
+    expect(result.stats.verifyFromCandidate).toBeGreaterThan(0);
+    expect(result.stats.leadFromCandidate).toBe(1);
+    expect(result.stats.leadHomeUnrated).toBe(1);
   });
 
   it("queues unrated home cards behind rated ones", async () => {

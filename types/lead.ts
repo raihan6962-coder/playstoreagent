@@ -123,6 +123,30 @@ export interface SessionCounters {
   /** Ceiling-bucket split: no readable rating (or unreadable page) from this country. */
   verifyCeilingMissing: number;
   lowestRatingSeen: number | null;
+  /** Verifications spent on the pending (card-level match) queue. */
+  verifyFromPending: number;
+  /** Verifications spent on the candidate (undecided card) queue. */
+  verifyFromCandidate: number;
+  /** Leads that arrived through the pending-queue verification. */
+  leadFromPending: number;
+  /** Leads that arrived through the candidate-queue verification (or card-verified overflow). */
+  leadFromCandidate: number;
+  /** Leads whose search card showed no rating yet the detail page confirmed one. */
+  leadHomeUnrated: number;
+  /** Leads from a rated card of the run's own storefront (pending match or rated candidate). */
+  leadHomeOther: number;
+  /** Leads from a foreign-storefront card. */
+  leadForeign: number;
+  /** Rejections by queue origin: home card without a printed rating. */
+  rejectHomeUnrated: number;
+  /** Rejections by queue origin: rated home card. */
+  rejectHomeOther: number;
+  /** Rejections by queue origin: foreign card. */
+  rejectForeign: number;
+  /** Text-bucket split: card text already failed when queued (doomed fetch — queueing should have been skipped). */
+  rejectTextCardBad: number;
+  /** Text-bucket split: card text passed at queue time but the detail page re-check failed (page variant / text drift). */
+  rejectTextCardGood: number;
 }
 
 export interface GenerationStats extends SessionCounters {
@@ -156,6 +180,12 @@ export interface PendingVerify {
    * are pulled ahead of foreign ones while both queues wait.
    */
   h?: boolean;
+  /** Queue origin for funnel attribution: home-rated / home-unrated / foreign card. */
+  o?: "hr" | "hu" | "f";
+  /** Why the entry was queued: match, numbers, partial text, description rescue. */
+  q?: "m" | "n" | "p" | "r";
+  /** Present when the card's own text already passed the keyword check at queue time. */
+  v?: true;
 }
 
 export interface SessionCursor {

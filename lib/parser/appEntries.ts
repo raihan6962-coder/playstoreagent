@@ -6,7 +6,8 @@ import type { StoreApp } from "@/types/lead";
 export const PLAY_BASE_URL = "https://play.google.com";
 
 const PACKAGE_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$/;
-const MAX_DESCRIPTION_LENGTH = 4_000;
+/** Length at which {@link readSummary} clips the card description. */
+export const MAX_DESCRIPTION_LENGTH = 4_000;
 
 export function looksLikePackageId(value: unknown): value is string {
   return typeof value === "string" && value.length <= 255 && PACKAGE_PATTERN.test(value);

@@ -33,7 +33,7 @@ import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
 /** Requests issued in parallel inside one batch (search, expand or enrich). */
-export const SEARCH_CONCURRENCY = 24;
+export const SEARCH_CONCURRENCY = 32;
 /**
  * Minimum spacing between request starts. Throughput is bounded by the gate
  * (1 / intervalMs) and by latency inside a window, so both ends move together:
@@ -43,11 +43,11 @@ export const SEARCH_CONCURRENCY = 24;
  * slots. Any Play pushback still goes through RateGate.penalize, which
  * doubles the spacing up to 4 s and creeps back after successful requests.
  */
-export const CLIENT_INTERVAL_MS = 80;
+export const CLIENT_INTERVAL_MS = 60;
 /** Suggest lookups issued in parallel inside one step. */
-export const SUGGEST_CONCURRENCY = 24;
+export const SUGGEST_CONCURRENCY = 32;
 /** Detail pages fetched per step to backfill lead metadata. */
-export const ENRICH_CONCURRENCY = 24;
+export const ENRICH_CONCURRENCY = 32;
 /** Suggest prefixes processed per step (the rest resume later). */
 const SUGGESTS_PER_PREFIX = 10;
 /**
@@ -79,7 +79,7 @@ function clipSummary(summary: string | null): string | null {
  */
 const MAX_ENRICH_QUEUE = 1_000;
 /** Enriched detail pages per step before the step reports back to the caller. */
-const MAX_ENRICH_PER_STEP = 200;
+const MAX_ENRICH_PER_STEP = 300;
 /**
  * Search-card matches waiting for their country's canonical detail page.
  * Verified candidates are streamed to the table only after that page confirms
@@ -90,7 +90,7 @@ const MAX_ENRICH_PER_STEP = 200;
  */
 const MAX_PENDING_QUEUE = 1_000;
 /** Detail verifications per step before the step reports back to the caller. */
-const MAX_PENDING_PER_STEP = 700;
+const MAX_PENDING_PER_STEP = 900;
 /**
  * Undecided cards waiting for their detail page: partial keyword hits (the
  * card's text proves some but not all significant terms) and cards missing
@@ -104,7 +104,7 @@ const MAX_PENDING_PER_STEP = 700;
  */
 const MAX_CANDIDATE_QUEUE = 2500;
 /** Detail fetches per step spent on undecided cards. */
-const MAX_CANDIDATE_PER_STEP = 1000;
+const MAX_CANDIDATE_PER_STEP = 1500;
 /**
  * Package names kept for dedupe. Past this point repeats may be re-evaluated;
  * `emitted` still guarantees a lead is only counted once. The cap also keeps

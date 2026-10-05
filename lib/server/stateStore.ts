@@ -1,22 +1,28 @@
 /**
- * Durable run storage backed by the contents/git-data API of a *private*
- * GitHub repository (PSA_STATE_REPO). There is no database in this project —
- * Gist needs a scope our token does not have, Vercel Blob's store-creation
- * API is inaccessible from this account, and the main repo is public — so a
- * private scratch repo gives us persistent, per-run JSON files that survive
- * serverless cold starts with no other infrastructure.
+ * Durable run storage. Two backends, picked by environment:
  *
- * The browser never talks to GitHub: every read/write goes through our own
- * route handlers, which hold the token server-side.
+ *  1. **Supabase Postgres** (primary) — when `SUPABASE_URL` +
+ *     `SUPABASE_SERVICE_ROLE_KEY` are set, every path is a row in the
+ *     `state_files` table (`path` PK, `value` jsonb, `updated_at`), accessed
+ *     through PostgREST with the service-role key (server-side only, RLS
+ *     on). `mutateJson` uses optimistic compare-and-swap on `updated_at`,
+ *     so read-modify-write cycles from different serverless instances
+ *     retry instead of losing each other's writes.
+ *
+ *  2. **GitHub contents API** (legacy fallback) — JSON files in a private
+ *     scratch repo (`PSA_STATE_REPO`), kept for tests and rollback.
+ *
+ * The browser never talks to either backend: every read/write goes through
+ * our own route handlers.
  *
  * Files per run:
  *   runs/{id}.state.json  cursor, stats, log, lease  (single writer: the tick)
  *   runs/{id}.meta.json   status, token              (any writer: stop/resume)
  *   runs/{id}.leads.json  the passing leads          (written by the tick)
  *
- * History grows one commit per write, so every {@link SQUASH_EVERY} writes the
- * branch is re-rooted to a single root commit (same tree, empty parents) —
- * the repo's history stays ~1 deep while contents keep updating normally.
+ * GitHub history grows one commit per write, so every {@link SQUASH_EVERY}
+ * writes the branch is re-rooted to a single root commit (same tree, empty
+ * parents) — that maintenance is unnecessary on Postgres.
  */
 
 export class StoreError extends Error {
@@ -36,7 +42,8 @@ const READ_CACHE_MS = 1_500;
 interface CacheEntry {
   at: number;
   raw: unknown;
-  sha: string;
+  /** GitHub blob sha (legacy backend only) — carried for conditional GETs. */
+  sha?: string;
   /** Weak/strong validator so unchanged reads can ride GitHub's free 304s. */
   etag?: string;
 }
@@ -57,6 +64,144 @@ function config(): { repo: string; token: string } {
     );
   }
   return { repo, token };
+}
+
+/* ── Supabase backend (primary) ─────────────────────────────────────────── */
+
+/** Supabase wins whenever both env vars are set; otherwise legacy GitHub. */
+function supabaseActive(): boolean {
+  return Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function supabaseRest(pathname: string, init?: RequestInit): Promise<Response> {
+  const url = process.env.SUPABASE_URL ?? "";
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+  if (!url || !key) {
+    throw new StoreError(
+      "State store is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).",
+      "config",
+    );
+  }
+  return fetch(`${url.replace(/\/+$/, "")}/rest/v1/state_files${pathname}`, {
+    ...init,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      ...init?.headers,
+    },
+    cache: "no-store",
+  });
+}
+
+function throwForSupabase(response: Response, context: string): never {
+  if (response.status === 429) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    throw new StoreError(
+      `Supabase rate limit while ${context}.`,
+      "rate-limit",
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? Date.now() + retryAfter * 1_000
+        : Date.now() + 60_000,
+    );
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new StoreError(`Supabase refused the service key while ${context}.`, "config");
+  }
+  if (response.status === 409) {
+    throw new StoreError(`Concurrent update while ${context}.`, "conflict");
+  }
+  if (response.status === 404) {
+    throw new StoreError(`Missing while ${context}: 404.`, "not-found");
+  }
+  throw new StoreError(`Supabase error while ${context}: ${response.status}.`, "server");
+}
+
+interface StateRow {
+  path?: string;
+  value: unknown;
+  updated_at: string;
+}
+
+function selectRow(path: string): string {
+  // PostgREST needs an explicit operator — a bare `path=a/b.json` is a parse error.
+  return `?path=eq.${encodeURIComponent(path)}&select=value,updated_at`;
+}
+
+async function readSupabase<T>(path: string, fresh: boolean): Promise<T | null> {
+  if (!fresh) {
+    const hit = readCache.get(path);
+    if (hit && Date.now() - hit.at < READ_CACHE_MS) return hit.raw as T;
+  }
+  const response = await supabaseRest(selectRow(path));
+  if (!response.ok) throwForSupabase(response, `reading ${path}`);
+  const rows = (await response.json()) as StateRow[];
+  if (rows.length === 0) {
+    readCache.delete(path);
+    return null;
+  }
+  readCache.set(path, { at: Date.now(), raw: rows[0].value });
+  return rows[0].value as T;
+}
+
+/** Full replace — upsert with merge-duplicates overwrites the value column. */
+async function writeSupabase(path: string, value: unknown): Promise<void> {
+  const response = await supabaseRest("", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ path, value, updated_at: new Date().toISOString() }),
+  });
+  if (!response.ok) throwForSupabase(response, `writing ${path}`);
+  readCache.set(path, { at: Date.now(), raw: value });
+}
+
+/** Bounded optimistic retries — a lost CAS re-reads and re-applies the mutate. */
+const MUTATE_ATTEMPTS = 5;
+
+async function mutateSupabase<T>(
+  path: string,
+  mutate: (current: T | null) => T | null | undefined,
+): Promise<void> {
+  for (let attempt = 0; attempt < MUTATE_ATTEMPTS; attempt += 1) {
+    const read = await supabaseRest(selectRow(path));
+    if (!read.ok) throwForSupabase(read, `reading ${path}`);
+    const rows = (await read.json()) as StateRow[];
+    const current = rows[0] ?? null;
+
+    const draft = current ? (structuredClone(current.value) as T) : null;
+    const updated = mutate(draft);
+    if (updated === undefined || updated === null) return;
+
+    const stamp = new Date().toISOString();
+    if (current) {
+      const patched = await supabaseRest(
+        `?path=eq.${encodeURIComponent(path)}&updated_at=eq.${encodeURIComponent(current.updated_at)}`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ value: updated, updated_at: stamp }),
+        },
+      );
+      if (!patched.ok) throwForSupabase(patched, `writing ${path}`);
+      const affected = (await patched.json()) as unknown[];
+      if (affected.length === 0) continue; // someone else won — re-read & retry
+      readCache.set(path, { at: Date.now(), raw: updated });
+      return;
+    }
+
+    const inserted = await supabaseRest("", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ path, value: updated, updated_at: stamp }),
+    });
+    if (inserted.ok) {
+      readCache.set(path, { at: Date.now(), raw: updated });
+      return;
+    }
+    if (inserted.status === 409) continue; // row appeared concurrently — retry against it
+    throwForSupabase(inserted, `writing ${path}`);
+  }
+  throw new StoreError(`Concurrent update while writing ${path}.`, "conflict");
 }
 
 function api(pathname: string): string {
@@ -116,7 +261,7 @@ async function fetchContent(path: string): Promise<{ sha: string; value: unknown
     // 304s against the rate limit — that is what keeps a 3s polling client
     // (two conditional reads per poll) inside the hourly budget.
     cached.at = Date.now();
-    return { sha: cached.sha, value: cached.raw };
+    return { sha: cached.sha ?? "", value: cached.raw };
   }
   if (response.status === 404) return null;
   if (!response.ok) throwFor(response, `reading ${path}`);
@@ -148,6 +293,7 @@ async function fetchContent(path: string): Promise<{ sha: string; value: unknown
  * double-run a step or delay a stop. Returns null for a missing file.
  */
 export async function readJson<T>(path: string, fresh = false): Promise<T | null> {
+  if (supabaseActive()) return readSupabase<T>(path, fresh);
   if (!fresh) {
     const hit = readCache.get(path);
     if (hit && Date.now() - hit.at < READ_CACHE_MS) return hit.raw as T;
@@ -223,6 +369,10 @@ export function mutateJson<T>(
   const next = previous
     .catch(() => undefined)
     .then(async () => {
+      if (supabaseActive()) {
+        await mutateSupabase<T>(path, mutate);
+        return;
+      }
       const current = await readJson<T>(path, true);
       const updated = mutate(current);
       if (updated === undefined || updated === null) return;
@@ -233,6 +383,10 @@ export function mutateJson<T>(
 }
 
 async function writeOne(path: string, value: unknown, message: string): Promise<void> {
+  if (supabaseActive()) {
+    await writeSupabase(path, value);
+    return;
+  }
   // A PUT must never run inside a squash window: the squash force-updates the
   // ref onto the pre-write tree, which would silently revert the PUT. Every
   // writer waits out the in-flight squash first (it runs at most every
@@ -261,6 +415,7 @@ async function writeOne(path: string, value: unknown, message: string): Promise<
  * Best-effort — the store keeps working if the squash itself fails.
  */
 export async function squashHistory(): Promise<void> {
+  if (supabaseActive()) return; // commits don't exist on Postgres
   try {
     const repo = config().repo;
     const ref = await gh(`/repos/${repo}/git/ref/heads/main`);

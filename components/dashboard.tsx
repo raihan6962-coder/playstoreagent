@@ -31,6 +31,8 @@ const POLL_IDLE_MS = 15_000;
 const LOG_CLIENT_MAX = 500;
 /** Throttle for the automatic Resume of a stalled run (browser open case). */
 const AUTO_RESUME_MS = 45_000;
+/** A capped run just needs a fresh tranche — retry promptly, but not every poll. */
+const QUERY_CAP_RESUME_MS = 30_000;
 /** Rate-limited runs retry much less often — the window only moves hourly. */
 const RATE_LIMITED_RESUME_MS = 10 * 60_000;
 
@@ -108,16 +110,18 @@ export function Dashboard() {
     let lastAutoResume = 0;
 
     /**
-     * "Keep going until the target" while the tab is open: a stalled chain
-     * or a run that ended on a rate limit resumes itself (throttled). The
-     * external sweep covers the tab-closed case; the Resume button stays as
-     * the manual fallback for both.
+     * "Keep going until the target" while the tab is open: a stalled chain,
+     * a run that ended on a rate limit, or one that hit the query safety cap
+     * resumes itself (throttled). The daily Vercel cron sweep covers the
+     * tab-closed case; the Resume button stays as the manual fallback for
+     * both.
      */
     const maybeAutoResume = (snapshot: Awaited<ReturnType<typeof fetchSnapshot>>): void => {
       const stalled = snapshot.status === "stalled";
       const rateLimited = snapshot.status === "done" && snapshot.reason === "rate-limited";
-      if (!stalled && !rateLimited) return;
-      const wait = stalled ? AUTO_RESUME_MS : RATE_LIMITED_RESUME_MS;
+      const queryCapped = snapshot.status === "done" && snapshot.reason === "query-cap";
+      if (!stalled && !rateLimited && !queryCapped) return;
+      const wait = stalled ? AUTO_RESUME_MS : queryCapped ? QUERY_CAP_RESUME_MS : RATE_LIMITED_RESUME_MS;
       const now = Date.now();
       if (now - lastAutoResume < wait) return;
       lastAutoResume = now;
@@ -128,11 +132,13 @@ export function Dashboard() {
           setMessage(
             stalled
               ? "The runner stalled — resuming it automatically…"
-              : "The rate limit cleared — resuming automatically…",
+              : queryCapped
+                ? "Safety cap reached — extending it automatically…"
+                : "The rate limit cleared — resuming automatically…",
           );
         })
         .catch(() => {
-          // Keep the notice up; the next poll (or the external sweep) retries.
+          // Keep the notice up; the next poll (or the daily sweep) retries.
         });
     };
 

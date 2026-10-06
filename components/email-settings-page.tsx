@@ -54,7 +54,7 @@ export function EmailSettingsPage() {
   const [dailyQuota, setDailyQuota] = useState("500");
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<{ text: string; warn: boolean } | null>(null);
   const [footer, setFooter] = useState<FooterSettings>({ enabled: true, note: "" });
   const [footerNote, setFooterNote] = useState("");
   const [savingFooter, setSavingFooter] = useState(false);
@@ -104,15 +104,39 @@ export function EmailSettingsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ label, webAppUrl, dailyQuota: Number(dailyQuota) }),
       });
-      const body = (await response.json()) as { error?: string; mailbox?: Mailbox };
+      const body = (await response.json()) as {
+        error?: string;
+        mailbox?: Mailbox;
+        script?: "current" | "outdated" | "unreachable";
+      };
       if (!response.ok) {
         setFormError(body.error ?? "Could not save the mailbox.");
         return;
       }
+      const connectedLabel = body.mailbox?.label ?? label;
       setLabel("");
       setWebAppUrl("");
-      setNotice(`Connected “${body.mailbox?.label ?? label}”.`);
-      setTimeout(() => setNotice(""), 4_000);
+      if (body.script === "outdated") {
+        setNotice({
+          text:
+            `Connected “${connectedLabel}” — but that deployment runs the older script, ` +
+            "so it can't send the Unsubscribe button or anti-spam headers. Copy the latest " +
+            "script (section 1), redeploy → New version, then add the URL again.",
+          warn: true,
+        });
+        setTimeout(() => setNotice(null), 12_000);
+      } else if (body.script === "unreachable") {
+        setNotice({
+          text:
+            `Connected “${connectedLabel}” — couldn't verify the deployment. ` +
+            "If sending fails later, redeploy it with access: Anyone.",
+          warn: true,
+        });
+        setTimeout(() => setNotice(null), 10_000);
+      } else {
+        setNotice({ text: `Connected “${connectedLabel}”.`, warn: false });
+        setTimeout(() => setNotice(null), 4_000);
+      }
       await refresh();
     } catch {
       setFormError("Connection failed — try again.");
@@ -247,7 +271,11 @@ export function EmailSettingsPage() {
             >
               {saving ? "Saving…" : "Add mailbox"}
             </button>
-            {notice && <span className="text-sm text-emerald-400">{notice}</span>}
+            {notice && (
+              <span className={`flex-1 text-sm ${notice.warn ? "text-amber-400" : "text-emerald-400"}`}>
+                {notice.text}
+              </span>
+            )}
           </div>
         </form>
       </section>

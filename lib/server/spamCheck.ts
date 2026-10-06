@@ -225,19 +225,22 @@ export async function sendDemo(input: SpamSendInput): Promise<SpamCheckRecord> {
   const marker = `PSAchk${randomBytes(8).toString("hex")}`;
   const lead = demoLead(input.to);
   const subject = renderTemplate(input.subject, lead, "demo");
-  const plainBody = `${renderTemplate(input.body, lead, "demo")}\n\n[ref ${marker}]`;
-  // The demo mirrors a real send: same footer, same HTML variant, so what
-  // the checker measures is what clients actually receive.
-  const footer = await getFooterSettings();
-  let bodyText = plainBody;
+  const rendered = renderTemplate(input.body, lead, "demo");
+  // The reference token rides the plain-text copy only: the checker finds it
+  // in the text part (with a subject fallback if a client drops it), while
+  // the HTML copy the reader actually sees stays clean.
+  let bodyText = `${rendered}\n\n[ref ${marker}]`;
   let html: string | undefined;
+  let unsub: string | undefined;
+  const footer = await getFooterSettings();
   if (footer.enabled) {
     const url = unsubscribeUrl(input.to);
-    bodyText = plainBody + buildPlainFooter(footer.note, url);
-    html = plainToHtml(plainBody) + buildFooterHtml(footer.note, url);
+    unsub = url;
+    bodyText += buildPlainFooter(footer.note, url);
+    html = plainToHtml(rendered) + buildFooterHtml(footer.note, url);
   }
 
-  const outcome = await deliver(mailbox.webAppUrl, input.to, subject, bodyText, html);
+  const outcome = await deliver(mailbox.webAppUrl, input.to, subject, bodyText, html, unsub);
   if (outcome.ok) await recordSend(mailbox.id);
 
   const record: SpamCheckRecord = {
@@ -326,7 +329,16 @@ export async function runCheck(id: string): Promise<SpamCheckRecord> {
     const response = await fetch(state.checkerWebAppUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "check", marker: record.marker, minutes }),
+      // subject/to/since let a current checker fall back to matching the
+      // demo by recipient + subject when the plain-text marker isn't indexed.
+      body: JSON.stringify({
+        action: "check",
+        marker: record.marker,
+        minutes,
+        subject: record.subject,
+        to: record.to,
+        since: record.at,
+      }),
       cache: "no-store",
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });

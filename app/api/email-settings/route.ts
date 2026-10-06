@@ -1,4 +1,5 @@
 import { addMailbox, listMailboxes, validateMailbox } from "@/lib/server/mailboxes";
+import { probeScriptVersion } from "@/lib/server/emailSender";
 import { getFooterSettings, saveFooterSettings, validateFooter } from "@/lib/server/emailFooter";
 import { storeErrorResponse } from "@/lib/server/runs";
 import { allowRequest, clientIp } from "@/lib/server/rateLimit";
@@ -44,7 +45,9 @@ export async function GET(): Promise<Response> {
   }
 }
 
-/** Connect a mailbox (Apps Script web-app URL + its daily send quota). */
+/** Connect a mailbox (Apps Script web-app URL + its daily send quota). The
+ * deployment is pinged with `action:"version"` so a stale paste (no
+ * unsubscribe headers, no HTML button) is flagged on the spot. */
 export async function POST(request: Request): Promise<Response> {
   if (!allowRequest(clientIp(request))) {
     return jsonError(429, "Too many requests. Please wait a moment and try again.");
@@ -64,7 +67,8 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const mailbox = await addMailbox(validated.value);
-    return Response.json({ ok: true, mailbox: publicMailbox(mailbox) }, { status: 201 });
+    const script = await probeScriptVersion(mailbox.webAppUrl);
+    return Response.json({ ok: true, mailbox: publicMailbox(mailbox), script }, { status: 201 });
   } catch (error) {
     return storeErrorResponse(error) ?? jsonError(500, "Could not save the mailbox.");
   }

@@ -66,12 +66,16 @@ export async function GET(request: Request): Promise<Response> {
   return htmlResponse(page("Unsubscribe", [], { token: encodeRecipient(email), email }));
 }
 
-/** POST — the user's actual click (form-encoded `to`, or JSON). */
+/** POST — the user's actual click (form-encoded `to`, or JSON). Mail
+ * providers' one-click unsubscribes POST `List-Unsubscribe=One-Click` with
+ * the token only in the query string (RFC 8058), so an empty body field
+ * falls back to the URL's `to`. */
 export async function POST(request: Request): Promise<Response> {
   if (!allowRequest(clientIp(request))) {
     return htmlResponse(page("Too many requests", ["Please wait a moment and try again."]), 429);
   }
   let token = "";
+  let oneClick = false;
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
@@ -84,6 +88,10 @@ export async function POST(request: Request): Promise<Response> {
     const form = new URLSearchParams(await request.text());
     token = form.get("to") ?? "";
   }
+  if (!token) {
+    token = new URL(request.url).searchParams.get("to") ?? "";
+    oneClick = token.length > 0;
+  }
   const email = decodeRecipient(token);
   if (!email) {
     return htmlResponse(
@@ -91,7 +99,7 @@ export async function POST(request: Request): Promise<Response> {
       400,
     );
   }
-  await addUnsubscribe(email, "footer-link");
+  await addUnsubscribe(email, oneClick ? "one-click" : "footer-link");
   return htmlResponse(
     page(
       "You're unsubscribed",

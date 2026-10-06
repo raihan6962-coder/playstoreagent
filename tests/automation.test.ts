@@ -17,6 +17,7 @@ import {
   beginEmailTick,
   deliver,
   executeEmailTick,
+  probeScriptVersion,
   renderTemplate,
   sweepEmailChains,
 } from "@/lib/server/emailSender";
@@ -41,7 +42,7 @@ const APPS_URL = "https://script.google.com/macros/s/test/exec";
 
 let appsResponse: () => Response = () => Response.json({ ok: true });
 /** Bodies POSTed to the Apps Script mailer (deliveries only — actions excluded). */
-let scriptPosts: { to: string; subject: string; body: string; html?: string }[] = [];
+let scriptPosts: { to: string; subject: string; body: string; html?: string; unsub?: string }[] = [];
 
 function lead(email: string | null, pkg: string): Lead {
   return {
@@ -555,6 +556,36 @@ describe("automation: email sender", () => {
     expect(result).toEqual({ ok: false, error: "quota exhausted" });
   });
 
+  it("forwards html and the one-click unsubscribe URL to the script", async () => {
+    const result = await deliver(
+      APPS_URL,
+      "to@example.com",
+      "Hi",
+      "Body plain",
+      "<p>Body</p>",
+      "https://site.test/api/unsubscribe?to=TOK",
+    );
+    expect(result).toEqual({ ok: true });
+    expect(scriptPosts).toHaveLength(1);
+    expect(scriptPosts[0].html).toBe("<p>Body</p>");
+    expect(scriptPosts[0].unsub).toBe("https://site.test/api/unsubscribe?to=TOK");
+  });
+
+  it("probes the deployed script's version", async () => {
+    appsResponse = () => Response.json({ ok: true, v: 2, mode: "raw" });
+    expect(await probeScriptVersion(APPS_URL)).toBe("current");
+    // Pre-upgrade deployments fall through to their `missing to` error.
+    appsResponse = () => Response.json({ ok: false, error: "missing to" });
+    expect(await probeScriptVersion(APPS_URL)).toBe("outdated");
+    appsResponse = () => Response.json({ ok: true }); // no version field
+    expect(await probeScriptVersion(APPS_URL)).toBe("outdated");
+    // A sign-in page means the deployment isn't shared as Anyone.
+    appsResponse = () => new Response("<!DOCTYPE html><html>sign in</html>", { status: 200 });
+    expect(await probeScriptVersion(APPS_URL)).toBe("unreachable");
+    appsResponse = () => new Response("nope", { status: 500 });
+    expect(await probeScriptVersion(APPS_URL)).toBe("unreachable");
+  });
+
   it("guards the email tick lease (token, status, concurrency)", async () => {
     const mailboxId = (await addMailbox({ label: "box", webAppUrl: APPS_URL, dailyQuota: 10 })).id;
     const task = seedTask({ mailboxIds: [mailboxId] });
@@ -645,6 +676,7 @@ describe("automation: email sender", () => {
     expect(scriptPosts[0].body).toContain("No longer interested? Unsubscribe:");
     expect(scriptPosts[0].body).toContain("/api/unsubscribe?to=");
     expect(scriptPosts[0].html).toContain("Unsubscribe</a>");
+    expect(scriptPosts[0].unsub).toContain("/api/unsubscribe?to=");
 
     const log = storedJson(mock.files, taskEmailLogPath(task.id)) as EmailLog;
     expect(log.entries).toHaveLength(2);

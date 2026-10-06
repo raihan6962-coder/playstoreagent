@@ -6,8 +6,8 @@
  * delivery so a crash can never double-mail a lead.
  *
  * Delivery target: the user's own Gmail via a Google Apps Script web app
- * (POSTed JSON {to, subject, body}). Nothing here stores Gmail credentials —
- * the Apps Script deployment is the mailer.
+ * (POSTed JSON {to, subject, body, html?, unsub?}). Nothing here stores
+ * Gmail credentials — the Apps Script deployment is the mailer.
  */
 
 import { timingSafeEqual } from "node:crypto";
@@ -140,7 +140,9 @@ export interface DeliverResult {
  * 2xx *and* a JSON body — a 200 that is actually Google's sign-in page
  * (web app not shared as "Anyone") counts as a failure with a hint, never as
  * a sent mail. `html` is optional: deployments that predate it simply send
- * the plain body (which already carries the text footer).
+ * the plain body (which already carries the text footer). `unsub` is the
+ * one-click unsubscribe URL — current scripts attach it as List-Unsubscribe
+ * headers, older ones ignore it.
  */
 export async function deliver(
   webAppUrl: string,
@@ -148,12 +150,16 @@ export async function deliver(
   subject: string,
   body: string,
   html?: string,
+  unsub?: string,
 ): Promise<DeliverResult> {
   try {
+    const payload: Record<string, string> = { to, subject, body };
+    if (html) payload.html = html;
+    if (unsub) payload.unsub = unsub;
     const response = await fetch(webAppUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(html ? { to, subject, body, html } : { to, subject, body }),
+      body: JSON.stringify(payload),
       cache: "no-store",
       signal: AbortSignal.timeout(20_000),
     });
@@ -182,6 +188,40 @@ export async function deliver(
     };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message.slice(0, 160) : "Delivery failed." };
+  }
+}
+
+/** How a deployed Apps Script answers `action:"version"`. */
+export type ScriptVersionStatus = "current" | "outdated" | "unreachable";
+
+/**
+ * One `action:"version"` ping at a mailbox's web app. Scripts from before
+ * the raw-send upgrade fall through to their `missing to` error (or answer
+ * Google's sign-in page), so anything that doesn't report v ≥ 2 is either
+ * stale or not reachable as a web app — both worth telling the user about
+ * right when they paste the URL.
+ */
+export async function probeScriptVersion(webAppUrl: string): Promise<ScriptVersionStatus> {
+  try {
+    const response = await fetch(webAppUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "version" }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(8_000),
+    });
+    const text = await response.text();
+    if (!response.ok || /<!doctype html|<html/i.test(text)) return "unreachable";
+    let data: { ok?: unknown; v?: unknown } | null = null;
+    try {
+      data = JSON.parse(text) as { ok?: unknown; v?: unknown };
+    } catch {
+      data = null;
+    }
+    if (data && data.ok !== false && typeof data.v === "number" && data.v >= 2) return "current";
+    return "outdated";
+  } catch {
+    return "unreachable";
   }
 }
 
@@ -312,12 +352,14 @@ export async function executeEmailTick(
         const plainBody = renderTemplate(task.templateBody, lead, task.keyword);
         let bodyText = plainBody;
         let html: string | undefined;
+        let unsub: string | undefined;
         if (footer.enabled) {
           const url = unsubscribeUrl(lead.email!);
+          unsub = url;
           bodyText = plainBody + buildPlainFooter(footer.note, url);
           html = plainToHtml(plainBody) + buildFooterHtml(footer.note, url);
         }
-        outcome = await deliver(picked.mailbox.webAppUrl, lead.email!, renderedSubject, bodyText, html);
+        outcome = await deliver(picked.mailbox.webAppUrl, lead.email!, renderedSubject, bodyText, html, unsub);
       }
       if (!outcome.skipped) consecutive = outcome.ok ? 0 : consecutive + 1;
 

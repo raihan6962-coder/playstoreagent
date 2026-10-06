@@ -13,6 +13,7 @@ import {
   validateSpamSend,
 } from "@/lib/server/spamCheck";
 import { installGitHubMock, storedJson, type GitHubMock } from "./helpers/githubMock";
+import type { SpamCheckRecord } from "@/types/spam-check";
 
 /** Sender mailbox's Apps Script — where demo sends go. */
 const SENDER_URL = "https://script.google.com/macros/s/sender/exec";
@@ -24,7 +25,7 @@ const SPAM_CHECK_PATH = "config/spam-check.json";
 let appsResponse: () => Response = () => Response.json({ ok: true });
 let checkerResponse: () => Response = () => Response.json({ ok: true, matches: [] });
 /** Bodies actually POSTed to the sender mailbox's Apps Script. */
-let senderPosts: { to: string; subject: string; body: string }[] = [];
+let senderPosts: { to: string; subject: string; body: string; html?: string; unsub?: string }[] = [];
 
 /**
  * Route fetch: the checker URL is checked first (it is also a
@@ -175,6 +176,14 @@ describe("spam check: demo sends", () => {
     expect(senderPosts[0].body).toContain("Hi Sample Studio, reach lead@example.com for demo.");
     expect(senderPosts[0].body).toContain(`[ref ${record.marker}]`);
 
+    // The HTML copy the reader sees stays clean — no reference token — but
+    // keeps the footer button and feeds the one-click unsubscribe URL.
+    expect(senderPosts[0].html).toBeDefined();
+    expect(senderPosts[0].html).toContain("Hi Sample Studio, reach lead@example.com for demo.");
+    expect(senderPosts[0].html).not.toContain(`[ref ${record.marker}]`);
+    expect(senderPosts[0].html).toContain("Unsubscribe</a>");
+    expect(senderPosts[0].unsub).toContain("/api/unsubscribe?to=");
+
     const state = storedJson(mock.files, SPAM_CHECK_PATH) as {
       history: typeof record[];
       subject: string;
@@ -243,7 +252,7 @@ describe("spam check: placement queries", () => {
     vi.unstubAllGlobals();
   });
 
-  async function sentDemo(): Promise<{ id: string; marker: string }> {
+  async function sentDemo(): Promise<SpamCheckRecord> {
     const mailboxId = await connectedMailbox();
     return sendDemo({ mailboxId, to: "lead@example.com", subject: "Hello", body: "World" });
   }
@@ -265,7 +274,8 @@ describe("spam check: placement queries", () => {
     const [stored] = await getSpamHistory();
     expect(stored.result).toBe("inbox");
 
-    // The query went to the checker with the demo's marker.
+    // The query went to the checker with the demo's marker plus the
+    // recipient/subject fallback fields a current script uses.
     const router = vi.mocked(globalThis.fetch as unknown as ReturnType<typeof vi.fn>);
     const call = router.mock.calls.find((entry) => String(entry[0]) === CHECKER_URL);
     expect(call).toBeDefined();
@@ -273,10 +283,16 @@ describe("spam check: placement queries", () => {
       action: string;
       marker: string;
       minutes: number;
+      subject?: string;
+      to?: string;
+      since?: number;
     };
     expect(sent.action).toBe("check");
     expect(sent.marker).toBe(demo.marker);
     expect(sent.minutes).toBeGreaterThanOrEqual(15);
+    expect(sent.subject).toBe("Hello");
+    expect(sent.to).toBe("lead@example.com");
+    expect(sent.since).toBe(demo.at);
   });
 
   it("reports Spam when the checker only finds it in SPAM", async () => {

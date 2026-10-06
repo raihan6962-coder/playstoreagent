@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { lintTemplate } from "@/lib/templateLint";
 import type { AutomationTask, Mailbox, TaskStatus } from "@/types/automation";
 
 const fieldClass =
@@ -251,6 +252,15 @@ export function AutomationSettingsPage() {
       .filter((task) => task.status !== "scheduled")
       .sort((a, b) => b.updatedAt - a.updatedAt),
   ];
+  // Live deliverability hints for whatever is being composed — advisory,
+  // never blocking (mirrors lib/templateLint.ts on the server side).
+  const lintIssues = formOpen
+    ? lintTemplate({
+        subject: values.templateSubject,
+        body: values.templateBody,
+        intervalSeconds: Number(values.intervalSeconds),
+      })
+    : [];
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-8 sm:px-6 lg:py-12">
@@ -411,6 +421,19 @@ export function AutomationSettingsPage() {
               />
             </Field>
           </div>
+
+          {lintIssues.length > 0 && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-amber-400">
+                Deliverability hints
+              </p>
+              <ul className="mt-1.5 flex flex-col gap-1 text-xs leading-relaxed text-amber-300/90">
+                {lintIssues.map((issue) => (
+                  <li key={issue}>• {issue}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center gap-3">
             <button

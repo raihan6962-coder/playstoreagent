@@ -6,9 +6,15 @@ import type { Mailbox } from "@/types/automation";
 
 /** Mirror of the server's cap (kept literal so no server code bundles here). */
 const MAX_DAILY_QUOTA = 2_000;
+const MAX_FOOTER_NOTE = 400;
 
 const fieldClass =
   "w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-500 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20";
+
+interface FooterSettings {
+  enabled: boolean;
+  note: string;
+}
 
 function Field({
   label,
@@ -49,12 +55,21 @@ export function EmailSettingsPage() {
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
+  const [footer, setFooter] = useState<FooterSettings>({ enabled: true, note: "" });
+  const [footerNote, setFooterNote] = useState("");
+  const [savingFooter, setSavingFooter] = useState(false);
+  const [footerError, setFooterError] = useState("");
+  const [footerNotice, setFooterNotice] = useState("");
 
   const refresh = useCallback(async () => {
     try {
       const response = await fetch("/api/email-settings", { cache: "no-store" });
-      const body = (await response.json()) as { mailboxes?: Mailbox[] };
+      const body = (await response.json()) as { mailboxes?: Mailbox[]; footer?: FooterSettings };
       if (response.ok) setMailboxes(body.mailboxes ?? []);
+      if (body.footer) {
+        setFooter(body.footer);
+        setFooterNote((current) => current || body.footer!.note);
+      }
     } catch {
       // Keep the last list; the next refresh retries.
     } finally {
@@ -118,6 +133,35 @@ export function EmailSettingsPage() {
       await refresh();
     } catch {
       setFormError("Connection failed — try again.");
+    }
+  }
+
+  async function saveFooter(event: React.FormEvent): Promise<void> {
+    event.preventDefault();
+    if (savingFooter) return;
+    setFooterError("");
+    setSavingFooter(true);
+    try {
+      const response = await fetch("/api/email-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ footer: { enabled: footer.enabled, note: footerNote } }),
+      });
+      const body = (await response.json()) as { error?: string; footer?: FooterSettings };
+      if (!response.ok) {
+        setFooterError(body.error ?? "Could not save the footer.");
+        return;
+      }
+      if (body.footer) {
+        setFooter(body.footer);
+        setFooterNote(body.footer.note);
+      }
+      setFooterNotice("Footer saved.");
+      setTimeout(() => setFooterNotice(""), 4_000);
+    } catch {
+      setFooterError("Connection failed — try again.");
+    } finally {
+      setSavingFooter(false);
     }
   }
 
@@ -204,6 +248,58 @@ export function EmailSettingsPage() {
               {saving ? "Saving…" : "Add mailbox"}
             </button>
             {notice && <span className="text-sm text-emerald-400">{notice}</span>}
+          </div>
+        </form>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-5 sm:p-6">
+        <h2 className="text-sm font-semibold text-zinc-100">3. Footer &amp; unsubscribe</h2>
+        <p className="text-xs text-zinc-500">
+          Every outreach email ends with your note and a working Unsubscribe button — the single
+          biggest inbox-trust and spam-compliance win. Opted-out addresses are skipped automatically
+          for the rest of time.
+        </p>
+        <form className="mt-4 flex flex-col gap-4" onSubmit={(event) => void saveFooter(event)}>
+          <label className="flex items-center gap-2.5 text-sm text-zinc-300">
+            <input
+              type="checkbox"
+              checked={footer.enabled}
+              onChange={(event) => setFooter({ ...footer, enabled: event.target.checked })}
+              className="h-4 w-4 accent-emerald-500"
+            />
+            Attach the footer to outgoing emails
+          </label>
+          <Field label="Footer note" hint={`${footerNote.length}/${MAX_FOOTER_NOTE} — shown right above the Unsubscribe button`}>
+            <textarea
+              className={`${fieldClass} min-h-20`}
+              value={footerNote}
+              onChange={(event) => setFooterNote(event.target.value)}
+              maxLength={MAX_FOOTER_NOTE}
+              placeholder="You received this email because your app's contact address is listed publicly on Google Play."
+            />
+          </Field>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+            <p className="text-[11px] uppercase tracking-wide text-zinc-500">Preview</p>
+            <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-zinc-400">
+              {"————————————\n"}
+              {footerNote || "Your note here."}
+              {"\nNo longer interested? Unsubscribe: https://…/api/unsubscribe?to=…"}
+            </p>
+            <p className="mt-3 text-[11px] text-zinc-600">
+              Plain text link works immediately; the styled green button appears after you redeploy
+              the updated script (section 1).
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="submit"
+              disabled={savingFooter}
+              className="rounded-lg bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {savingFooter ? "Saving…" : "Save footer"}
+            </button>
+            {footerNotice && <span className="text-sm text-emerald-400">{footerNotice}</span>}
+            {footerError && <span className="text-sm text-rose-400">{footerError}</span>}
           </div>
         </form>
       </section>

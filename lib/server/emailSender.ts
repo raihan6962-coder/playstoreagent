@@ -17,6 +17,14 @@ import {
   recordSend,
   utcDate,
 } from "@/lib/server/mailboxes";
+import {
+  buildFooterHtml,
+  buildPlainFooter,
+  getFooterSettings,
+  plainToHtml,
+  unsubscribeUrl,
+} from "@/lib/server/emailFooter";
+import { listUnsubscribes } from "@/lib/server/unsubscribes";
 import { TASKS_PATH, taskEmailLogPath } from "@/lib/server/paths";
 import { mutateJson, readJson, writeJson } from "@/lib/server/stateStore";
 import { notifyTelegram } from "@/lib/server/telegram";
@@ -123,20 +131,29 @@ export function renderTemplate(template: string, lead: Lead, keyword: string): s
 export interface DeliverResult {
   ok: boolean;
   error?: string;
+  /** Recipient opted out — nothing was sent (neither ok-count nor failure). */
+  skipped?: boolean;
 }
 
 /**
  * One delivery through the user's Apps Script web app. Success requires a
  * 2xx *and* a JSON body — a 200 that is actually Google's sign-in page
  * (web app not shared as "Anyone") counts as a failure with a hint, never as
- * a sent mail.
+ * a sent mail. `html` is optional: deployments that predate it simply send
+ * the plain body (which already carries the text footer).
  */
-export async function deliver(webAppUrl: string, to: string, subject: string, body: string): Promise<DeliverResult> {
+export async function deliver(
+  webAppUrl: string,
+  to: string,
+  subject: string,
+  body: string,
+  html?: string,
+): Promise<DeliverResult> {
   try {
     const response = await fetch(webAppUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to, subject, body }),
+      body: JSON.stringify(html ? { to, subject, body, html } : { to, subject, body }),
       cache: "no-store",
       signal: AbortSignal.timeout(20_000),
     });
@@ -175,7 +192,9 @@ async function appendEmailLog(taskId: string, entry: EmailLogEntry): Promise<voi
     ({ taskId, entries: [], days: {}, updatedAt: 0 } as EmailLog);
   const date = utcDate(entry.t);
   const day = log.days[date] ?? { sent: 0, failed: 0, byMailbox: {} };
-  if (entry.ok) {
+  if (entry.skipped) {
+    day.skipped = (day.skipped ?? 0) + 1;
+  } else if (entry.ok) {
     day.sent += 1;
     day.byMailbox[entry.mailboxId] = (day.byMailbox[entry.mailboxId] ?? 0) + 1;
   } else {
@@ -253,6 +272,10 @@ export async function executeEmailTick(
       : [];
     const mailable = leads.filter((lead) => typeof lead.email === "string" && lead.email.includes("@"));
     let consecutive = leasedTask.email.consecutiveFailures;
+    // Read once per slice — the footer and the opt-out list only change
+    // between ticks, and this saves two store reads per individual send.
+    const footer = await getFooterSettings();
+    const optedOut = new Set((await listUnsubscribes()).map((entry) => entry.email));
 
     while (Date.now() < deadline) {
       const task = await readTask(taskId);
@@ -279,13 +302,24 @@ export async function executeEmailTick(
       }
 
       const lead = mailable[task.email.nextIndex];
-      const outcome = await deliver(
-        picked.mailbox.webAppUrl,
-        lead.email!,
-        renderTemplate(task.templateSubject, lead, task.keyword),
-        renderTemplate(task.templateBody, lead, task.keyword),
-      );
-      consecutive = outcome.ok ? 0 : consecutive + 1;
+      let outcome: DeliverResult;
+      if (optedOut.has(lead.email!.toLowerCase())) {
+        // Suppressed by the unsubscribe list: advance the index without
+        // touching Gmail, quota or the send interval.
+        outcome = { ok: true, skipped: true };
+      } else {
+        const renderedSubject = renderTemplate(task.templateSubject, lead, task.keyword);
+        const plainBody = renderTemplate(task.templateBody, lead, task.keyword);
+        let bodyText = plainBody;
+        let html: string | undefined;
+        if (footer.enabled) {
+          const url = unsubscribeUrl(lead.email!);
+          bodyText = plainBody + buildPlainFooter(footer.note, url);
+          html = plainToHtml(plainBody) + buildFooterHtml(footer.note, url);
+        }
+        outcome = await deliver(picked.mailbox.webAppUrl, lead.email!, renderedSubject, bodyText, html);
+      }
+      if (!outcome.skipped) consecutive = outcome.ok ? 0 : consecutive + 1;
 
       // Checkpoint the index BEFORE anything else: the next tick resumes at
       // nextIndex, so this ordering is what makes delivery exactly-once.
@@ -295,22 +329,26 @@ export async function executeEmailTick(
           const fresh = tasks?.find((entry) => entry.id === taskId);
           if (!fresh) return null;
           fresh.email.nextIndex += 1;
-          if (outcome.ok) fresh.email.sent += 1;
-          else fresh.email.failed += 1;
-          fresh.email.lastSentAt = Date.now();
+          // A skip preserves lastSentAt so a block of opt-outs never slows
+          // the real sends around them.
+          if (!outcome.skipped) {
+            if (outcome.ok) fresh.email.sent += 1;
+            else fresh.email.failed += 1;
+            fresh.email.lastSentAt = Date.now();
+          }
           fresh.email.consecutiveFailures = consecutive;
           fresh.updatedAt = Date.now();
           return tasks;
         },
         "psa: email sent",
       );
-      if (outcome.ok) await recordSend(picked.mailbox.id);
+      if (outcome.ok && !outcome.skipped) await recordSend(picked.mailbox.id);
       await appendEmailLog(taskId, {
         t: Date.now(),
         to: lead.email!,
         mailboxId: picked.mailbox.id,
         ok: outcome.ok,
-        ...(outcome.ok ? {} : { error: outcome.error }),
+        ...(outcome.skipped ? { skipped: true } : outcome.ok ? {} : { error: outcome.error }),
       });
 
       if (!outcome.ok && consecutive >= MAX_CONSECUTIVE_FAILURES) {

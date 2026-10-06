@@ -6,8 +6,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 /** Mirrors GET /api/email-analytics (app/api/email-analytics/route.ts). */
 interface AnalyticsResponse {
   ok: true;
-  totals: { sent: number; failed: number; tasksDone: number; tasksActive: number };
-  byDay: { date: string; sent: number; failed: number }[];
+  totals: { sent: number; failed: number; skipped: number; tasksDone: number; tasksActive: number };
+  byDay: { date: string; sent: number; failed: number; skipped: number }[];
   byMailbox: {
     id: string;
     label: string;
@@ -20,6 +20,7 @@ interface AnalyticsResponse {
     to: string;
     ok: boolean;
     error?: string;
+    skipped?: boolean;
     taskId: string;
     keyword: string;
     mailboxId: string;
@@ -76,7 +77,10 @@ export function EmailAnalyticsPage() {
     return labels;
   }, [data]);
 
-  const maxDay = Math.max(1, ...(data?.byDay ?? []).map((day) => day.sent + day.failed));
+  const maxDay = Math.max(
+    1,
+    ...(data?.byDay ?? []).map((day) => day.sent + day.failed + (day.skipped ?? 0)),
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-8 sm:px-6 lg:py-12">
@@ -102,9 +106,10 @@ export function EmailAnalyticsPage() {
         <p className="text-sm text-zinc-500">No data yet.</p>
       ) : (
         <>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
             <Stat label="Emails sent" value={String(data.totals.sent)} accent />
             <Stat label="Failed" value={String(data.totals.failed)} />
+            <Stat label="Skipped (unsub)" value={String(data.totals.skipped ?? 0)} />
             <Stat label="Tasks done" value={String(data.totals.tasksDone)} />
             <Stat label="Tasks active" value={String(data.totals.tasksActive)} />
           </div>
@@ -127,9 +132,14 @@ export function EmailAnalyticsPage() {
                         className="h-full bg-rose-500"
                         style={{ width: `${(day.failed / maxDay) * 100}%` }}
                       />
+                      <div
+                        className="h-full bg-zinc-500"
+                        style={{ width: `${((day.skipped ?? 0) / maxDay) * 100}%` }}
+                      />
                     </div>
-                    <span className="w-32 shrink-0 text-right font-mono text-xs text-zinc-400">
+                    <span className="w-44 shrink-0 text-right font-mono text-xs text-zinc-400">
                       {day.sent} sent{day.failed > 0 ? ` · ${day.failed} failed` : ""}
+                      {(day.skipped ?? 0) > 0 ? ` · ${day.skipped} skipped` : ""}
                     </span>
                   </li>
                 ))}
@@ -208,10 +218,14 @@ export function EmailAnalyticsPage() {
                           {mailboxLabels.get(entry.mailboxId) ?? entry.mailboxId.slice(0, 8)}
                         </td>
                         <td
-                          className={`py-2 ${entry.ok ? "text-emerald-400" : "text-rose-400"}`}
+                          className={`py-2 ${entry.skipped ? "text-amber-400" : entry.ok ? "text-emerald-400" : "text-rose-400"}`}
                           title={entry.ok ? undefined : entry.error}
                         >
-                          {entry.ok ? "sent" : `failed — ${(entry.error ?? "error").slice(0, 60)}`}
+                          {entry.skipped
+                            ? "skipped — unsubscribed"
+                            : entry.ok
+                              ? "sent"
+                              : `failed — ${(entry.error ?? "error").slice(0, 60)}`}
                         </td>
                       </tr>
                     ))}

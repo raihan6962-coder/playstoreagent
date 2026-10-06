@@ -1,4 +1,5 @@
 import { storeErrorResponse, sweepStalledRuns } from "@/lib/server/runs";
+import { checkReplies } from "@/lib/server/replies";
 import { sweepTasks } from "@/lib/server/tasks";
 import { validateCountry } from "@/lib/validation/input";
 
@@ -14,7 +15,9 @@ function jsonError(status: number, error: string): Response {
  *  1. restart self-chains of runs whose checkpoints went quiet,
  *  2. revive runs that ended on a storage rate limit,
  *  3. claim due tasks (headless start of the day's automation), reconcile
- *     tasks whose runs finished, and restart quiet email chains.
+ *     tasks whose runs finished, and restart quiet email chains,
+ *  4. scan connected mailboxes for client replies and Telegram-notify the
+ *     human ones (auto-replies are recorded, never notified).
  * Authenticated with the shared `CRON_SECRET` bearer token (Vercel attaches
  * it automatically from the env var of the same name).
  */
@@ -29,10 +32,17 @@ export async function GET(request: Request): Promise<Response> {
   try {
     const runs = await sweepStalledRuns(origin);
     const tasks = await sweepTasks(origin, { country: geo.ok ? geo.value : undefined });
+    let replies: Awaited<ReturnType<typeof checkReplies>> | { error: string };
+    try {
+      replies = await checkReplies();
+    } catch (error) {
+      replies = { error: error instanceof Error ? error.message.slice(0, 160) : "reply scan failed" };
+    }
     return Response.json({
       ok: runs.store === "ok",
       ...runs,
       tasks,
+      replies,
     });
   } catch (error) {
     return storeErrorResponse(error) ?? jsonError(500, "Sweep failed.");

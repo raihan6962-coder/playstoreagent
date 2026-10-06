@@ -11,6 +11,13 @@
 
 import { randomBytes, randomUUID } from "node:crypto";
 import { deliver, renderTemplate } from "@/lib/server/emailSender";
+import {
+  buildFooterHtml,
+  buildPlainFooter,
+  getFooterSettings,
+  plainToHtml,
+  unsubscribeUrl,
+} from "@/lib/server/emailFooter";
 import { listMailboxes, recordSend, validateWebAppUrl } from "@/lib/server/mailboxes";
 import { mutateJson, readJson } from "@/lib/server/stateStore";
 import type { Lead } from "@/types/lead";
@@ -218,9 +225,19 @@ export async function sendDemo(input: SpamSendInput): Promise<SpamCheckRecord> {
   const marker = `PSAchk${randomBytes(8).toString("hex")}`;
   const lead = demoLead(input.to);
   const subject = renderTemplate(input.subject, lead, "demo");
-  const body = `${renderTemplate(input.body, lead, "demo")}\n\n[ref ${marker}]`;
+  const plainBody = `${renderTemplate(input.body, lead, "demo")}\n\n[ref ${marker}]`;
+  // The demo mirrors a real send: same footer, same HTML variant, so what
+  // the checker measures is what clients actually receive.
+  const footer = await getFooterSettings();
+  let bodyText = plainBody;
+  let html: string | undefined;
+  if (footer.enabled) {
+    const url = unsubscribeUrl(input.to);
+    bodyText = plainBody + buildPlainFooter(footer.note, url);
+    html = plainToHtml(plainBody) + buildFooterHtml(footer.note, url);
+  }
 
-  const outcome = await deliver(mailbox.webAppUrl, input.to, subject, body);
+  const outcome = await deliver(mailbox.webAppUrl, input.to, subject, bodyText, html);
   if (outcome.ok) await recordSend(mailbox.id);
 
   const record: SpamCheckRecord = {

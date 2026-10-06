@@ -16,8 +16,8 @@ const LOG_TASK_CAP = 20;
 
 export interface AnalyticsResponse {
   ok: true;
-  totals: { sent: number; failed: number; tasksDone: number; tasksActive: number };
-  byDay: { date: string; sent: number; failed: number }[];
+  totals: { sent: number; failed: number; skipped: number; tasksDone: number; tasksActive: number };
+  byDay: { date: string; sent: number; failed: number; skipped: number }[];
   byMailbox: {
     id: string;
     label: string;
@@ -30,6 +30,7 @@ export interface AnalyticsResponse {
     to: string;
     ok: boolean;
     error?: string;
+    skipped?: boolean;
     taskId: string;
     keyword: string;
     mailboxId: string;
@@ -62,7 +63,7 @@ export async function GET(): Promise<Response> {
       }
     }
 
-    const days = new Map<string, { sent: number; failed: number }>();
+    const days = new Map<string, { sent: number; failed: number; skipped: number }>();
     const mailboxTotals = new Map<string, number>();
     const recent: AnalyticsResponse["recent"] = [];
 
@@ -70,9 +71,10 @@ export async function GET(): Promise<Response> {
       const log = await readJson<EmailLog>(taskEmailLogPath(task.id), true);
       if (!log) continue;
       for (const [date, stats] of Object.entries(log.days)) {
-        const current = days.get(date) ?? { sent: 0, failed: 0 };
+        const current = days.get(date) ?? { sent: 0, failed: 0, skipped: 0 };
         current.sent += stats.sent;
         current.failed += stats.failed;
+        current.skipped += stats.skipped ?? 0;
         days.set(date, current);
         for (const [mailboxId, count] of Object.entries(stats.byMailbox)) {
           mailboxTotals.set(mailboxId, (mailboxTotals.get(mailboxId) ?? 0) + count);
@@ -84,6 +86,7 @@ export async function GET(): Promise<Response> {
           to: entry.to,
           ok: entry.ok,
           ...(entry.error ? { error: entry.error } : {}),
+          ...(entry.skipped ? { skipped: true } : {}),
           taskId: task.id,
           keyword: task.keyword,
           mailboxId: entry.mailboxId,
@@ -107,9 +110,11 @@ export async function GET(): Promise<Response> {
       totalSent: mailboxTotals.get(mailbox.id) ?? 0,
     }));
 
+    const skippedTotal = [...days.values()].reduce((sum, stats) => sum + stats.skipped, 0);
+
     const payload: AnalyticsResponse = {
       ok: true,
-      totals: { sent, failed, tasksDone, tasksActive },
+      totals: { sent, failed, skipped: skippedTotal, tasksDone, tasksActive },
       byDay,
       byMailbox,
       recent: recent.slice(0, 50),

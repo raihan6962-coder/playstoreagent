@@ -9,6 +9,7 @@ import {
   validateMailbox,
   validateWebAppUrl,
 } from "@/lib/server/mailboxes";
+import { addUnsubscribe } from "@/lib/server/unsubscribes";
 import { TASKS_PATH, taskEmailLogPath } from "@/lib/server/paths";
 import { createRun } from "@/lib/server/runs";
 import { readJson, writeJson } from "@/lib/server/stateStore";
@@ -39,6 +40,8 @@ const ORIGIN = "http://automation.test";
 const APPS_URL = "https://script.google.com/macros/s/test/exec";
 
 let appsResponse: () => Response = () => Response.json({ ok: true });
+/** Bodies POSTed to the Apps Script mailer (deliveries only — actions excluded). */
+let scriptPosts: { to: string; subject: string; body: string; html?: string }[] = [];
 
 function lead(email: string | null, pkg: string): Lead {
   return {
@@ -124,10 +127,17 @@ async function writeTasks(tasks: AutomationTask[]): Promise<void> {
  * through to the store mock.
  */
 function stubRouter(mock: GitHubMock): void {
+  scriptPosts = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).startsWith("https://script.google.com/")) return appsResponse();
+      if (String(input).startsWith("https://script.google.com/")) {
+        if (init?.body) {
+          const parsed = JSON.parse(String(init.body)) as { to?: string };
+          if (parsed.to) scriptPosts.push(parsed as (typeof scriptPosts)[number]);
+        }
+        return appsResponse();
+      }
       return (mock.fetchMock as unknown as typeof fetch)(input, init);
     }),
   );
@@ -603,6 +613,48 @@ describe("automation: email sender", () => {
 
     const mailbox = (await listMailboxes())[0];
     expect(mailbox.sent.count).toBe(2);
+  });
+
+  it("skips unsubscribed recipients and stamps the unsubscribe footer", async () => {
+    const mailboxId = (await addMailbox({ label: "box", webAppUrl: APPS_URL, dailyQuota: 10 })).id;
+    const runId = randomUUID();
+    const task = seedTask({ status: "sending", mailboxIds: [mailboxId], runId, intervalSeconds: 1 });
+    await writeTasks([task]);
+    await writeJson(
+      `runs/${runId}.leads.json`,
+      [lead("one@example.com", "com.one"), lead("two@example.com", "com.two")],
+      "psa: seed",
+    );
+    await addUnsubscribe("two@example.com", "footer-link");
+
+    const leased = await beginEmailTick(task.id, task.emailToken);
+    expect(leased.kind).toBe("step");
+    if (leased.kind !== "step") return;
+    await executeEmailTick(ORIGIN, task.id, leased.task);
+
+    const fresh = storedTasks(mock.files)[0];
+    expect(fresh.status).toBe("done");
+    expect(fresh.email.nextIndex).toBe(2);
+    expect(fresh.email.sent).toBe(1);
+    expect(fresh.email.failed).toBe(0);
+
+    // Only the non-opted-out lead reached the mailer, and its copy carries
+    // the plain-text unsubscribe footer plus the HTML button variant.
+    expect(scriptPosts).toHaveLength(1);
+    expect(scriptPosts[0].to).toBe("one@example.com");
+    expect(scriptPosts[0].body).toContain("No longer interested? Unsubscribe:");
+    expect(scriptPosts[0].body).toContain("/api/unsubscribe?to=");
+    expect(scriptPosts[0].html).toContain("Unsubscribe</a>");
+
+    const log = storedJson(mock.files, taskEmailLogPath(task.id)) as EmailLog;
+    expect(log.entries).toHaveLength(2);
+    expect(log.entries.filter((entry) => entry.skipped)).toHaveLength(1);
+    expect(log.entries.find((entry) => entry.skipped)?.to).toBe("two@example.com");
+    expect(Object.values(log.days).reduce((sum, day) => sum + (day.sent ?? 0), 0)).toBe(1);
+    expect(Object.values(log.days).reduce((sum, day) => sum + (day.skipped ?? 0), 0)).toBe(1);
+
+    // The opt-out consumed no quota.
+    expect((await listMailboxes())[0].sent.count).toBe(1);
   });
 
   it("releases the lease and chains a hop when the store hiccups mid-send", async () => {

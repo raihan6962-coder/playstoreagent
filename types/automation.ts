@@ -89,12 +89,16 @@ export interface EmailLogEntry {
   mailboxId: string;
   ok: boolean;
   error?: string;
+  /** Recipient unsubscribed — index advanced, nothing delivered. */
+  skipped?: boolean;
 }
 
 export interface EmailDayStats {
   sent: number;
   failed: number;
   byMailbox: Record<string, number>;
+  /** Suppressed by the unsubscribe list (neither sent nor failed). */
+  skipped?: number;
 }
 
 export interface EmailLog {

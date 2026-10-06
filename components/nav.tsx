@@ -8,10 +8,11 @@ const LINKS = [
   { href: "/leads", label: "Leads" },
   { href: "/email-analytics", label: "Email Analytics" },
   { href: "/email-settings", label: "Email Settings" },
+  { href: "/spam-check", label: "Spam Check" },
   { href: "/automation-settings", label: "Automation Settings" },
 ] as const;
 
-/** Top menu: the five sections of the pipeline. */
+/** Top menu: the six sections of the pipeline. */
 export function Nav() {
   const pathname = usePathname();
   return (

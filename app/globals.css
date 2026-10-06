@@ -7,13 +7,194 @@
   --font-mono: var(--font-geist-mono);
 }
 
+@theme {
+  /* Retuned neutrals: blue-black depths instead of flat zinc gray. */
+  --color-zinc-950: #050509;
+  --color-zinc-900: #0a0a11;
+  --color-zinc-800: #15151f;
+  --color-zinc-700: #1e1e2b;
+  --font-display: var(--font-space-grotesk);
+}
+
 :root {
-  --background: #09090b;
+  --background: #050509;
   --foreground: #f4f4f5;
 }
 
+/* ── Ambient canvas: layered glows + faint engineering grid ─────────────── */
 body {
-  background: var(--background);
+  background-color: var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  background-image:
+    radial-gradient(900px 520px at 10% -10%, rgb(16 185 129 / 0.1), transparent 62%),
+    radial-gradient(820px 500px at 92% -4%, rgb(34 211 238 / 0.07), transparent 58%),
+    radial-gradient(1100px 700px at 50% 115%, rgb(99 102 241 / 0.07), transparent 62%);
+  background-attachment: fixed;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgb(255 255 255 / 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.022) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse 95% 75% at 50% 0%, black 15%, transparent 78%);
+  -webkit-mask-image: radial-gradient(ellipse 95% 75% at 50% 0%, black 15%, transparent 78%);
+}
+
+/* ── Typography: geometric display face for headings & big numbers ──────── */
+h1,
+h2,
+h3,
+h4,
+[class~="text-3xl"],
+[class~="text-4xl"] {
+  font-family: var(--font-display), var(--font-geist-sans), system-ui, sans-serif;
+  letter-spacing: -0.015em;
+}
+
+/* ── Surfaces: every flat zinc panel becomes edge-lit glass ─────────────── */
+[class~="bg-zinc-900"],
+[class*="bg-zinc-900/"] {
+  background-color: rgb(255 255 255 / 0.03);
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.024), rgb(255 255 255 / 0));
+  box-shadow: inset 0 1px 0 0 rgb(255 255 255 / 0.045);
+}
+
+[class~="border-zinc-800"],
+[class*="border-zinc-800/"] {
+  border-color: rgb(255 255 255 / 0.08);
+}
+
+/* ── Actions: emerald fills become lit gradients ────────────────────────── */
+[class~="bg-emerald-500"] {
+  background-color: #10b981;
+  background-image: linear-gradient(135deg, #34d399 0%, #10b981 55%, #059669 100%);
+  box-shadow:
+    0 6px 22px -6px rgb(16 185 129 / 0.55),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.28);
+}
+
+[class~="hover:bg-emerald-400"]:hover {
+  filter: brightness(1.12) saturate(1.06);
+}
+
+[class~="bg-emerald-500/60"] {
+  background-image: linear-gradient(90deg, rgb(16 185 129 / 0.72), rgb(52 211 153 / 0.92));
+  box-shadow: 0 0 14px -2px rgb(16 185 129 / 0.45);
+}
+
+/* ── Focus, selection, scrollbars ───────────────────────────────────────── */
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid rgb(52 211 153 / 0.55);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgb(16 185 129 / 0.35);
+  color: #f4f4f5;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(16 185 129 / 0.3) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(16 185 129 / 0.22);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(16 185 129 / 0.42);
+  background-clip: content-box;
+}
+
+/* ── Signature pieces used by the shell & login ─────────────────────────── */
+.psa-grad-text {
+  background: linear-gradient(92deg, #d1fae5 0%, #34d399 42%, #22d3ee 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.psa-fade-up {
+  animation: psa-fade-up 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.psa-drawer-in {
+  animation: psa-drawer-in 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.psa-fade-in {
+  animation: psa-fade-in 0.22s ease both;
+}
+
+.psa-dot {
+  animation: psa-dot 2.4s ease-in-out infinite;
+}
+
+@keyframes psa-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes psa-drawer-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+
+@keyframes psa-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes psa-dot {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

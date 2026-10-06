@@ -1,29 +1,53 @@
 import { NextResponse } from "next/server";
-import { buildAuthorizeUrl, makePkce, PKCE_COOKIE, PKCE_TTL_MS } from "@/lib/server/auth";
+import {
+  attemptLogin,
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+  signSession,
+} from "@/lib/server/auth";
+import { clientIp } from "@/lib/server/rateLimit";
 
 export const maxDuration = 15;
 
 /**
- * Step 1 of sign-in: mint a PKCE verifier (HttpOnly cookie) and send the
- * browser to Supabase, which in turn sends it to Google. No API key ever
- * appears in a URL — Supabase's /authorize is a public entry point.
+ * Verify email+password against Supabase, then mint our own HMAC session
+ * cookie. The allowlist and the failure budget are enforced server-side
+ * in attemptLogin — this route only shapes the HTTP contract.
  */
-export async function GET(request: Request): Promise<Response> {
-  const origin = new URL(request.url).origin;
+export async function POST(request: Request): Promise<Response> {
+  let body: { email?: unknown; password?: unknown };
   try {
-    const pkce = await makePkce();
-    const url = buildAuthorizeUrl(origin, pkce.challenge);
-    const response = NextResponse.redirect(url, 307);
-    response.cookies.set(PKCE_COOKIE, JSON.stringify({ verifier: pkce.verifier, exp: pkce.exp }), {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: Math.floor(PKCE_TTL_MS / 1000),
-    });
-    return response;
-  } catch (error) {
-    console.error("auth login redirect failed", error);
-    return NextResponse.redirect(new URL("/login?error=not_configured", request.url), 307);
+    body = (await request.json()) as { email?: unknown; password?: unknown };
+  } catch {
+    return NextResponse.json({ error: "invalid_credentials" }, { status: 400 });
   }
+  const email = typeof body.email === "string" ? body.email : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!email || !password) {
+    return NextResponse.json({ error: "invalid_credentials" }, { status: 400 });
+  }
+
+  const outcome = await attemptLogin(clientIp(request), email, password);
+  if (!outcome.ok || !outcome.email) {
+    const status = outcome.error === "rate_limited" ? 429 : 401;
+    return NextResponse.json({ error: outcome.error ?? "invalid_credentials" }, { status });
+  }
+
+  let token: string;
+  try {
+    token = await signSession(outcome.email);
+  } catch (error) {
+    console.error("session signing failed", error);
+    return NextResponse.json({ error: "not_configured" }, { status: 503 });
+  }
+
+  const response = NextResponse.json({ ok: true, email: outcome.email });
+  response.cookies.set(SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: Math.floor(SESSION_TTL_MS / 1000),
+  });
+  return response;
 }

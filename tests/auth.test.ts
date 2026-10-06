@@ -1,13 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   adminEmails,
-  buildAuthorizeUrl,
-  exchangeAuthCode,
+  attemptLogin,
   isAdminEmail,
   isPublicPath,
-  makePkce,
-  parsePkce,
-  SESSION_TTL_MS,
+  LOGIN_FAILURE_LIMIT,
   signSession,
   verifySessionToken,
 } from "@/lib/server/auth";
@@ -17,6 +14,9 @@ beforeEach(() => {
   process.env.SUPABASE_URL = "https://test-project.supabase.co";
   process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-key";
   delete process.env.ADMIN_EMAILS;
+  // Isolate the per-IP+email failure budget between tests.
+  vi.useFakeTimers();
+  vi.setSystemTime(Date.parse("2026-01-01T00:00:00Z"));
 });
 
 afterEach(() => {
@@ -57,7 +57,9 @@ describe("session tokens", () => {
   it("rejects tampered, foreign and malformed tokens", async () => {
     const token = await signSession("revnexa0@gmail.com");
     const [version, body, signature] = token.split(".");
-    const forgedBody = Buffer.from(JSON.stringify({ email: "revnexa0@gmail.com", exp: Date.now() + 60_000 })).toString("base64url");
+    const forgedBody = Buffer.from(
+      JSON.stringify({ email: "revnexa0@gmail.com", exp: Date.now() + 60_000 }),
+    ).toString("base64url");
     expect(await verifySessionToken(`${version}.${forgedBody}.${signature}`)).toBeNull();
     expect(await verifySessionToken(`${version}.${body}.${signature.slice(0, -2)}xx`)).toBeNull();
     expect(await verifySessionToken("v2.deadbeef.deadbeef")).toBeNull();
@@ -73,11 +75,9 @@ describe("session tokens", () => {
   });
 
   it("expires sessions after the TTL", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(Date.parse("2026-01-01T00:00:00Z"));
     const token = await signSession("revnexa0@gmail.com");
     expect(await verifySessionToken(token)).not.toBeNull();
-    vi.setSystemTime(Date.parse("2026-01-01T00:00:00Z") + SESSION_TTL_MS + 1_000);
+    vi.setSystemTime(Date.parse("2026-01-08T00:00:00Z"));
     expect(await verifySessionToken(token)).toBeNull();
   });
 
@@ -95,38 +95,7 @@ describe("session tokens", () => {
   });
 });
 
-describe("PKCE state", () => {
-  it("builds a verifiable challenge and round-trips the cookie value", async () => {
-    const pkce = await makePkce();
-    expect(pkce.verifier.length).toBeGreaterThanOrEqual(40);
-    expect(pkce.challenge).not.toContain("=");
-    const parsed = parsePkce(JSON.stringify({ verifier: pkce.verifier, exp: pkce.exp }));
-    expect(parsed?.verifier).toBe(pkce.verifier);
-  });
-
-  it("rejects expired, short or garbage state", () => {
-    expect(parsePkce(null)).toBeNull();
-    expect(parsePkce("")).toBeNull();
-    expect(parsePkce("not json")).toBeNull();
-    expect(parsePkce(JSON.stringify({ verifier: "short", exp: Date.now() + 60_000 }))).toBeNull();
-    expect(
-      parsePkce(JSON.stringify({ verifier: "x".repeat(48), exp: Date.now() - 1 })),
-    ).toBeNull();
-  });
-
-  it("builds the Supabase authorize URL", () => {
-    const url = new URL(buildAuthorizeUrl("http://localhost:3000", "challenge-value"));
-    expect(url.origin + url.pathname).toBe("https://test-project.supabase.co/auth/v1/authorize");
-    expect(url.searchParams.get("provider")).toBe("google");
-    expect(url.searchParams.get("redirect_to")).toBe("http://localhost:3000/auth/callback");
-    expect(url.searchParams.get("code_challenge")).toBe("challenge-value");
-    expect(url.searchParams.get("code_challenge_method")).toBe("s256");
-    // The service key must never leak into a URL.
-    expect(url.toString()).not.toContain("service-role-key");
-  });
-});
-
-describe("code exchange", () => {
+describe("password sign-in", () => {
   function stubFetch(responses: Response[]): { calls: { url: string; init?: RequestInit }[] } {
     const calls: { url: string; init?: RequestInit }[] = [];
     let index = 0;
@@ -142,73 +111,129 @@ describe("code exchange", () => {
     return { calls };
   }
 
-  it("exchanges via grant_type=pkce and extracts the email", async () => {
+  it("accepts the admin password and returns the verified email", async () => {
     const { calls } = stubFetch([
-      Response.json({ user: { email: "Admin@Gmail.com", email_verified: true } }),
+      Response.json({ user: { email: "revnexa0@gmail.com", email_confirmed_at: "2026-01-01" } }),
     ]);
-    const result = await exchangeAuthCode("http://localhost:3000", "auth-code", "verifier-1");
-    expect(result).toEqual({ ok: true, email: "admin@gmail.com", emailVerified: true });
-    expect(calls[0].url).toContain("grant_type=pkce");
+    const outcome = await attemptLogin("10.0.0.1", "  Revnexa0@Gmail.com ", "hunter2hunter2");
+    expect(outcome).toEqual({ ok: true, email: "revnexa0@gmail.com" });
+    expect(calls[0].url).toBe("https://test-project.supabase.co/auth/v1/token?grant_type=password");
     const body = JSON.parse(String(calls[0].init?.body)) as Record<string, string>;
-    expect(body.auth_code).toBe("auth-code");
-    expect(body.code_verifier).toBe("verifier-1");
+    expect(body.email).toBe("revnexa0@gmail.com");
+    expect(body.password).toBe("hunter2hunter2");
     const headers = calls[0].init?.headers as Record<string, string>;
     expect(headers.apikey).toBe("service-role-key");
   });
 
-  it("falls back to the legacy authorization_code grant", async () => {
-    const { calls } = stubFetch([
-      Response.json({ error_code: "bad_code" }, { status: 400 }),
-      Response.json({ user: { email: "admin@gmail.com", email_verified: true } }),
-    ]);
-    const result = await exchangeAuthCode("https://app.example.com", "auth-code", "verifier-1");
-    expect(result.ok).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(calls[1].url).toContain("grant_type=authorization_code");
-    const body = JSON.parse(String(calls[1].init?.body)) as Record<string, string>;
-    expect(body.redirect_uri).toBe("https://app.example.com/auth/callback");
+  it("never contacts Supabase for a non-admin address", async () => {
+    const { calls } = stubFetch([]);
+    const outcome = await attemptLogin("10.0.0.1", "stranger@example.com", "anything123");
+    expect(outcome).toEqual({ ok: false, error: "access_denied" });
+    expect(calls).toHaveLength(0);
   });
 
-  it("maps Supabase redirect complaints to a setup hint", async () => {
+  it("rejects empty submissions without a network call", async () => {
+    const { calls } = stubFetch([]);
+    expect(await attemptLogin("10.0.0.1", "", "pw")).toEqual({
+      ok: false,
+      error: "invalid_credentials",
+    });
+    expect(await attemptLogin("10.0.0.1", "revnexa0@gmail.com", "")).toEqual({
+      ok: false,
+      error: "invalid_credentials",
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("maps Supabase's wrong-password rejection", async () => {
     stubFetch([
-      Response.json({ error_code: "validation_failed", msg: "Invalid Redirect URL" }, { status: 400 }),
-      Response.json({ error_code: "validation_failed", msg: "Invalid Redirect URL" }, { status: 400 }),
+      Response.json({ code: 400, error_code: "invalid_credentials", msg: "Invalid login credentials" }, { status: 400 }),
     ]);
-    const result = await exchangeAuthCode("http://localhost:3000", "auth-code", "verifier-1");
-    expect(result).toEqual({ ok: false, error: "redirect_mismatch" });
+    const outcome = await attemptLogin("10.0.0.4", "revnexa0@gmail.com", "wrong-password");
+    expect(outcome).toEqual({ ok: false, error: "invalid_credentials" });
   });
 
-  it("requires an email in the payload", async () => {
-    stubFetch([Response.json({ access_token: "no-user-here" })]);
-    const result = await exchangeAuthCode("http://localhost:3000", "auth-code", "verifier-1");
-    expect(result).toEqual({ ok: false, error: "no_email" });
+  it("turns a password for a non-allowlisted account into a denial", async () => {
+    process.env.ADMIN_EMAILS = "revnexa0@gmail.com";
+    stubFetch([
+      Response.json({ user: { email: "someone.else@gmail.com" } }),
+    ]);
+    const outcome = await attemptLogin("10.0.0.5", "revnexa0@gmail.com", "pw");
+    expect(outcome).toEqual({ ok: false, error: "access_denied" });
   });
 
-  it("surfaces network failure as a timeout", async () => {
+  it("locks out after the failure budget and reopens on a fresh window", async () => {
+    stubFetch([
+      Response.json({ error_code: "invalid_credentials", msg: "Invalid login credentials" }, { status: 400 }),
+    ]);
+    for (let attempt = 0; attempt < LOGIN_FAILURE_LIMIT; attempt += 1) {
+      const outcome = await attemptLogin("10.0.0.6", "revnexa0@gmail.com", "nope");
+      expect(outcome.error).toBe("invalid_credentials");
+    }
+    const locked = await attemptLogin("10.0.0.6", "revnexa0@gmail.com", "nope");
+    expect(locked).toEqual({ ok: false, error: "rate_limited" });
+
+    // A different email on the same IP still has its own budget.
+    process.env.ADMIN_EMAILS = "revnexa0@gmail.com,other@example.com";
+    const otherEmail = await attemptLogin("10.0.0.6", "other@example.com", "nope");
+    expect(otherEmail.error).toBe("invalid_credentials");
+
+    // The window rolls over.
+    vi.setSystemTime(Date.parse("2026-01-01T00:16:00Z"));
+    const reopened = await attemptLogin("10.0.0.6", "revnexa0@gmail.com", "nope");
+    expect(reopened.error).toBe("invalid_credentials");
+  });
+
+  it("clears the budget after a successful sign-in", async () => {
+    const wrong = () =>
+      Response.json({ error_code: "invalid_credentials", msg: "Invalid login credentials" }, { status: 400 });
+    // Sequence matters: four failures, then the good password, then more failures.
+    stubFetch([wrong(), wrong(), wrong(), wrong(), Response.json({ user: { email: "revnexa0@gmail.com" } }), wrong()]);
+    // Four failures — one short of the limit.
+    for (let attempt = 0; attempt < LOGIN_FAILURE_LIMIT - 1; attempt += 1) {
+      await attemptLogin("10.0.0.7", "revnexa0@gmail.com", "nope");
+    }
+    const ok = await attemptLogin("10.0.0.7", "revnexa0@gmail.com", "right");
+    expect(ok.ok).toBe(true);
+    // Without a reset the very next failure would trip the lockout (4+1=5);
+    // with it, four more failures still fit inside the fresh budget.
+    for (let attempt = 0; attempt < LOGIN_FAILURE_LIMIT - 1; attempt += 1) {
+      const again = await attemptLogin("10.0.0.7", "revnexa0@gmail.com", "nope");
+      expect(again.error).toBe("invalid_credentials");
+    }
+  });
+
+  it("reports a missing Supabase environment", async () => {
+    delete process.env.SUPABASE_URL;
+    const outcome = await attemptLogin("10.0.0.8", "revnexa0@gmail.com", "pw");
+    expect(outcome).toEqual({ ok: false, error: "not_configured" });
+  });
+
+  it("classifies network failure and Supabase rate limits", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => {
         throw new Error("network down");
       }),
     );
-    const result = await exchangeAuthCode("http://localhost:3000", "auth-code", "verifier-1");
-    expect(result).toEqual({ ok: false, error: "exchange_timeout" });
-  });
+    expect(await attemptLogin("10.0.0.9", "revnexa0@gmail.com", "pw")).toEqual({
+      ok: false,
+      error: "network",
+    });
 
-  it("flags an auth endpoint that is not there", async () => {
     stubFetch([
-      Response.json({ message: "Not found" }, { status: 404 }),
-      Response.json({ message: "Not found" }, { status: 404 }),
+      Response.json({ error_code: "over_request_rate_limit", msg: "Request rate limit reached" }, { status: 429 }),
     ]);
-    const result = await exchangeAuthCode("http://localhost:3000", "auth-code", "verifier-1");
-    expect(result).toEqual({ ok: false, error: "auth_disabled" });
+    expect(await attemptLogin("10.0.0.2", "revnexa0@gmail.com", "pw")).toEqual({
+      ok: false,
+      error: "rate_limited",
+    });
   });
 });
 
 describe("proxy access rules", () => {
   it("keeps the login flow, leads' opt-out and credentialed server routes public", () => {
     expect(isPublicPath("/login")).toBe(true);
-    expect(isPublicPath("/auth/callback")).toBe(true);
     expect(isPublicPath("/api/auth/login")).toBe(true);
     expect(isPublicPath("/api/auth/logout")).toBe(true);
     expect(isPublicPath("/api/auth/me")).toBe(true);
@@ -222,6 +247,7 @@ describe("proxy access rules", () => {
     expect(isPublicPath("/")).toBe(false);
     expect(isPublicPath("/inbox")).toBe(false);
     expect(isPublicPath("/spam-check")).toBe(false);
+    expect(isPublicPath("/auth/callback")).toBe(false); // Google flow is gone
     expect(isPublicPath("/api/unsubscribes")).toBe(false); // plural = management API
     expect(isPublicPath("/api/replies")).toBe(false);
     expect(isPublicPath("/api/tasks")).toBe(false);

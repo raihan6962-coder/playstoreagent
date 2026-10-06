@@ -8,6 +8,7 @@ const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 12;
 
 const hits = new Map<string, number[]>();
+const failures = new Map<string, number[]>();
 
 export function clientIp(request: Request): string {
   const forwarded = request.headers.get("x-forwarded-for");
@@ -30,4 +31,27 @@ export function allowRequest(ip: string): boolean {
     }
   }
   return true;
+}
+
+/** Read-only budget check: has this key burned `limit` failures inside `windowMs`? */
+export function withinFailureBudget(key: string, limit: number, windowMs: number): boolean {
+  const now = Date.now();
+  const recent = (failures.get(key) ?? []).filter((at) => now - at < windowMs);
+  failures.set(key, recent);
+  return recent.length < limit;
+}
+
+export function noteFailure(key: string): void {
+  const recent = failures.get(key) ?? [];
+  recent.push(Date.now());
+  failures.set(key, recent);
+  if (failures.size > 1_000) {
+    for (const [key2, timestamps] of failures) {
+      if (timestamps.every((at) => Date.now() - at >= 15 * 60_000)) failures.delete(key2);
+    }
+  }
+}
+
+export function clearFailures(key: string): void {
+  failures.delete(key);
 }

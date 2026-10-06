@@ -1,52 +1,24 @@
 "use client";
 
-import { Suspense, useEffect } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 
 const MESSAGES: Record<string, string> = {
-  access_denied: "This Google account isn't allowed. Only the workspace admin can sign in.",
+  invalid_credentials: "Wrong email or password.",
+  access_denied: "This account isn't allowed. Only the workspace admin can sign in.",
+  rate_limited: "Too many attempts — wait a few minutes and try again.",
   not_configured: "Sign-in isn't configured yet — the Supabase auth environment is missing.",
-  provider_error: "Supabase refused the Google sign-in. Check that the Google provider is enabled.",
-  redirect_mismatch: "Supabase hasn't allowlisted this app's callback URL (Authentication → URL Configuration).",
   auth_disabled: "Supabase Auth looks disabled for this project.",
-  pkce_mismatch: "The sign-in session didn't match — please try again.",
-  code_expired: "That sign-in link expired — please try again.",
-  exchange_failed: "Couldn't complete the sign-in with Supabase — please try again.",
-  no_email: "Google didn't return an email address for this account.",
-  unverified: "Google hasn't verified this account's email address.",
-  missing_code: "The sign-in was interrupted — please try again.",
-  expired: "Your sign-in attempt expired — please try again.",
-  rate_limited: "Too many attempts — wait a moment and try again.",
+  unverified: "This email address isn't verified yet.",
+  network: "Couldn't reach the sign-in service — check your connection and try again.",
 };
 
-function GoogleGlyph(): React.ReactElement {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden className="h-5 w-5">
-      <path
-        fill="#4285F4"
-        d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47a5.54 5.54 0 0 1-2.4 3.63v3.02h3.88c2.27-2.09 3.54-5.17 3.54-8.89Z"
-      />
-      <path
-        fill="#34A853"
-        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.01c-1.08.72-2.45 1.15-4.05 1.15-3.13 0-5.78-2.11-6.73-4.96H1.28v3.09A11.99 11.99 0 0 0 12 24Z"
-      />
-      <path
-        fill="#FBBC05"
-        d="M5.27 14.27a7.19 7.19 0 0 1 0-4.54V6.64H1.28a12 12 0 0 0 0 10.72l3.99-3.09Z"
-      />
-      <path
-        fill="#EA4335"
-        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0A11.99 11.99 0 0 0 1.28 6.64l3.99 3.09C6.22 6.86 8.87 4.75 12 4.75Z"
-      />
-    </svg>
-  );
-}
-
 function LoginContent(): React.ReactElement {
-  const searchParams = useSearchParams();
   const router = useRouter();
-  const error = searchParams.get("error");
-  const deniedEmail = searchParams.get("email");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -64,7 +36,30 @@ function LoginContent(): React.ReactElement {
     };
   }, [router]);
 
-  const message = error ? (MESSAGES[error] ?? "Sign-in failed — please try again.") : null;
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      if (response.ok) {
+        router.replace("/");
+        router.refresh();
+        return;
+      }
+      const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+      setError(MESSAGES[payload?.error ?? ""] ?? "Sign-in failed — please try again.");
+    } catch {
+      setError(MESSAGES.network);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="relative flex min-h-[100svh] items-center justify-center px-4 py-12">
@@ -89,27 +84,63 @@ function LoginContent(): React.ReactElement {
         </div>
 
         <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-7 shadow-[0_24px_80px_-24px_rgba(16,185,129,0.25)] backdrop-blur-xl">
-          {message ? (
-            <div className="mb-5 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm leading-relaxed text-amber-200">
-              {message}
-              {deniedEmail ? (
-                <span className="mt-1 block break-all text-amber-300/80">
-                  Account: <strong>{deniedEmail}</strong>
-                </span>
-              ) : null}
+          {error ? (
+            <div
+              role="alert"
+              className="mb-5 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm leading-relaxed text-amber-200"
+            >
+              {error}
             </div>
           ) : null}
 
-          <a
-            href="/api/auth/login"
-            className="group flex h-[52px] w-full items-center justify-center gap-3 rounded-xl border border-white/15 bg-white text-sm font-semibold text-zinc-900 transition hover:bg-white/90 active:scale-[0.99]"
-          >
-            <GoogleGlyph />
-            Continue with Google
-          </a>
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label htmlFor="email" className="mb-1.5 block text-xs uppercase tracking-[0.18em] text-zinc-500">
+                Email
+              </label>
+              <input
+                id="email"
+                type="email"
+                required
+                autoComplete="username"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                className="w-full rounded-xl border border-white/10 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus-visible:border-emerald-400/60"
+                placeholder="admin@example.com"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="password" className="mb-1.5 block text-xs uppercase tracking-[0.18em] text-zinc-500">
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                required
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="w-full rounded-xl border border-white/10 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus-visible:border-emerald-400/60"
+                placeholder="••••••••"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={busy}
+              className="group flex h-[52px] w-full items-center justify-center gap-3 rounded-xl bg-gradient-to-b from-emerald-400 to-emerald-500 text-sm font-semibold text-zinc-950 shadow-[0_12px_36px_-12px_rgba(16,185,129,0.7)] transition hover:from-emerald-300 hover:to-emerald-400 active:scale-[0.99] disabled:opacity-60"
+            >
+              {busy ? (
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-950/30 border-t-zinc-950" />
+              ) : (
+                "Sign in"
+              )}
+            </button>
+          </form>
 
           <p className="mt-5 text-center text-xs leading-relaxed text-zinc-500">
-            Restricted access — sign-in is limited to the workspace admin Google account.
+            Restricted access — sign-in is limited to the workspace admin account.
           </p>
         </div>
 
@@ -122,9 +153,5 @@ function LoginContent(): React.ReactElement {
 }
 
 export function LoginScreen(): React.ReactElement {
-  return (
-    <Suspense fallback={null}>
-      <LoginContent />
-    </Suspense>
-  );
+  return <LoginContent />;
 }

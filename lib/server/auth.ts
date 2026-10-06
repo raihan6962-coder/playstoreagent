@@ -1,17 +1,21 @@
+import { clearFailures, noteFailure, withinFailureBudget } from "@/lib/server/rateLimit";
+
 /**
  * Admin-only auth. Stateless HMAC-signed session cookies (verified with
  * WebCrypto only, so the edge proxy and Node route handlers share one
- * implementation) plus the Supabase PKCE pieces of the Google flow.
+ * implementation) plus the Supabase password-grant sign-in.
  *
- * The identity decision is made once, at the callback: Supabase Auth proves
- * the Google account, we then whitelist-check the email and mint our own
- * short-lived session. Nothing about the rest of the app talks to Supabase.
+ * The identity decision is made once, at login: Supabase Auth proves the
+ * credentials, we then whitelist-check the email and mint our own session.
+ * Nothing about the rest of the app talks to Supabase.
  */
 
 export const SESSION_COOKIE = "psa_session";
-export const PKCE_COOKIE = "psa_pkce";
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-export const PKCE_TTL_MS = 10 * 60 * 1000;
+
+/** Failed sign-ins allowed per IP+email before cooling off. */
+export const LOGIN_FAILURE_LIMIT = 5;
+export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 
 /** The only account that may sign in unless ADMIN_EMAILS overrides it. */
 const DEFAULT_ADMIN_EMAIL = "revnexa0@gmail.com";
@@ -20,11 +24,6 @@ const encoder = new TextEncoder();
 
 export interface Session {
   email: string;
-  exp: number;
-}
-
-export interface PkceState {
-  verifier: string;
   exp: number;
 }
 
@@ -137,63 +136,37 @@ export async function sessionFromRequest(request: {
   return verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value);
 }
 
-/* ── PKCE helpers for the Google round-trip ──────────────────────────────── */
+/* ── password sign-in ────────────────────────────────────────────────────── */
 
-export interface PkceChallenge {
-  verifier: string;
-  challenge: string;
-  exp: number;
-}
-
-export async function makePkce(now = Date.now()): Promise<PkceChallenge> {
-  const verifier = b64urlFromBytes(crypto.getRandomValues(new Uint8Array(48)));
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(verifier));
-  return { verifier, challenge: b64urlFromBytes(new Uint8Array(digest)), exp: now + PKCE_TTL_MS };
-}
-
-export function parsePkce(value: string | undefined | null, now = Date.now()): PkceState | null {
-  if (!value) return null;
-  try {
-    const state = JSON.parse(value) as Partial<PkceState>;
-    if (typeof state.verifier !== "string" || state.verifier.length < 32) return null;
-    if (typeof state.exp !== "number" || state.exp <= now) return null;
-    return { verifier: state.verifier, exp: state.exp };
-  } catch {
-    return null;
-  }
-}
-
-/** Supabase's browser entry point — no API key in the URL, by design. */
-export function buildAuthorizeUrl(origin: string, challenge: string): string {
-  const url = new URL(`${supabaseUrl()}/auth/v1/authorize`);
-  url.searchParams.set("provider", "google");
-  url.searchParams.set("redirect_to", `${origin}/auth/callback`);
-  url.searchParams.set("code_challenge", challenge);
-  url.searchParams.set("code_challenge_method", "s256");
-  return url.toString();
-}
-
-export interface ExchangeResult {
+export interface LoginOutcome {
   ok: boolean;
   email?: string;
-  emailVerified?: boolean;
   error?: string;
 }
 
 /**
- * Swap the callback code for a Supabase session. Primary: the current
- * `grant_type=pkce` contract (what supabase-js sends); fallback: the older
- * `authorization_code` shape, in case the project still runs an older GoTrue.
+ * Verify email+password against Supabase's password grant, enforcing the
+ * admin allowlist and a per-IP+email failure budget. Every layer that can
+ * reject does so without contacting Supabase when it already knows better.
  */
-export async function exchangeAuthCode(
-  origin: string,
-  code: string,
-  verifier: string,
-): Promise<ExchangeResult> {
+export async function attemptLogin(
+  ip: string,
+  email: string,
+  password: string,
+): Promise<LoginOutcome> {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized || !password) return { ok: false, error: "invalid_credentials" };
+  if (!isAdminEmail(normalized)) return { ok: false, error: "access_denied" };
+
+  const budgetKey = `login:${ip}:${normalized}`;
+  if (!withinFailureBudget(budgetKey, LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_MS)) {
+    return { ok: false, error: "rate_limited" };
+  }
+
   let endpoint: string;
   let headers: Record<string, string>;
   try {
-    endpoint = `${supabaseUrl()}/auth/v1/token`;
+    endpoint = `${supabaseUrl()}/auth/v1/token?grant_type=password`;
     headers = {
       apikey: supabaseServiceKey(),
       "content-type": "application/json",
@@ -201,59 +174,48 @@ export async function exchangeAuthCode(
   } catch {
     return { ok: false, error: "not_configured" };
   }
-  const redirectUri = `${origin}/auth/callback`;
 
-  const attempts: { grant: string; body: Record<string, string> }[] = [
-    { grant: "pkce", body: { auth_code: code, code_verifier: verifier } },
-    {
-      grant: "authorization_code",
-      body: { auth_code: code, code_verifier: verifier, redirect_uri: redirectUri },
-    },
-  ];
-
-  let lastError = "exchange_failed";
-  for (const attempt of attempts) {
-    try {
-      const response = await fetch(`${endpoint}?grant_type=${attempt.grant}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(attempt.body),
-        signal: AbortSignal.timeout(15_000),
-      });
-      const data = (await response.json().catch(() => null)) as
-        | {
-            user?: { email?: string; email_verified?: boolean };
-            session?: { user?: { email?: string; email_verified?: boolean } };
-            error_code?: string;
-            error_description?: string;
-            msg?: string;
-          }
-        | null;
-      if (!response.ok) {
-        lastError = mapSupabaseError(data, response.status);
-        continue;
-      }
-      const user = data?.user ?? data?.session?.user;
-      const email = user?.email?.trim().toLowerCase();
-      if (!email) return { ok: false, error: "no_email" };
-      return { ok: true, email, emailVerified: user?.email_verified !== false };
-    } catch {
-      lastError = "exchange_timeout";
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ email: normalized, password }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = (await response.json().catch(() => null)) as
+      | {
+          user?: { email?: string; email_confirmed_at?: string };
+          error_code?: string;
+          msg?: string;
+        }
+      | null;
+    if (!response.ok) {
+      noteFailure(budgetKey);
+      return { ok: false, error: mapPasswordError(data, response.status) };
     }
+    const verified = data?.user?.email?.trim().toLowerCase();
+    if (!verified || !isAdminEmail(verified)) {
+      // Supabase accepted a password for a non-admin account — still deny.
+      noteFailure(budgetKey);
+      return { ok: false, error: "access_denied" };
+    }
+    clearFailures(budgetKey);
+    return { ok: true, email: verified };
+  } catch {
+    noteFailure(budgetKey);
+    return { ok: false, error: "network" };
   }
-  return { ok: false, error: lastError };
 }
 
-function mapSupabaseError(
-  data: { error_code?: string; error_description?: string; msg?: string } | null,
+function mapPasswordError(
+  data: { error_code?: string; msg?: string } | null,
   status: number,
 ): string {
-  const text = `${data?.error_code ?? ""} ${data?.error_description ?? ""} ${data?.msg ?? ""}`.toLowerCase();
-  if (text.includes("redirect")) return "redirect_mismatch";
-  if (text.includes("code verifier") || text.includes("code_verifier")) return "pkce_mismatch";
-  if (text.includes("expired")) return "code_expired";
+  const text = `${data?.error_code ?? ""} ${data?.msg ?? ""}`.toLowerCase();
+  if (status === 429 || text.includes("rate limit")) return "rate_limited";
+  if (text.includes("not confirmed")) return "unverified";
   if (status === 404) return "auth_disabled";
-  return "exchange_failed";
+  return "invalid_credentials";
 }
 
 /* ── proxy access rules ──────────────────────────────────────────────────── */
@@ -265,7 +227,6 @@ function mapSupabaseError(
  */
 export function isPublicPath(pathname: string): boolean {
   if (pathname === "/login") return true;
-  if (pathname.startsWith("/auth/")) return true;
   if (pathname.startsWith("/api/auth/")) return true;
   if (pathname === "/api/unsubscribe") return true; // lead-facing opt-out page/form
   if (pathname.startsWith("/api/cron/")) return true; // Bearer CRON_SECRET

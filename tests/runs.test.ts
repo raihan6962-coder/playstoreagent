@@ -32,6 +32,10 @@ describe("run orchestration", () => {
   beforeEach(() => {
     process.env.PSA_STATE_REPO = "owner/state-repo";
     process.env.GITHUB_TOKEN = "test-token";
+    // A leaked token from another suite would turn sweep notifications into
+    // live fetches — keep them inert unless a test sets them on purpose.
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
     mock = installGitHubMock();
   });
 
@@ -265,6 +269,38 @@ describe("run orchestration", () => {
     const revived = (storedJson(mock.files, `runs/${due.runId}.meta.json`) as RunMeta);
     expect(revived.status).toBe("running");
     expect(revived.reason).toBeNull();
+  });
+
+  function telegramPosts(): { text: string }[] {
+    return mock.fetchMock.mock.calls
+      .filter(([url]) => String(url).includes("api.telegram.org"))
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { text: string });
+  }
+
+  it("pings Telegram when the sweep restarts a stalled run", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    process.env.TELEGRAM_CHAT_ID = "chat-42";
+    const stalled = await createRun(filters());
+    await ageRun(stalled.runId);
+
+    await sweepStalledRuns(ORIGIN);
+
+    const posts = telegramPosts();
+    expect(posts).toHaveLength(1);
+    expect(posts[0].text).toContain("restarted");
+    expect(posts[0].text).toContain(stalled.runId.slice(0, 8));
+  });
+
+  it("stays silent on Telegram when every watched run is healthy", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    process.env.TELEGRAM_CHAT_ID = "chat-42";
+    await createRun(filters());
+
+    const result = await sweepStalledRuns(ORIGIN);
+
+    expect(result.kicked).toBe(0);
+    expect(result.revived).toBe(0);
+    expect(telegramPosts()).toHaveLength(0);
   });
 
   it("reports a rate-limited store instead of pruning on failed reads", async () => {

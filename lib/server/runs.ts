@@ -26,6 +26,7 @@ import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/seconda
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
 import { mutateJson, readJson, StoreError, writeJson } from "@/lib/server/stateStore";
+import { notifyTelegram, notifyTime } from "@/lib/server/telegram";
 import type {
   DoneReason,
   GenerationEvent,
@@ -344,6 +345,7 @@ export async function executeTick(
   token: string,
   state: RunState,
 ): Promise<void> {
+  const startedAt = Date.now();
   let stopSeen = false;
   let leadsDirty = false;
   let leads: Lead[] = [];
@@ -500,7 +502,20 @@ export async function executeTick(
     // headers keeps this invocation inside its own response lifecycle while
     // the next one starts its step in its after() window. If every attempt
     // fails the snapshot ages into `stalled` and the client's Resume re-kicks.
-    await postTick(origin, runId, token);
+    // A failed chain hop used to die silently — hours of quiet until someone
+    // noticed. Now it also pings Telegram; the sweep restarts it either way.
+    const chained = await postTick(
+      origin,
+      runId,
+      token,
+      CHAIN_POLICY,
+      startedAt + CHAIN_TIME_BUDGET_MS,
+    );
+    if (!chained) {
+      await notifyTelegram(
+        `⚠️ Chain hop failed for run ${runId.slice(0, 8)} — ${state.stats.matched} leads so far. The watchdog restarts it within ~5 minutes. (${notifyTime(Date.now())})`,
+      );
+    }
   } catch (error) {
     if (checkpointTimer) clearInterval(checkpointTimer);
     const message = error instanceof Error ? error.message : "Unexpected server error.";
@@ -516,6 +531,9 @@ export async function executeTick(
       // unavailable/rate-limited: lease + updatedAt simply age out and the
       // run surfaces as `stalled`, resumable once the store recovers.
     }
+    await notifyTelegram(
+      `❌ Run ${runId.slice(0, 8)} step failed — ${message} (${notifyTime(Date.now())}). Resume it from the dashboard.`,
+    );
   }
 }
 
@@ -696,7 +714,8 @@ export async function resumeRun(
 
 /**
  * Retry policies per call site — each must fit the window its caller runs in
- * (create's `after()` 60s, tick's 300s, a button click, the sweep's 60s).
+ * (create's `after()` 60s, a button click, the sweep's 120s). The chain
+ * policy is additionally bounded by `CHAIN_TIME_BUDGET_MS` at call time.
  */
 interface TickPolicy {
   attempts: number;
@@ -704,12 +723,26 @@ interface TickPolicy {
   timeoutMs: number;
 }
 
-/** executeTick's chain, inside the tick route's maxDuration window. */
+/**
+ * executeTick's chain, inside the tick route's maxDuration window. A chain
+ * step always spends the full 240s budget, so the retry loop gets whatever
+ * the deadline leaves — when that is not enough for another attempt, postTick
+ * gives up cleanly instead of sleeping into the instance's kill. (An
+ * unbounded retry chain here used to run the function past maxDuration: the
+ * process was killed mid-backoff, silently, with the run quiet until an
+ * external kick revived it hours later.)
+ */
 const CHAIN_POLICY: TickPolicy = {
-  attempts: 5,
-  backoffsMs: [2_000, 5_000, 15_000, 30_000],
+  attempts: 3,
+  backoffsMs: [3_000, 8_000],
   timeoutMs: 12_000,
 };
+/**
+ * How long after its own start executeTick may still spend chaining: the
+ * route's maxDuration (300s) minus the 240s step, the final writes, and a
+ * margin for the failure alert. postTick stops retrying at this line.
+ */
+const CHAIN_TIME_BUDGET_MS = 280_000;
 /** The create route's after() window (60s) — keep the first kick inside it. */
 const KICK_POLICY: TickPolicy = { attempts: 3, backoffsMs: [2_000, 5_000], timeoutMs: 12_000 };
 /** Resume answers a button click — fail fast; sweep and client retry anyway. */
@@ -722,17 +755,29 @@ const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 
  * failures (a single api.github.com connect timeout must not kill a run —
  * that is exactly how a live run used to die silently and surface as
  * `stalled`). 401/404 are permanent and return immediately; success is any
- * 2xx (202 = step scheduled or busy, 200 = run already final).
+ * 2xx (202 = step scheduled or busy, 200 = run already final). When
+ * `deadlineAt` is given the loop never sleeps or waits past it: giving up
+ * cleanly hands the run to the external sweep, while running past the
+ * window would have the instance killed mid-retry with no alert and no log.
  */
 async function postTick(
   origin: string,
   runId: string,
   token: string,
   policy: TickPolicy = CHAIN_POLICY,
+  deadlineAt?: number,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
-    if (attempt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, policy.backoffsMs[attempt - 1] ?? 5_000));
+    const backoffMs = attempt > 0 ? policy.backoffsMs[attempt - 1] ?? 5_000 : 0;
+    if (
+      deadlineAt !== undefined &&
+      Date.now() + backoffMs + policy.timeoutMs > deadlineAt
+    ) {
+      console.error(`tick chain out of time budget for ${runId} before attempt ${attempt + 1}`);
+      return false;
+    }
+    if (backoffMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
     try {
       const response = await fetch(`${origin}/api/runs/${runId}/tick`, {
@@ -798,6 +843,8 @@ export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
     pruned: 0,
     store: "ok",
   };
+  const kickedRuns: string[] = [];
+  const revivedRuns: string[] = [];
 
   let kept: string[];
   try {
@@ -844,7 +891,10 @@ export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
           state.version += 1;
           state.seq += 1;
           await writeJson(statePath(runId), state, `psa: revive ${runId}`);
-          if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) result.revived += 1;
+          if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) {
+            result.revived += 1;
+            revivedRuns.push(runId.slice(0, 8));
+          }
         } else {
           remove.add(runId); // stopped or finished for good
         }
@@ -860,7 +910,11 @@ export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
         continue;
       }
 
-      if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) result.kicked += 1;
+      if (await postTick(origin, runId, meta.token, SWEEP_POLICY)) {
+        result.kicked += 1;
+        const quietMin = Math.max(1, Math.round((Date.now() - state.updatedAt) / 60_000));
+        kickedRuns.push(`${runId.slice(0, 8)} (${quietMin}m quiet)`);
+      }
     } catch (error) {
       // The store stopped answering (typically rate-limited): abort without
       // pruning — the next sweep retries everything from a healthy store.
@@ -882,6 +936,20 @@ export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
     } catch {
       // Best-effort: stale entries are re-pruned next sweep.
     }
+  }
+
+  // A silent restart looks exactly like a dead run from the dashboard — the
+  // sweep's interventions are the only signal that the chain hiccuped and
+  // recovered. Healthy sweeps stay silent.
+  if (kickedRuns.length > 0 || revivedRuns.length > 0) {
+    const parts: string[] = [];
+    if (kickedRuns.length > 0) {
+      parts.push(`restarted ${kickedRuns.length} stalled run(s): ${kickedRuns.join(", ")}`);
+    }
+    if (revivedRuns.length > 0) {
+      parts.push(`revived ${revivedRuns.length} rate-limited run(s): ${revivedRuns.join(", ")}`);
+    }
+    await notifyTelegram(`🔁 Sweep ${parts.join("; ")}. (${notifyTime(Date.now())})`);
   }
   return result;
 }

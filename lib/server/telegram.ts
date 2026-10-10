@@ -34,5 +34,8 @@ export function notifyTime(at: number): string {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    // Vercel runs in UTC; the operator reads Bangladesh time. NOTIF_TZ lets
+    // an env override it without a code change.
+    timeZone: process.env.NOTIF_TZ ?? "Asia/Dhaka",
   });
 }

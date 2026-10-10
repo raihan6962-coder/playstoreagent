@@ -111,16 +111,6 @@ const MAX_CANDIDATE_QUEUE = 2500;
 /** Detail fetches per step spent on undecided cards. */
 const MAX_CANDIDATE_PER_STEP = 1500;
 /**
- * Home cards that print no rating share the per-step candidate budget at a
- * hard cap instead of flooding it. Measured live at a 3.5 ceiling: 1360 of
- * 1507 rejections in one step were unrated-home verifies, and a 42-card
- * sample passed both ceilings on the detail page just once — while every one
- * of those fetches displaced a search that produces the card-level matches
- * from which all leads actually arrive (baseline step: 10 pending verifies →
- * 2 leads, 1500 candidate verifies → 0).
- */
-const MAX_UNRATED_VERIFY_PER_STEP = 250;
-/**
  * A card summary shorter than this is treated as possibly incomplete (a stub
  * or layout clip) rather than the listing's full text. Measured live: 169 of
  * 170 BD search cards carried ≥300 chars — the description itself — so under
@@ -375,7 +365,6 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let enrichRequests = 0;
   let pendingRequests = 0;
   let candidateRequests = 0;
-  let unratedRequests = 0;
   /** Verification packages that failed this step; retried on the next one instead. */
   const pendingRetried = new Set<string>();
   let parseFailures = 0;
@@ -530,8 +519,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       }
 
       // The card could not settle the verdict on its own: a partial keyword
-      // hit, a decisive number that is missing, or card text that carries no
-      // keyword term at all while the numbers pass.
+      // hit, a decisive install count that is missing, or card text that
+      // carries no keyword term at all while the numbers pass. (A missing
+      // rating is undecided too, but the queue guard below never spends a
+      // fetch on it — see the unrated note.)
       //
       // How much a detail fetch can still change depends on the text the card
       // already showed. Measured live on the BD storefront, a search card
@@ -556,11 +547,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // the title or description (developer/category-only hits can never
       // complete that way either).
       const primaryPartial = evaluation.primaryTerms.length > 0;
-      // A foreign card that prints no rating never earns a fetch: the BD
-      // detail page answers "no rating" for these far more often than it
-      // rescues one, and every such fetch is a verify slot not spent on a
-      // rated home card that passes for certain.
-      const foreignUnrated = !countryFinal && app.rating === null;
+      // A card that prints no rating never earns a fetch, home or foreign.
+      // Measured live: one run spent 785 unrated home verifies and got 0
+      // leads back — 548 detail pages also answered "no rating" and 245
+      // printed over the ceiling — while every one of those fetches was a
+      // window second not spent on a rated card or a fresh search, the two
+      // places leads actually arrive. Rated cards missing only the install
+      // count still fetch: that gap really does close on the detail page.
+      const unrated = app.rating === null;
       const descriptionRescue =
         evaluation.primaryTerms.length === 0 &&
         app.rating !== null &&
@@ -580,7 +574,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             ? "r"
             : null;
       if (
-        !foreignUnrated &&
+        !unrated &&
         queueReason !== null &&
         cardCanStillQualify(app, filters, countryFinal)
       ) {
@@ -643,9 +637,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
    * queue: their printed rating *is* the verified number (100% pass measured,
    * R6b), and a home description-rescue is nearly as good — Play matched the
    * listing on a description the card never showed, which only happens when
-   * the full text really carries the term. Unrated cards and foreign entries
-   * go to the back: unrated fetches measured 521 of 521 wasted verifies, and
-   * foreign cards still carry cross-storefront drift to survive.
+   * the full text really carries the term. Foreign entries go to the back:
+   * they still carry cross-storefront drift to survive. Cards that print no
+   * rating never reach this function at all (see the queue guard in ingest).
    */
   function queueCandidate(
     app: StoreApp,
@@ -681,9 +675,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     // are known-good (research R6b: home cards verify 100%). Home
     // description-rescues go to the front too — Play matched them on a
     // description the card never showed, which is the strongest signal a
-    // rescue has. Unrated cards (home or foreign) and every foreign entry go
-    // to the back: unrated fetches measured 521 of 521 wasted verifies, and
-    // foreign cards carry cross-storefront drift.
+    // rescue has. Foreign entries go to the back: they carry cross-storefront
+    // drift. Unrated cards never queue (ingest blocks them), so the `hu`
+    // origin below only ever exists on cursors written before that change.
     if (front) {
       cursor.candidateQueue.unshift(entry);
     } else {
@@ -1126,13 +1120,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     if (candidateRequests >= MAX_CANDIDATE_PER_STEP) return null;
     for (const entry of cursor.candidateQueue) {
       if (verifyFlight.has(entry.p) || pendingRetried.has(entry.p)) continue;
-      // Unrated home cards get a capped slice of the step's budget: their
-      // measured conversion is a fraction of a percent while every fetch they
-      // take is a search that could produce the rated matches leads come
-      // from. Rated and foreign entries are unaffected — they pass the cap.
-      if (entry.o === "hu" && unratedRequests >= MAX_UNRATED_VERIFY_PER_STEP) continue;
+      // A cursor written before unrated cards stopped queueing may still
+      // hold one: drop it without a fetch — 785 such verifications measured
+      // 0 leads, so the window belongs to rated cards. (dropFromCandidate
+      // reassigns the array; this loop keeps walking its original snapshot.)
+      if (entry.o === "hu") {
+        dropFromCandidate(entry.p);
+        continue;
+      }
       verifyFlight.add(entry.p);
-      if (entry.o === "hu") unratedRequests += 1;
       return runVerifyTask(entry, "candidate").then((outcome) => {
         verifyFlight.delete(entry.p);
         return outcome;

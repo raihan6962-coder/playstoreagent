@@ -841,10 +841,10 @@ describe("runGenerationStep", () => {
     expect(result.reason).toBe("plan-exhausted");
   });
 
-  it("caps unrated home verifications at the per-step budget", async () => {
-    // Unrated cards queue for their one authoritative fetch — but past the
-    // per-step cap they wait for a later step instead of spending the whole
-    // window on the least likely verifies in the run.
+  it("never spends a fetch on a home card that prints no rating", async () => {
+    // Measured live: one run spent 785 unrated home verifies and got 0 leads
+    // back, each one a window second not spent on a rated card or a search.
+    // Such cards now never enter the queue at all.
     const unrated = Array.from({ length: 260 }, (_, index) => ({
       packageName: `com.example.crypto.wallet.dark${index}`,
       title: `Crypto Wallet Dark ${index}`,
@@ -879,12 +879,11 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    expect(result.stats.candidates).toBe(260);
-    expect(result.stats.verifyFromCandidate).toBe(250);
-    expect(result.stats.rejectHomeUnrated).toBe(250);
-    expect(result.cursor?.candidateQueue).toHaveLength(10);
+    expect(result.stats.candidates).toBe(0);
+    expect(result.stats.homeQueued).toBe(0);
+    expect(result.stats.verifyFromCandidate).toBe(0);
+    expect(result.cursor?.candidateQueue).toHaveLength(0);
     expect(harness.leads()).toHaveLength(0);
-    expect(result.reason).toBe("budget-exhausted");
   });
 
   it("never shows a partial match whose detail page still lacks the full keyword", async () => {
@@ -919,9 +918,11 @@ describe("runGenerationStep", () => {
     expect(result.reason).toBe("plan-exhausted");
   });
 
-  it("verifies a fully relevant card whose rating the search card could not report", async () => {
-    // Some cards print no rating at all: the card is relevant and the
-    // installs pass, but without a number the old flow never verified it.
+  it("never queues a fully relevant card whose search card printed no rating", async () => {
+    // The card is relevant and the installs pass, but without a printed
+    // rating the verdict is settled at card level: 785 such detail fetches
+    // measured 0 leads. Even when the detail page would have answered with a
+    // passing number (2.4 here), no fetch is spent finding out.
     const NO_CARD_RATING = {
       packageName: "com.example.budget.dark",
       title: "Budget Tracker Dark",
@@ -944,18 +945,17 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget.dark"]);
-    expect(result.stats.candidates).toBeGreaterThan(0);
-    expect(result.stats.verifyRejected).toBe(0);
-    expect(result.stats.verifyFromCandidate).toBeGreaterThan(0);
-    expect(result.stats.leadFromCandidate).toBe(1);
-    expect(result.stats.leadHomeUnrated).toBe(1);
+    expect(harness.leads()).toHaveLength(0);
+    expect(result.stats.candidates).toBe(0);
+    expect(result.stats.verifyFromCandidate).toBe(0);
+    expect(result.stats.leadFromCandidate).toBe(0);
+    expect(result.stats.leadHomeUnrated).toBe(0);
   });
 
-  it("queues unrated home cards behind rated ones", async () => {
+  it("queues the rated card and keeps the unrated one out", async () => {
     // Live runs measured 521 unrated fetches spending the verify budget ahead
-    // of rated candidates: unrated cards may still get their one authoritative
-    // fetch, but never in front of a card that can pass today.
+    // of rated candidates: the unrated card never queues now, so only the
+    // rated card waits for its fetch.
     const UNRATED = {
       packageName: "com.example.crypto.unrated",
       title: "Crypto Keeper Dark",
@@ -992,9 +992,53 @@ describe("runGenerationStep", () => {
 
     expect(result.cursor?.candidateQueue.map((entry) => entry.p)).toEqual([
       "com.example.crypto.rated",
-      "com.example.crypto.unrated",
     ]);
-    expect(result.stats.homeQueued).toBe(2);
+    expect(result.stats.candidates).toBe(1);
+    expect(result.stats.homeQueued).toBe(1);
+  });
+
+  it("drains a leftover unrated home entry from an older cursor without fetching it", async () => {
+    // Cursors written before unrated cards stopped queueing may still hold
+    // `hu` entries: they leave the queue for free instead of spending a
+    // fetch on a verdict that measured 0 leads across 785 tries.
+    const RATED = {
+      packageName: "com.example.crypto.rated",
+      title: "Crypto Keeper",
+      rating: "2.3",
+      ratingValue: 2.3,
+      installs: "10,000+",
+      summary: "Cold storage",
+    };
+    const harness = collect();
+    const fetched: string[] = [];
+    const client = makeFakeClient({
+      search: () => searchHtml([makeAppEntry(RATED)]),
+      detail: (packageName) => {
+        fetched.push(packageName);
+        throw new Error("network down");
+      },
+    });
+    const cursor = createInitialCursor("crypto wallet");
+    cursor.candidateQueue.push({
+      p: "com.example.legacy.unrated",
+      i: 10_000,
+      s: "Cold storage",
+      o: "hu",
+      q: "n",
+    });
+
+    const result = await runGenerationStep({
+      filters: filters({ keyword: "crypto wallet", limit: 10 }),
+      cursor,
+      budgetMs: 8_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(fetched).not.toContain("com.example.legacy.unrated");
+    expect(result.cursor?.candidateQueue.map((entry) => entry.p)).toEqual([
+      "com.example.crypto.rated",
+    ]);
   });
 
   it("rejects a match whose detail page carries no text of its own", async () => {

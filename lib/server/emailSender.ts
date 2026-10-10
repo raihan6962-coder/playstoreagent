@@ -45,7 +45,15 @@ interface EmailPolicy {
   backoffsMs: number[];
   timeoutMs: number;
 }
-const EMAIL_CHAIN_POLICY: EmailPolicy = { attempts: 5, backoffsMs: [2_000, 5_000, 15_000, 30_000], timeoutMs: 12_000 };
+/**
+ * Chain policy mirrors the run's: a slice always spends the full budget, so
+ * retries are short and bounded by `EMAIL_CHAIN_TIME_BUDGET_MS` at call time
+ * — an unbounded chain here used to push the tick past maxDuration and get
+ * the instance killed mid-backoff, silently.
+ */
+const EMAIL_CHAIN_POLICY: EmailPolicy = { attempts: 3, backoffsMs: [3_000, 8_000], timeoutMs: 12_000 };
+/** Slice budget plus lease/step slack — the chain may not retry past this line. */
+const EMAIL_CHAIN_TIME_BUDGET_MS = 280_000;
 const EMAIL_KICK_POLICY: EmailPolicy = { attempts: 3, backoffsMs: [2_000, 5_000], timeoutMs: 12_000 };
 const EMAIL_SWEEP_POLICY: EmailPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 10_000 };
 
@@ -266,10 +274,19 @@ export async function postEmailTick(
   origin: string,
   task: { id: string; emailToken: string },
   policy: EmailPolicy = EMAIL_CHAIN_POLICY,
+  deadlineAt?: number,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
-    if (attempt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, policy.backoffsMs[attempt - 1] ?? 5_000));
+    const backoffMs = attempt > 0 ? policy.backoffsMs[attempt - 1] ?? 5_000 : 0;
+    if (
+      deadlineAt !== undefined &&
+      Date.now() + backoffMs + policy.timeoutMs > deadlineAt
+    ) {
+      console.error(`email chain out of time budget for ${task.id} before attempt ${attempt + 1}`);
+      return false;
+    }
+    if (backoffMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
     try {
       const response = await fetch(`${origin}/api/tasks/${task.id}/email-tick`, {
@@ -304,6 +321,7 @@ export async function executeEmailTick(
   taskId: string,
   leasedTask: AutomationTask,
 ): Promise<void> {
+  const startedAt = Date.now();
   const intervalMs = Math.max(1, leasedTask.intervalSeconds) * 1_000;
   try {
     const deadline = Date.now() + EMAIL_BUDGET_MS;
@@ -405,7 +423,12 @@ export async function executeEmailTick(
     // Budget slice over: free the lease, then chain — the next slice picks
     // up at nextIndex and honours the interval from lastSentAt.
     await releaseLease(taskId);
-    await postEmailTick(origin, leasedTask, EMAIL_CHAIN_POLICY);
+    await postEmailTick(
+      origin,
+      leasedTask,
+      EMAIL_CHAIN_POLICY,
+      startedAt + EMAIL_CHAIN_TIME_BUDGET_MS,
+    );
   } catch (error) {
     console.error("email tick failed", error);
     // Lease release lets the sweep re-kick once the task goes quiet — but a

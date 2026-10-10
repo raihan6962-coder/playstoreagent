@@ -41,8 +41,13 @@ import type {
   SnapshotStatus,
 } from "@/types/run";
 
-/** One tick's step budget — leaves headroom below the route's maxDuration. */
-const TICK_BUDGET_MS = 240_000;
+/**
+ * One tick's step budget. Deliberately well under the route's maxDuration:
+ * the chained hop that follows needs real time for cold-start fetches (a
+ * 240s step left ~30s for a chain whose POSTs routinely timeout under 25s —
+ * one cold start and the chain was dead again).
+ */
+const TICK_BUDGET_MS = 200_000;
 /** Extra lease time past the budget so clock skew cannot free a live step. */
 const LEASE_MARGIN_MS = 45_000;
 const CHECKPOINT_MS = 10_000;
@@ -735,20 +740,22 @@ interface TickPolicy {
 const CHAIN_POLICY: TickPolicy = {
   attempts: 3,
   backoffsMs: [3_000, 8_000],
-  timeoutMs: 12_000,
+  // Cold starts on the next invocation routinely blow past 12s; that
+  // timeout was turning exactly those hops into silent chain deaths.
+  timeoutMs: 25_000,
 };
 /**
  * How long after its own start executeTick may still spend chaining: the
- * route's maxDuration (300s) minus the 240s step, the final writes, and a
+ * route's maxDuration (300s) minus the 200s step, the final writes, and a
  * margin for the failure alert. postTick stops retrying at this line.
  */
 const CHAIN_TIME_BUDGET_MS = 280_000;
-/** The create route's after() window (60s) — keep the first kick inside it. */
-const KICK_POLICY: TickPolicy = { attempts: 3, backoffsMs: [2_000, 5_000], timeoutMs: 12_000 };
+/** The create route's after() window (60s) — keep the kick inside it. */
+const KICK_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 25_000 };
 /** Resume answers a button click — fail fast; sweep and client retry anyway. */
 const RESUME_POLICY: TickPolicy = { attempts: 2, backoffsMs: [2_000], timeoutMs: 8_000 };
-/** The sweep's own 60s route budget. */
-const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 10_000 };
+/** The sweep's own 120s route budget — it may restart several runs. */
+const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 15_000 };
 
 /**
  * One self-chain hop: POST the tick route, retrying briefly on transient

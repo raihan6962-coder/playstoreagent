@@ -32,7 +32,8 @@ import type { AutomationTask, EmailLog, EmailLogEntry } from "@/types/automation
 import { runLeadsPath } from "@/lib/server/runs";
 
 /** One email tick's send window — headroom under the route's maxDuration. */
-const EMAIL_BUDGET_MS = 240_000;
+/** Send-loop slice — mirrors the run's TICK_BUDGET (see runs.ts). */
+const EMAIL_BUDGET_MS = 200_000;
 const EMAIL_LEASE_MS = 285_000;
 const EMAIL_LOG_MAX = 300;
 /** Systemic failures (bad deployment, revoked access) — abort after this run of reds. */
@@ -51,11 +52,11 @@ interface EmailPolicy {
  * — an unbounded chain here used to push the tick past maxDuration and get
  * the instance killed mid-backoff, silently.
  */
-const EMAIL_CHAIN_POLICY: EmailPolicy = { attempts: 3, backoffsMs: [3_000, 8_000], timeoutMs: 12_000 };
+const EMAIL_CHAIN_POLICY: EmailPolicy = { attempts: 3, backoffsMs: [3_000, 8_000], timeoutMs: 25_000 };
 /** Slice budget plus lease/step slack — the chain may not retry past this line. */
 const EMAIL_CHAIN_TIME_BUDGET_MS = 280_000;
-const EMAIL_KICK_POLICY: EmailPolicy = { attempts: 3, backoffsMs: [2_000, 5_000], timeoutMs: 12_000 };
-const EMAIL_SWEEP_POLICY: EmailPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 10_000 };
+const EMAIL_KICK_POLICY: EmailPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 25_000 };
+const EMAIL_SWEEP_POLICY: EmailPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 15_000 };
 
 function tokenMatches(expected: string, got: string): boolean {
   const a = Buffer.from(expected, "utf8");

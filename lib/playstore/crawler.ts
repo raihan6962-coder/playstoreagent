@@ -393,6 +393,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   ) {
     cursor.cycleQueries = 0;
   }
+  // Counters added with cycles: persisted states minted before them carry no
+  // such fields — without this the first increment would produce NaN.
+  for (const key of ["cycles", "collected", "filtered"] as const) {
+    const current = cursor.counters[key];
+    if (typeof current !== "number" || !Number.isFinite(current) || current < 0) {
+      cursor.counters[key] = 0;
+    }
+  }
   // Stages renamed since: old "search" cursors resume collecting, old
   // "expand" ones resume filtering. Their saved planIndex is clamped to the
   // current cycle's plan below (the old run-global plan no longer exists —

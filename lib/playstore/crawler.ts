@@ -9,11 +9,13 @@ import type {
   Lead,
   LeadFilters,
   PendingVerify,
+  PlanQuery,
   QueryPlanEntry,
   SessionCounters,
   SessionCursor,
   SimilarSeed,
   StoreApp,
+  TempCandidate,
 } from "@/types/lead";
 import {
   PlayClient,
@@ -22,17 +24,18 @@ import {
   PlayRateLimitError,
 } from "./client";
 import { fetchAppDetail } from "./detail";
+import { keywordVariants } from "./keywords";
 import {
-  buildPlanQueries,
+  buildCycleQueries,
   entryAt,
   keepsKeyword,
-  MAX_EXTRA_TAIL,
+  MAX_CYCLE_QUERIES,
+  MAX_KEYWORDS,
   MAX_SUGGESTION_QUERIES,
-  MAX_WAVES,
+  MAX_TEMP_CANDIDATES,
+  MAX_VARIANT_BACKSTOP,
   planSize,
   suggestPrefixes,
-  waveTailSlice,
-  WAVE_QUERIES_PER_WAVE,
 } from "./queryPlan";
 import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
@@ -78,9 +81,9 @@ function clipSummary(summary: string | null): string | null {
 }
 /**
  * Leads waiting for their canonical detail page. Every emitted lead is queued;
- * the search window pulls these first (see `pullSearchTask`) so the rating the
- * table shows is refreshed from the run's own country within seconds instead
- * of waiting for a phase that may never run within the time budget.
+ * the filter stage pulls these first so the rating the table shows is
+ * refreshed from the run's own country within seconds instead of waiting for
+ * the terminal enrich phase.
  */
 const MAX_ENRICH_QUEUE = 1_000;
 /** Enriched detail pages per step before the step reports back to the caller. */
@@ -137,16 +140,6 @@ const BATCH_HEADROOM_MS = 5_000;
  * never be the thing that blows past `maxDuration`.
  */
 const ROUND_HEADROOM_MS = 15_000;
-/**
- * Detail pages and searches share every window: walking "similar apps"
- * measured ~6x the qualified leads per request of a fresh search (see
- * research3.test.ts), so a healthy seed queue gets the larger half of the
- * window — eight of 24 slots — and a sparse queue still gets a quarter.
- */
-const EXPAND_SLOTS_FULL = 16;
-const EXPAND_SLOTS_SPARSE = 6;
-/** Seed queue size considered "healthy" for the full expansion slot share. */
-const EXPAND_QUEUE_HEALTHY = 8;
 
 type TaskOutcome = "ok" | "target" | "rate-limited" | "parse-failure" | "transport-failure";
 
@@ -190,6 +183,9 @@ function emptyCounters(): SessionCounters {
     rejectForeign: 0,
     rejectTextCardBad: 0,
     rejectTextCardGood: 0,
+    cycles: 0,
+    collected: 0,
+    filtered: 0,
   };
 }
 
@@ -264,6 +260,11 @@ export function createInitialCursor(keyword: string): SessionCursor {
     suggestions: [],
     suggestIndex: 0,
     planIndex: 0,
+    keywords: [keyword],
+    keywordIndex: 0,
+    tempCandidates: [],
+    cycleSeen: [],
+    cycleQueries: 0,
     wave: 0,
     waveDiscovered: 0,
     phase: "suggest",
@@ -292,13 +293,12 @@ export interface StepOptions {
   /** Return true when the caller went away; the step then wraps up early. */
   aborted?: () => boolean;
   /**
-   * Keyword-generation round supplier (Groq). When present, every time the
-   * plan runs dry with the target still open the step asks it for a fresh
-   * batch of related search phrases before falling back to the deterministic
-   * waves — the "generate a related keyword, search it, repeat" loop. The
-   * step filters the result against everything already in the plan and caps
-   * the attempt count itself; when absent (unit tests, no API key) the run
-   * goes straight to waves.
+   * Keyword-generation round supplier (Groq). Fired once per cycle miss:
+   * when a keyword's collect → filter cycle ends below target and no queued
+   * keyword remains, the supplier is asked for fresh phrases related to the
+   * MAIN keyword, and each phrase joins the keyword queue as its own future
+   * cycle. When absent (unit tests, no API key) the run falls back to the
+   * deterministic alternates and then stops honestly.
    */
   generateSecondary?: (keyword: string) => Promise<string[]>;
   /**
@@ -372,17 +372,93 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let suggestFailed = false;
   let currentQuery: string | null = null;
 
-  // `let` because the search loop extends the plan when it runs dry: first
-  // with AI keyword rounds (while the generator is available), then with
-  // deterministic wave slices — both append to the cursor's tail, never
-  // reordering what `planIndex` already walked past.
-  let queries = buildPlanQueries(
-    cursor.keyword,
-    suggestions,
-    cursor.secondary,
-    cursor.extraTail,
-  );
-  let totalPlan = planSize(queries);
+  // --- keyword-cycle state (migrates cursors minted before cycles existed) ---
+  if (!Array.isArray(cursor.keywords) || cursor.keywords.length === 0) {
+    cursor.keywords = [cursor.keyword];
+  }
+  if (
+    typeof cursor.keywordIndex !== "number" ||
+    !Number.isInteger(cursor.keywordIndex) ||
+    cursor.keywordIndex < 0 ||
+    cursor.keywordIndex >= cursor.keywords.length
+  ) {
+    cursor.keywordIndex = 0;
+  }
+  if (!Array.isArray(cursor.tempCandidates)) cursor.tempCandidates = [];
+  if (!Array.isArray(cursor.cycleSeen)) cursor.cycleSeen = [];
+  if (
+    typeof cursor.cycleQueries !== "number" ||
+    !Number.isFinite(cursor.cycleQueries) ||
+    cursor.cycleQueries < 0
+  ) {
+    cursor.cycleQueries = 0;
+  }
+  // Stages renamed since: old "search" cursors resume collecting, old
+  // "expand" ones resume filtering. Their saved planIndex is clamped to the
+  // current cycle's plan below (the old run-global plan no longer exists —
+  // unsearched tail queries are superseded by the new cycles).
+  if ((cursor.phase as string) === "search") cursor.phase = "collect";
+  else if ((cursor.phase as string) === "expand") cursor.phase = "filter";
+  const cycleSeenSet = new Set(cursor.cycleSeen);
+  // Package → pool index, rebuilt from the persisted pool: a home-storefront
+  // card supersedes a foreign one already pooled (see stashTemp).
+  const tempIndex = new Map<string, number>();
+  cursor.tempCandidates.forEach((entry, index) => {
+    if (!tempIndex.has(entry.p)) tempIndex.set(entry.p, index);
+  });
+
+  // Round-one AI phrases (primed by the caller before the first step) join
+  // the keyword queue instead of the query plan: every phrase gets its own
+  // collect → filter cycle. Idempotent — re-merging an already-queued phrase
+  // is a no-op, so repeated steps cannot duplicate the queue.
+  if (cursor.secondary.length > 0) {
+    const queued = new Set(cursor.keywords.map((entry) => entry.toLowerCase()));
+    for (const phrase of cursor.secondary) {
+      const trimmed = phrase.trim();
+      if (trimmed.length < 2 || queued.has(trimmed.toLowerCase())) continue;
+      if (cursor.keywords.length >= MAX_KEYWORDS) break;
+      queued.add(trimmed.toLowerCase());
+      cursor.keywords.push(trimmed);
+    }
+  }
+
+  const activeCycleKeyword = (): string =>
+    cursor.keywords[Math.min(cursor.keywordIndex, cursor.keywords.length - 1)] ?? cursor.keyword;
+
+  // The keyword every verdict in this step is judged against. Cycle 0 is the
+  // main keyword (identical to `filters`); later cycles judge against their
+  // own phrase — a secondary harvest is relevant to that phrase, and judging
+  // it against the main keyword would reject everything the cycle searched
+  // for. Only the keyword differs; ceilings, country and target are shared.
+  let activeFilters: LeadFilters = filters;
+  let queries: PlanQuery[] = [];
+  let totalPlan = 0;
+  const rebuildCyclePlan = (): void => {
+    activeFilters = { ...filters, keyword: activeCycleKeyword() };
+    queries = buildCycleQueries(activeFilters.keyword, suggestions);
+    totalPlan = planSize(queries);
+    if (cursor.planIndex > totalPlan) cursor.planIndex = totalPlan;
+  };
+  rebuildCyclePlan();
+
+  /** Opens a keyword cycle: empty pool, plan rewound, filter pending. */
+  const startCycle = (index: number): void => {
+    cursor.keywordIndex = index;
+    cursor.planIndex = 0;
+    cursor.cycleQueries = 0;
+    cursor.cycleSeen = [];
+    cycleSeenSet.clear();
+    cursor.tempCandidates = [];
+    cursor.phase = "collect";
+    rebuildCyclePlan();
+    emit({
+      type: "progress",
+      stats: stats(),
+      message:
+        `Collecting apps for “${activeCycleKeyword()}” (cycle ${index + 1}) — ` +
+        `up to ${MAX_TEMP_CANDIDATES} before filtering…`,
+    });
+  };
 
   const stats = () =>
     buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
@@ -407,6 +483,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     return { reason, message, cursor: result, stats: finalStats };
   };
 
+  /** Query safety cap reached mid-step: keep the phase so Resume continues. */
+  const finishQueryCap = (): StepResult =>
+    finish(
+      "query-cap",
+      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${cursor.counters.matched}/${filters.limit} leads — press Resume to grant another tranche and continue.`,
+      true,
+    );
+
   // Safety backstop — checked before anything is scheduled so a resumed run
   // at its cap stops immediately instead of burning one more batch.
   if (
@@ -421,20 +505,123 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   /**
-   * Returns true when the lead target has been reached. `cardGl` is the
-   * storefront the cards were read from: when it matches the run's country
-   * the printed rating is final, foreign cards still have cross-storefront
-   * drift to give them a chance (see {@link cardCanStillQualify}).
+   * Stashes fresh search/expansion cards into the active cycle's temporary
+   * harvest pool — no verdict yet. The filter stage judges the whole pool at
+   * once, after collection ends. Packages already settled (`seen`) or already
+   * pooled this cycle are skipped as duplicates. Pool overflow still counts
+   * as discovered (the pool refills from the same searches next cycle, once
+   * the filter has drained it).
    */
-  const ingest = (apps: StoreApp[], cardGl: string = filters.country): boolean => {
+  const stashTemp = (apps: StoreApp[], cardGl: string = filters.country): void => {
     const countryFinal = cardGl === filters.country;
     for (const app of apps) {
-      const evaluation = evaluateApp(app, filters, seen);
-
-      if (evaluation.reasons.includes("duplicate")) {
+      // A home-storefront card supersedes a foreign one already pooled: its
+      // printed rating is final, and pooling the foreign card first must not
+      // cost the home evaluation — that is exactly how leads were lost
+      // before (a marked foreign card made the later home search hit the
+      // duplicate path). Anything already settled stays skipped.
+      const pooledAt = tempIndex.get(app.packageName);
+      const pooled = pooledAt !== undefined ? cursor.tempCandidates[pooledAt] : undefined;
+      if (countryFinal && pooled !== undefined && pooled.gl !== filters.country) {
+        cursor.tempCandidates[pooledAt as number] = {
+          p: app.packageName,
+          t: app.title,
+          d: app.developer,
+          r: app.rating,
+          rr: app.ratingRaw,
+          i: app.installs,
+          ir: app.installsRaw,
+          c: app.category,
+          s: clipSummary(app.summary),
+          gl: cardGl,
+        };
+        continue;
+      }
+      if (seen.has(app.packageName) || cycleSeenSet.has(app.packageName)) {
         cursor.counters.duplicates += 1;
         continue;
       }
+      if (cursor.cycleSeen.length < MAX_SEEN_PACKAGES) {
+        cycleSeenSet.add(app.packageName);
+        cursor.cycleSeen.push(app.packageName);
+      }
+      cursor.counters.discovered += 1;
+      if (countryFinal) cursor.counters.homeDiscovered += 1;
+      if (app.rating !== null) {
+        const lowest = cursor.counters.lowestRatingSeen;
+        cursor.counters.lowestRatingSeen =
+          lowest === null || app.rating < lowest ? app.rating : lowest;
+      }
+      // Relevance pre-check: a card whose complete text already fails the
+      // cycle's keyword can never convert this cycle — skip it so the pool
+      // holds only maybes instead of known rejects. Stub or missing text
+      // still stashes (the detail page may complete the keyword), and every
+      // skipped card stays collectible for later cycles (never marked seen
+      // here, and the settle verdict below unmarks irrelevant drops too).
+      const precheck = evaluateApp(app, activeFilters, seen);
+      if (
+        precheck.reasons.includes("not-relevant") &&
+        app.summary !== null &&
+        app.summary.length >= CARD_TEXT_STUB_LENGTH &&
+        app.summary.length < MAX_DESCRIPTION_LENGTH
+      ) {
+        continue;
+      }
+      if (cursor.tempCandidates.length >= MAX_TEMP_CANDIDATES) continue;
+      tempIndex.set(app.packageName, cursor.tempCandidates.length);
+      cursor.tempCandidates.push({
+        p: app.packageName,
+        t: app.title,
+        d: app.developer,
+        r: app.rating,
+        rr: app.ratingRaw,
+        i: app.installs,
+        ir: app.installsRaw,
+        c: app.category,
+        s: clipSummary(app.summary),
+        gl: cardGl,
+      });
+      cursor.counters.collected += 1;
+    }
+  };
+
+  /** Rebuilds the judgable card from a pooled entry (detail fills the rest). */
+  function tempToApp(entry: TempCandidate): StoreApp {
+    return {
+      packageName: entry.p,
+      title: entry.t,
+      developer: entry.d,
+      rating: entry.r,
+      ratingRaw: entry.rr,
+      ratingsCount: null,
+      installs: entry.i,
+      installsRaw: entry.ir,
+      installsUpper: null,
+      category: entry.c,
+      summary: entry.s,
+      description: null,
+      icon: null,
+      urlPath: null,
+    };
+  }
+
+  /**
+   * Settles one pooled card: the card-level verdict (match → verify queue,
+   * partial text or missing installs → candidate queue, hopeless → dropped).
+   * Returns true when the lead target has been reached. Judged against the
+   * *cycle's* keyword — a secondary phrase's harvest is relevant to that
+   * phrase, and judging it against the main keyword would reject everything
+   * the cycle searched for. `cardGl` is the storefront that served the card
+   * (see {@link cardCanStillQualify}).
+   */
+  const settleCard = (app: StoreApp, cardGl: string): boolean => {
+    const countryFinal = cardGl === filters.country;
+    const evaluation = evaluateApp(app, activeFilters, seen);
+
+    if (evaluation.reasons.includes("duplicate")) {
+      cursor.counters.duplicates += 1;
+      return false;
+    }
 
       // A card seen abroad may still qualify at home: the BD detail page
       // never prints *lower* than the foreign card (probe: 10 of 10 agreed or
@@ -446,23 +633,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       const owedHomeCheck =
         !countryFinal &&
         (app.rating === null ||
-          (roundRating(app.rating) <= filters.maxRating &&
-            !cardCanStillQualify(app, filters, countryFinal)));
+          (roundRating(app.rating) <= activeFilters.maxRating &&
+            !cardCanStillQualify(app, activeFilters, countryFinal)));
       if (!owedHomeCheck && seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
-      cursor.counters.discovered += 1;
       cursor.counters.evaluated += 1;
-      if (countryFinal) cursor.counters.homeDiscovered += 1;
-
-      if (app.rating !== null) {
-        const lowest = cursor.counters.lowestRatingSeen;
-        cursor.counters.lowestRatingSeen =
-          lowest === null || app.rating < lowest ? app.rating : lowest;
-      }
 
       if (evaluation.status === "match" && evaluation.lead) {
         const lead = evaluation.lead;
-        if (emitted.has(lead.packageName)) continue;
-        if (cursor.counters.matched >= filters.limit) return true;
+        if (emitted.has(lead.packageName)) return false;
+        if (cursor.counters.matched >= activeFilters.limit) return true;
 
         // The search card's rating came from whichever storefront answered the
         // query, but the table must show this run's country. Queue the package
@@ -473,7 +652,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         // card printed just under the ceiling is a near-certain miss at home
         // (research R9: 0 of 2 passed), and home cards jump the verify queue
         // via their `h` flag (research R6b: home cards verify 100%).
-        const stillQualifies = cardCanStillQualify(app, filters, countryFinal);
+        const stillQualifies = cardCanStillQualify(app, activeFilters, countryFinal);
         if (stillQualifies && cursor.pendingQueue.length < MAX_PENDING_QUEUE) {
           if (!queuedPending.has(lead.packageName)) {
             queuedPending.add(lead.packageName);
@@ -489,7 +668,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             cursor.counters.candidates += 1;
             if (countryFinal) cursor.counters.homePending += 1;
           }
-          continue;
+          return false;
         }
         // Safety valve: the verify queue is overflowing (hundreds of matches
         // inside one window). Show the card-verified lead instead of silently
@@ -502,7 +681,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             })
           )
             return true;
-          continue;
+          return false;
         }
         // Foreign card inside the drift dead band: the card already predicted
         // the rejection. Falls through so the rated card can still seed an
@@ -558,8 +737,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       const descriptionRescue =
         evaluation.primaryTerms.length === 0 &&
         app.rating !== null &&
-        roundRating(app.rating) <= filters.maxRating &&
-        (app.installs === null || app.installs <= filters.maxInstalls);
+        roundRating(app.rating) <= activeFilters.maxRating &&
+        (app.installs === null || app.installs <= activeFilters.maxInstalls);
       const textMayChange =
         app.summary === null ||
         app.summary.length < CARD_TEXT_STUB_LENGTH ||
@@ -576,11 +755,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (
         !unrated &&
         queueReason !== null &&
-        cardCanStillQualify(app, filters, countryFinal)
+        cardCanStillQualify(app, activeFilters, countryFinal)
       ) {
         queueCandidate(app, countryFinal, queueReason, relevant);
       }
-    }
     return false;
   };
 
@@ -810,7 +988,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       transportFailures = 0;
       currentQuery = entry.query;
 
-      if (ingest(result.apps, entry.gl)) return "target";
+      stashTemp(result.apps, entry.gl);
       return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
@@ -855,7 +1033,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       }
       applyDetail(seed.p, detail.app);
 
-      if (ingest(detail.similarApps)) return "target";
+      // Expansion discoveries join the active cycle's harvest pool — the
+      // filter stage settles them in order instead of verifying mid-search.
+      stashTemp(detail.similarApps, filters.country);
       return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
@@ -899,11 +1079,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       parseFailures = 0;
       transportFailures = 0;
 
+      // Enrichment is pure metadata backfill now: expansion walks happen in
+      // the filter stage, where discoveries join the active harvest pool.
       applyDetail(pkg, detail.app);
       if (!expanded.has(pkg)) {
         expanded.add(pkg);
         cursor.expanded.push(pkg);
-        ingest(detail.similarApps);
       }
 
       cursor.enrichQueue = cursor.enrichQueue.filter((item) => item !== pkg);
@@ -1014,7 +1195,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           // reserved for verifications whose numbers never confirmed.
           const evalSeen = new Set(seen);
           evalSeen.delete(entry.p);
-          const evaluation = evaluateApp(app, filters, evalSeen);
+          // Relevance is judged against the cycle's keyword: an app verified
+          // from a secondary phrase's harvest must prove *that* phrase, or
+          // secondary cycles could never convert.
+          const evaluation = evaluateApp(app, activeFilters, evalSeen);
           if (evaluation.status === "match" && evaluation.lead) {
             settled = true;
             target = emitLead(evaluation.lead, { from: queue, origin });
@@ -1055,7 +1239,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (detail.app && detail.app.packageName === entry.p && !expanded.has(entry.p)) {
         expanded.add(entry.p);
         cursor.expanded.push(entry.p);
-        if (ingest(detail.similarApps)) return "target";
+        // Similar apps join the active cycle's harvest pool — settled by the
+        // filter stage in order. Seeding already happened above for relevant
+        // near-misses, so nothing here can reach the target directly.
+        stashTemp(detail.similarApps, filters.country);
       }
       return "ok";
     } catch (error) {
@@ -1145,11 +1332,11 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   while (cursor.phase === "suggest") {
     const prefixes = suggestPrefixes(cursor.keyword);
     if (cursor.suggestIndex >= prefixes.length) {
-      cursor.phase = "search";
+      startCycle(0);
       break;
     }
     if (suggestions.length >= MAX_SUGGESTION_QUERIES) {
-      cursor.phase = "search";
+      startCycle(0);
       break;
     }
     if (!hasTimeForRequest()) {
@@ -1212,8 +1399,122 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
   }
 
-  // ---------------------------------------------------------------- search --
-  while (cursor.phase === "search") {
+  /**
+   * Opens the next keyword cycle after a miss, or reports the run terminal.
+   * Priority: queued keywords first, then one AI round (asked against the
+   * MAIN keyword so every phrase stays in its neighbourhood), then built-in
+   * alternate phrases — but only once AI was attempted at least once this run
+   * (the run-level prime), so runs without a generator stop honestly instead
+   * of wandering deterministically. Declared at step scope (not inside the
+   * cycle loop below) so both the filter stage and the terminal pass share it.
+   */
+  async function advanceCycle(): Promise<"continue" | StepResult> {
+    const next = cursor.keywordIndex + 1;
+    if (next < cursor.keywords.length) {
+      startCycle(next);
+      return "continue";
+    }
+
+    const generate = options.generateSecondary;
+    if (
+      generate !== undefined &&
+      cursor.secondaryRounds < MAX_SECONDARY_ROUNDS &&
+      cursor.dryRounds < MAX_CONSECUTIVE_DRY_ROUNDS
+    ) {
+      // A round is one Groq call (10s). Only start it when a whole round
+      // still fits: generation must never be the thing that blows the budget.
+      if (!hasTimeForRequest(ROUND_HEADROOM_MS)) {
+        return finish(
+          "budget-exhausted",
+          "Time budget reached for this step — resume to continue.",
+          true,
+        );
+      }
+      const round = cursor.secondaryRounds + 1;
+      emit({
+        type: "progress",
+        stats: stats(),
+        message: `Main keyword swept without hitting the target — generating related keywords (round ${round} of ${MAX_SECONDARY_ROUNDS})…`,
+      });
+      let fresh: string[] = [];
+      try {
+        fresh = await generate(cursor.keyword);
+      } catch {
+        fresh = [];
+      }
+      cursor.secondaryRounds = round;
+      const queued = new Set(cursor.keywords.map((entry) => entry.toLowerCase()));
+      const room = Math.max(0, MAX_KEYWORDS - cursor.keywords.length);
+      const added = fresh
+        .map((phrase) => phrase.trim())
+        .filter((phrase) => phrase.length >= 2 && !queued.has(phrase.toLowerCase()))
+        .slice(0, room);
+      if (added.length > 0) {
+        cursor.dryRounds = 0;
+        for (const phrase of added) cursor.keywords.push(phrase);
+        startCycle(next);
+        emit({
+          type: "progress",
+          stats: stats(),
+          message: `Queued ${added.length} related keywords (round ${round}) — collecting them one by one…`,
+        });
+        return "continue";
+      }
+      cursor.dryRounds += 1;
+      emit({
+        type: "progress",
+        stats: stats(),
+        message: `Round ${round} produced no new keywords — falling back to built-in alternates.`,
+      });
+    }
+
+    if (cursor.secondaryTried) {
+      const queued = new Set(cursor.keywords.map((entry) => entry.toLowerCase()));
+      const alternates = keywordVariants(cursor.keyword)
+        .filter((phrase) => !queued.has(phrase.toLowerCase()))
+        .slice(0, MAX_VARIANT_BACKSTOP);
+      const room = Math.max(0, MAX_KEYWORDS - cursor.keywords.length);
+      if (alternates.length > 0 && room > 0) {
+        for (const phrase of alternates.slice(0, room)) cursor.keywords.push(phrase);
+        startCycle(next);
+        emit({
+          type: "progress",
+          stats: stats(),
+          message: `Trying built-in alternate keywords for “${cursor.keyword}”…`,
+        });
+        return "continue";
+      }
+    }
+
+    // Leads waiting on metadata backfill get it before any terminal verdict:
+    // without this handoff the enrich phase would never run on a run whose
+    // cycles all completed.
+    if (cursor.enrichQueue.length > 0) {
+      cursor.phase = "enrich";
+      return "continue";
+    }
+
+    if (cursor.counters.discovered === 0) {
+      return finish(
+        "no-results",
+        `No apps were found for “${filters.keyword}”. Try a broader keyword.`,
+        false,
+      );
+    }
+    return finish(
+      "plan-exhausted",
+      `Only ${cursor.counters.matched} matching app${cursor.counters.matched === 1 ? " was" : "s were"} found before the available results were exhausted.`,
+      false,
+    );
+  }
+
+  // --------------------------------------- cycles: collect → filter → enrich, repeat --
+  // Each keyword gets one harvest (collect: searches only) and one verdict
+  // (filter: settle the pool, verify, expand), then metadata backfill
+  // (enrich), then the run advances to the next keyword until the target
+  // hits. Every stage resumes mid-flow across steps via the cursor.
+  for (;;) {
+  while (cursor.phase === "collect" || cursor.phase === "filter") {
     if (cursor.counters.matched >= filters.limit) {
       cursor.phase = "enrich";
       break;
@@ -1226,75 +1527,24 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       );
     }
 
-    let expandCredit = 0;
-    let pullsWithoutSearch = 0;
-    const enrichFlight = new Set<string>();
-    const pullSearchTask = (): Promise<TaskOutcome> | null => {
-      // Queued verifications come first: that detail page is the only gate
-      // before a lead may appear, so a match found this very window reaches
-      // the table as soon as it is confirmed — and never before. On transient
-      // failures the package stays queued for the next step, so a null return
-      // here just falls through to the queues below.
-      //
-      // Exception: once three pulls in a row went to verify/enrich/expand,
-      // the plan gets the next slot while it still has queries left.
-      // Measured in production: without that reserve a fresh run spent its
-      // whole first minute on detail fetches — the query counter sat at 37
-      // while 866 pages were fetched — which delays the niche queries that
-      // produce most matches, and with them the first lead.
-      const planRemains = entryAt(queries, cursor.planIndex, filters.country) !== null;
-      if (pullsWithoutSearch < 3 || !planRemains) {
-        const verify = pullVerifyTask();
-        if (verify) {
-          pullsWithoutSearch += 1;
-          return verify;
-        }
-
-        // Then backfill metadata for leads already on screen (their ratings
-        // count, if the detail page carried none at verification time).
-        if (enrichRequests + enrichFlight.size < MAX_ENRICH_PER_STEP) {
-          for (const pkg of cursor.enrichQueue) {
-            if (enrichFlight.has(pkg)) continue;
-            enrichFlight.add(pkg);
-            pullsWithoutSearch += 1;
-            return runEnrichTask(pkg).then((outcome) => {
-              enrichFlight.delete(pkg);
-              return outcome;
-            });
-          }
-        }
-
-        const seedsAvailable =
-          cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
-        if (seedsAvailable) {
-          expandCredit +=
-            (cursor.similarQueue.length >= EXPAND_QUEUE_HEALTHY
-              ? EXPAND_SLOTS_FULL
-              : EXPAND_SLOTS_SPARSE) / SEARCH_CONCURRENCY;
-        }
-        if (expandCredit >= 1) {
-          const [seed] = takeSeeds(1);
-          if (seed) {
-            expandCredit = Math.min(expandCredit - 1, 1);
-            pullsWithoutSearch += 1;
-            return runExpandTask(seed);
-          }
-          expandCredit = 0;
-        }
+    // --------------------------------------------------------------- collect --
+    // One keyword's harvest: searches ONLY — no verify, enrich or expand pulls
+    // compete for slots, so the pool fills at full search concurrency. Cards
+    // land in the temporary pool (`stashTemp`); the filter stage judges them
+    // after collection ends.
+    if (cursor.phase === "collect") {
+      if (
+        options.queryBudget !== undefined &&
+        cursor.counters.queriesRun >= options.queryBudget
+      ) {
+        return finishQueryCap();
       }
 
-      const seedsAvailable =
-        cursor.similarQueue.length > 0 && expandRequests < MAX_EXPAND_REQUESTS;
-      const entry = planRemains ? entryAt(queries, cursor.planIndex, filters.country) : null;
-      if (!entry) {
-        if (!seedsAvailable) return null;
-        const [seed] = takeSeeds(1);
-        if (!seed) return null;
-        pullsWithoutSearch += 1;
-        return runExpandTask(seed);
-      }
+    const pullCollectTask = (): Promise<TaskOutcome> | null => {
+      const entry = entryAt(queries, cursor.planIndex, filters.country);
+      if (!entry) return null;
       cursor.planIndex += 1;
-      pullsWithoutSearch = 0;
+      cursor.cycleQueries += 1;
       currentQuery = entry.query;
       emit({
         type: "progress",
@@ -1304,165 +1554,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       return runSearchTask(entry);
     };
 
-    const outcomes = await runWindow(SEARCH_CONCURRENCY, pullSearchTask, () =>
-      cursor.counters.matched < filters.limit &&
-      hasTimeForRequest(BATCH_HEADROOM_MS) &&
-      parseFailures < MAX_PARSE_FAILURES &&
-      transportFailures < MAX_TRANSPORT_FAILURES,
-    );
-
-    const failure = batchFailure(outcomes);
-    if (failure) return failure;
-    if (outcomes.includes("target")) {
-      cursor.phase = "enrich";
-      break;
-    }
-    if (cursor.planIndex >= totalPlan || entryAt(queries, cursor.planIndex, filters.country) === null) {
-      // The plan ran out before the lead limit: keep generating. Two
-      // append-only extension paths, priority order — first the AI rounds
-      // ("generate a related keyword from the main keyword and search it,
-      // repeat"), then the deterministic long-tail waves. Both push onto
-      // `cursor.extraTail`, the plan's monotonic tail, so `planIndex` stays
-      // valid; a wave that finds no new app means the reachable supply under
-      // these ceilings is genuinely exhausted — then (and only then) the
-      // search phase ends honestly.
-      const generate = options.generateSecondary;
-      const wantsRound =
-        generate !== undefined &&
-        cursor.secondaryRounds < MAX_SECONDARY_ROUNDS &&
-        cursor.dryRounds < MAX_CONSECUTIVE_DRY_ROUNDS;
-
-      // A round is one Groq call (10s). Only gate on it — appending a wave
-      // or advancing the phase is pure CPU and must keep working even when
-      // the step's budget is nearly spent, so a run with no generator (or
-      // with rounds spent) never turns a wave decision into a timeout.
-      if (wantsRound && !hasTimeForRequest(ROUND_HEADROOM_MS)) {
-        // Keep `phase = "search"`: the next step resumes this exact decision
-        // instead of advancing phases on a plan that was never extended.
-        return finish(
-          "budget-exhausted",
-          "Time budget reached for this step — resume to continue.",
-          true,
-        );
-      }
-
-      if (wantsRound && generate !== undefined) {
-        const round = cursor.secondaryRounds + 1;
-        emit({
-          type: "progress",
-          stats: stats(),
-          message: `Main keyword swept without hitting the target — generating related keywords (round ${round} of ${MAX_SECONDARY_ROUNDS})…`,
-        });
-        let fresh: string[] = [];
-        try {
-          fresh = await generate(cursor.keyword);
-        } catch {
-          fresh = [];
-        }
-        cursor.secondaryRounds = round;
-        const used = new Set(queries.map((item) => item.query.toLowerCase()));
-        const room = Math.max(0, MAX_EXTRA_TAIL - cursor.extraTail.length);
-        const added = fresh
-          .map((phrase) => phrase.trim())
-          .filter((phrase) => phrase.length >= 2 && !used.has(phrase.toLowerCase()))
-          .slice(0, room);
-        if (added.length > 0) {
-          cursor.dryRounds = 0;
-          for (const phrase of added) {
-            cursor.extraTail.push({ query: phrase, kind: "suggestion" });
-          }
-          queries = buildPlanQueries(
-            cursor.keyword,
-            suggestions,
-            cursor.secondary,
-            cursor.extraTail,
-          );
-          totalPlan = planSize(queries);
-          emit({
-            type: "progress",
-            stats: stats(),
-            message: `Queued ${added.length} related keywords (round ${round}) — searching and filtering them now…`,
-          });
-          continue;
-        }
-        cursor.dryRounds += 1;
-        emit({
-          type: "progress",
-          stats: stats(),
-          message: `Round ${round} produced no new keywords — continuing with the built-in query plan.`,
-        });
-      }
-
-      if (cursor.wave < MAX_WAVES && cursor.counters.discovered > cursor.waveDiscovered) {
-        const slice = waveTailSlice(
-          cursor.keyword,
-          suggestions,
-          cursor.secondary,
-          cursor.wave * WAVE_QUERIES_PER_WAVE,
-          WAVE_QUERIES_PER_WAVE,
-        );
-        const room = Math.max(0, MAX_EXTRA_TAIL - cursor.extraTail.length);
-        if (slice.length > 0) {
-          cursor.extraTail.push(...slice.slice(0, room));
-        }
-        cursor.wave += 1;
-        cursor.waveDiscovered = cursor.counters.discovered;
-        queries = buildPlanQueries(
-          cursor.keyword,
-          suggestions,
-          cursor.secondary,
-          cursor.extraTail,
-        );
-        totalPlan = planSize(queries);
-        emit({
-          type: "progress",
-          stats: stats(),
-          message: `Lead limit not reached yet — extending the query plan (wave ${cursor.wave} of ${MAX_WAVES}).`,
-        });
-        continue;
-      }
-
-      cursor.phase = "expand";
-      break;
-    }
-  }
-
-  // ---------------------------------------------------------------- expand --
-  while (cursor.phase === "expand") {
-    if (cursor.counters.matched >= filters.limit) {
-      cursor.phase = "enrich";
-      break;
-    }
-    if (cursor.similarQueue.length === 0) {
-      cursor.phase = "enrich";
-      break;
-    }
-    if (expandRequests >= MAX_EXPAND_REQUESTS) {
-      return finish(
-        "budget-exhausted",
-        "Exploring related apps — resume to continue.",
-        true,
-      );
-    }
-    if (!hasTimeForRequest(BATCH_HEADROOM_MS)) {
-      return finish(
-        "budget-exhausted",
-        "Time budget reached for this step — resume to continue.",
-        true,
-      );
-    }
-
     const outcomes = await runWindow(
       SEARCH_CONCURRENCY,
-      () => {
-        const verify = pullVerifyTask();
-        if (verify) return verify;
-        const [seed] = takeSeeds(1);
-        return seed ? runExpandTask(seed) : null;
-      },
+      pullCollectTask,
       () =>
         cursor.counters.matched < filters.limit &&
-        expandRequests < MAX_EXPAND_REQUESTS &&
+        cursor.tempCandidates.length < MAX_TEMP_CANDIDATES &&
+        cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        (options.queryBudget === undefined ||
+          cursor.counters.queriesRun < options.queryBudget) &&
         hasTimeForRequest(BATCH_HEADROOM_MS) &&
         parseFailures < MAX_PARSE_FAILURES &&
         transportFailures < MAX_TRANSPORT_FAILURES,
@@ -1470,9 +1570,116 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
     const failure = batchFailure(outcomes);
     if (failure) return failure;
-    if (outcomes.includes("target")) {
+    if (
+      options.queryBudget !== undefined &&
+      cursor.counters.queriesRun >= options.queryBudget
+    ) {
+      return finishQueryCap();
+    }
+    // Harvest window over: judge the pool now (even on a time-out — the next
+    // step resumes in the filter stage instead of re-collecting).
+    emit({
+      type: "progress",
+      stats: stats(),
+      message:
+        `Collected ${cursor.tempCandidates.length} apps for “${activeCycleKeyword()}” — ` +
+        `filtering by rating ≤ ${activeFilters.maxRating} and installs ≤ ${activeFilters.maxInstalls} now…`,
+    });
+    cursor.phase = "filter";
+    }
+
+  // ---------------------------------------------------------------- filter --
+  // One keyword's verdict: settle the temporary pool in order (match → verify
+  // queue, partial text or missing installs → candidate queue, hopeless →
+  // dropped), then drain the verify queues while walking similar-app seeds.
+  // Expansion discoveries rejoin the same pool. When pool and queues are all
+  // empty the cycle completes: target check, then the next keyword cycle.
+  if (cursor.phase === "filter") {
+    // Settle pass: pure CPU, no requests — every pooled card gets its
+    // card-level verdict and leaves the pool (queued or dropped). Settling
+    // consumes the temporary store, so a finished cycle carries nothing over.
+    let hitTarget = false;
+    while (cursor.tempCandidates.length > 0 && hasTimeForRequest(REQUEST_HEADROOM_MS)) {
+      const pooled = cursor.tempCandidates.shift();
+      if (!pooled) break;
+      cursor.counters.filtered += 1;
+      if (settleCard(tempToApp(pooled), pooled.gl)) {
+        hitTarget = true;
+        break;
+      }
+    }
+    if (hitTarget) {
       cursor.phase = "enrich";
       break;
+    }
+
+    const verifyOutcomes = await runWindow(
+      SEARCH_CONCURRENCY,
+      () => {
+        const verify = pullVerifyTask();
+        if (verify) return verify;
+        if (expandRequests >= MAX_EXPAND_REQUESTS) return null;
+        const [seed] = takeSeeds(1);
+        return seed ? runExpandTask(seed) : null;
+      },
+      () =>
+        cursor.counters.matched < filters.limit &&
+        hasTimeForRequest(BATCH_HEADROOM_MS) &&
+        parseFailures < MAX_PARSE_FAILURES &&
+        transportFailures < MAX_TRANSPORT_FAILURES,
+    );
+
+    const verifyFailure = batchFailure(verifyOutcomes);
+    if (verifyFailure) return verifyFailure;
+    if (verifyOutcomes.includes("target")) {
+      cursor.phase = "enrich";
+      break;
+    }
+
+    if (
+      cursor.tempCandidates.length === 0 &&
+      cursor.pendingQueue.length === 0 &&
+      cursor.candidateQueue.length === 0
+    ) {
+      // Harvest unfinished (the pool filled mid-plan and drained, or the
+      // window yielded): resume collecting the same cycle instead of
+      // abandoning its remaining plan.
+      if (
+        cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        entryAt(queries, cursor.planIndex, filters.country) !== null
+      ) {
+        cursor.phase = "collect";
+        continue;
+      }
+      // Cycle complete: pool bookkeeping discarded (already empty), the
+      // cycle counted, then either stop on target or open the next keyword.
+      cursor.tempCandidates = [];
+      cursor.cycleSeen = [];
+      cycleSeenSet.clear();
+      cursor.counters.cycles += 1;
+      emit({
+        type: "progress",
+        stats: stats(),
+        message: `Finished “${activeCycleKeyword()}” — ${cursor.counters.matched}/${filters.limit} leads so far.`,
+      });
+      if (cursor.counters.matched >= filters.limit) {
+        cursor.phase = "enrich";
+        break;
+      }
+      const advanced = await advanceCycle();
+      if (advanced === "continue") continue;
+      return advanced;
+    }
+
+    if (verifyOutcomes.length === 0 && cursor.tempCandidates.length === 0) {
+      // The queues hold only entries already retried this step (transport
+      // kept failing them): nothing more can settle before the next step.
+      return finish(
+        "budget-exhausted",
+        "Verifying the queued candidates — resume to continue.",
+        true,
+      );
+    }
     }
   }
 
@@ -1541,6 +1748,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   // ------------------------------------------------------------------ done --
+  // Terminal pass after the stages: target check, then leftover queues (never
+  // discard work the run already spent requests on), then the next cycle.
   if (cursor.counters.matched >= filters.limit) {
     return finish(
       "target-reached",
@@ -1549,9 +1758,6 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     );
   }
 
-  // A terminal decision with candidates still pending would silently discard
-  // leads the run already spent searches on, so report back and let the next
-  // step (or the dashboard's auto-resume) drain the queues first.
   if (cursor.pendingQueue.length > 0) {
     return finish(
       "budget-exhausted",
@@ -1568,7 +1774,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     );
   }
 
-  if (cursor.enrichQueue.length > 0 && enrichRequests >= MAX_ENRICH_PER_STEP) {
+  if (cursor.enrichQueue.length > 0) {
     return finish(
       "budget-exhausted",
       "Backfilling details for the collected leads — resume to continue.",
@@ -1584,20 +1790,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     );
   }
 
-  if (cursor.counters.discovered === 0) {
-    return finish(
-      "no-results",
-      `No apps were found for “${filters.keyword}”. Try a broader keyword.`,
-      false,
-    );
+  const advanced = await advanceCycle();
+  if (advanced === "continue") continue;
+  return advanced;
   }
-
-  return finish(
-    "plan-exhausted",
-    `Only ${cursor.counters.matched} matching app${cursor.counters.matched === 1 ? " was" : "s were"} found before the available results were exhausted.` +
-      (cursor.wave > 0
-        ? ` Searched through ${cursor.wave + 1} query waves — no further apps under the given rating/install limits exist in the reachable results.`
-        : ""),
-    false,
-  );
 }

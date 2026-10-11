@@ -4,6 +4,7 @@ import {
   runGenerationStep,
 } from "@/lib/playstore/crawler";
 import {
+  buildCycleQueries,
   buildPlanQueries,
   keepsKeyword,
   MAX_SUGGESTION_QUERIES,
@@ -445,13 +446,14 @@ describe("runGenerationStep", () => {
     expect(messages.some((message) => message.includes("Fetching details"))).toBe(true);
   });
 
-  it("keeps generating through fresh query waves when the base plan runs dry", async () => {
+  it("opens the next keyword cycle when the main cycle runs dry", async () => {
     const harness = collect();
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
     const cursor = createInitialCursor(KEYWORD);
-    // A run that already walked the whole base plan but is far below the limit.
-    cursor.phase = "search";
-    cursor.planIndex = planSize(buildPlanQueries(KEYWORD));
+    // A run that already walked the whole main cycle but is far below the limit.
+    cursor.phase = "collect";
+    cursor.keywords = [KEYWORD, "budget planner"];
+    cursor.planIndex = planSize(buildCycleQueries(KEYWORD, cursor.suggestions));
     cursor.counters.discovered = 5;
     cursor.counters.evaluated = 5;
     cursor.seen = [
@@ -470,22 +472,20 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    expect(cursor.wave).toBe(1);
-    expect(harness.messages().some((message) => message.includes("extending the query plan"))).toBe(true);
+    expect(cursor.keywordIndex).toBe(1);
+    expect(cursor.counters.cycles).toBeGreaterThanOrEqual(1);
+    expect(harness.messages().some((message) => message.includes("budget planner"))).toBe(true);
     expect(result.reason).toBe("plan-exhausted");
-    expect(result.message).toContain("2 query waves");
-    expect(result.message).toContain("Only 0 matching apps were found");
   });
 
-  it("stops honestly when an extra wave finds nothing new", async () => {
+  it("stops honestly when the keyword cycles are exhausted", async () => {
     const harness = collect();
     const client = makeFakeClient({ search: () => searchRoutes(), detail: detailRoute });
     const cursor = createInitialCursor(KEYWORD);
-    cursor.phase = "search";
-    cursor.planIndex = planSize(buildPlanQueries(KEYWORD));
+    cursor.phase = "collect";
+    cursor.planIndex = planSize(buildCycleQueries(KEYWORD, cursor.suggestions));
     cursor.counters.discovered = 5;
     cursor.counters.evaluated = 5;
-    cursor.waveDiscovered = 5; // the last wave already ran with this many discoveries
 
     const result = await runGenerationStep({
       filters: filters({ limit: 100 }),
@@ -495,10 +495,10 @@ describe("runGenerationStep", () => {
       client,
     });
 
-    expect(cursor.wave).toBe(0);
-    expect(harness.messages().some((message) => message.includes("extending the query plan"))).toBe(false);
+    expect(cursor.counters.cycles).toBe(1);
+    expect(harness.messages().some((message) => message.includes("cycle 2"))).toBe(false);
     expect(result.reason).toBe("plan-exhausted");
-    expect(result.message).not.toContain("query waves");
+    expect(result.message).toContain("Only 0 matching apps were found");
   });
 
   it("never shows a lead whose detail page returns 404", async () => {
@@ -583,7 +583,7 @@ describe("runGenerationStep", () => {
     });
 
     const cursor = createInitialCursor(KEYWORD);
-    cursor.phase = "search";
+    cursor.phase = "collect";
     // Index 1 of the sweep for country US is a foreign storefront (US owns
     // index 0), so the first searches read every card abroad: GOOD_TWO
     // printed 2.7 sits between the 2.0 fetch gate and the 3.0 ceiling —
@@ -663,7 +663,7 @@ describe("runGenerationStep", () => {
     // queued for verification: the step must come back resumable instead of
     // dropping the candidate or emitting it unverified.
     const cursor = createInitialCursor(KEYWORD);
-    cursor.phase = "search";
+    cursor.phase = "collect";
     const partial = await runGenerationStep({
       filters: filters({ limit: 50 }),
       cursor,

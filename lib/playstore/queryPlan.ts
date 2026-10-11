@@ -26,6 +26,25 @@ export const MAX_WAVES = 16;
  * Sized for 16 waves × 120 + 5 keyword rounds × 100 phrases with headroom.
  */
 export const MAX_EXTRA_TAIL = 3_000;
+/**
+ * Harvest-pool cap per keyword cycle: how many cards one keyword may stash
+ * into its temporary pool before the filter stage starts judging them.
+ */
+export const MAX_TEMP_CANDIDATES = 400;
+/**
+ * Search requests spent collecting a single keyword cycle before its filter
+ * runs regardless. Bounds a duplicate-heavy cycle: repeats keep costing
+ * requests, and the run-level query budget is the only other backstop.
+ */
+export const MAX_CYCLE_QUERIES = 3_000;
+/** Cap on the keyword queue (main keyword + AI phrases + built-in alternates). */
+export const MAX_KEYWORDS = 60;
+/**
+ * Built-in alternate phrases added to the keyword queue per fallthrough once
+ * AI generation goes dry. Small enough that a dry run still terminates
+ * promptly, large enough to keep a keyless run productive.
+ */
+export const MAX_VARIANT_BACKSTOP = 8;
 
 const VARIANT_SUFFIXES = [
   "app",
@@ -207,7 +226,7 @@ export function dedupePlan(plan: QueryPlanEntry[], limit = MAX_PLAN_SIZE): Query
 }
 
 /** Deterministic queries used when the suggest endpoint is unavailable. */
-function baseQuerySpecs(keyword: string): PlanQuery[] {
+export function baseQuerySpecs(keyword: string): PlanQuery[] {
   const tokens = tokenizeKeyword(keyword);
   const specs: PlanQuery[] = [];
 
@@ -339,6 +358,38 @@ function buildHead(
   }
 
   return { out, seen };
+}
+
+/**
+ * The query list for ONE keyword cycle: deterministic base queries, the
+ * locally generated topic-consistent variants, then the Play suggestions
+ * that still mention every significant token of *this* cycle's keyword.
+ *
+ * Unlike the run-global plan, a cycle never carries other keywords'
+ * phrases — each keyword is collected and filtered on its own before the run
+ * moves on, which is what makes per-keyword harvest pools and per-keyword
+ * relevance verdicts possible. AI-generated phrases become their own cycles
+ * instead of plan entries.
+ */
+export function buildCycleQueries(keyword: string, suggestions: string[] = []): PlanQuery[] {
+  const out: PlanQuery[] = [];
+  const seen = new Set<string>();
+  const push = (query: string, kind: QueryKind): void => {
+    const trimmed = query.trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed.length === 0 || seen.has(key)) return;
+    seen.add(key);
+    out.push({ query: trimmed, kind });
+  };
+
+  for (const spec of baseQuerySpecs(keyword)) push(spec.query, spec.kind);
+  for (const variant of keywordVariants(keyword)) push(variant, "variant");
+  for (const suggestion of suggestions) {
+    const trimmed = suggestion.trim();
+    if (trimmed.length === 0 || !keepsKeyword(keyword, trimmed)) continue;
+    push(trimmed, "suggestion");
+  }
+  return out;
 }
 
 /**

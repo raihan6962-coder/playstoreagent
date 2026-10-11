@@ -57,7 +57,7 @@ export interface LeadFilters {
   country: string;
 }
 
-export type SessionPhase = "suggest" | "search" | "expand" | "enrich" | "done";
+export type SessionPhase = "suggest" | "collect" | "filter" | "enrich" | "done";
 
 export type PriceFilter = "all" | "free" | "paid";
 
@@ -153,6 +153,15 @@ export interface SessionCounters {
   rejectTextCardBad: number;
   /** Text-bucket split: card text passed at queue time but the detail page re-check failed (page variant / text drift). */
   rejectTextCardGood: number;
+  /** Keyword cycles fully collected and filtered (main keyword = cycle 0). */
+  cycles: number;
+  /**
+   * Cards stashed into the active cycle's temporary harvest pool.
+   * Monotonic — never decremented (the pool itself is discarded per cycle).
+   */
+  collected: number;
+  /** Harvest-pool cards settled by the filter (queued for verification or dropped). */
+  filtered: number;
 }
 
 export interface GenerationStats extends SessionCounters {
@@ -164,6 +173,36 @@ export interface GenerationStats extends SessionCounters {
   /** Extra query waves appended so far (0 = the base plan). */
   wave: number;
   elapsedMs: number;
+}
+
+/**
+ * One card of a keyword cycle's temporary harvest pool: everything a cycle's
+ * searches found, saved before any filtering decision. Slim on purpose — just
+ * the fields the card-level verdict needs. The pool lives inside the cursor
+ * (single-writer, resumable across ticks) and is discarded the moment the
+ * cycle's filter drains it, so it can never bloat the persisted state.
+ */
+export interface TempCandidate {
+  /** Package name. */
+  p: string;
+  /** Listing title. */
+  t: string;
+  /** Developer name. */
+  d: string | null;
+  /** Printed rating (null when the card showed none). */
+  r: number | null;
+  /** Raw printed rating text. */
+  rr: string | null;
+  /** Parsed install count. */
+  i: number | null;
+  /** Raw install bucket text. */
+  ir: string | null;
+  /** Play category. */
+  c: string | null;
+  /** Card summary (clipped). */
+  s: string | null;
+  /** Storefront country code that served the card. */
+  gl: string;
 }
 
 /**
@@ -207,6 +246,35 @@ export interface SessionCursor {
   suggestIndex: number;
   /** Index into the query × storefront cross product (see queryPlan.ts). */
   planIndex: number;
+  /**
+   * Ordered keyword queue: the main keyword first, then AI-generated and
+   * built-in alternate phrases. Each entry gets one collect → filter cycle —
+   * search it, harvest its cards, filter them, save the verified leads —
+   * before the run moves on, and the run keeps cycling until the lead target
+   * hits. Grows as AI rounds produce fresh phrases (capped).
+   */
+  keywords: string[];
+  /** Index of the keyword whose cycle is currently active. */
+  keywordIndex: number;
+  /**
+   * The active cycle's temporary harvest pool (see {@link TempCandidate}).
+   * Search results land here during the collect stage; the filter stage
+   * consumes them in order. Always empty outside an unfinished cycle — a
+   * finished cycle discards its pool instead of carrying it forward, which is
+   * what keeps the persisted cursor small no matter how many apps a keyword
+   * surfaced.
+   */
+  tempCandidates: TempCandidate[];
+  /**
+   * Packages already harvested into this cycle's pool. Cleared with the pool
+   * at cycle end. Exists so a resumed collect does not re-stash the same
+   * cards, while the global `seen` set is only marked when a card is actually
+   * settled (a foreign card that still owes its home evaluation must stay
+   * unmarked, exactly as before).
+   */
+  cycleSeen: string[];
+  /** Search requests spent inside the active cycle's collect stage. */
+  cycleQueries: number;
   /**
    * How many extra query waves have been appended to the plan. The session
    * keeps generating until the lead limit is hit: when the base plan runs

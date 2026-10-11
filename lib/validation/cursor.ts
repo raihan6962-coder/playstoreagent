@@ -2,15 +2,33 @@ import { MAX_CONSECUTIVE_DRY_ROUNDS, MAX_SECONDARY_ROUNDS } from "@/lib/keywords
 import {
   buildPlanQueries,
   legacyWaveTail,
+  MAX_CYCLE_QUERIES,
   MAX_EXTRA_TAIL,
+  MAX_KEYWORDS,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
   planSize,
   suggestPrefixes,
 } from "@/lib/playstore/queryPlan";
-import type { PendingVerify, PlanQuery, SessionCursor, SimilarSeed } from "@/types/lead";
+import type {
+  PendingVerify,
+  PlanQuery,
+  SessionCursor,
+  SimilarSeed,
+  TempCandidate,
+} from "@/types/lead";
 
-const PHASES = new Set(["suggest", "search", "expand", "enrich", "done"]);
+const PHASES = new Set(["suggest", "collect", "filter", "enrich", "done"]);
+/**
+ * Stages renamed since: cursors minted by the old code resume in the matching
+ * new stage. Their saved planIndex is validated against the old plan shape
+ * below (unchanged); the crawler clamps it to the current cycle's plan at
+ * step start, since unsearched tail queries are superseded by the new cycles.
+ */
+const LEGACY_PHASES: Record<string, SessionCursor["phase"]> = {
+  search: "collect",
+  expand: "filter",
+};
 const QUERY_KINDS = new Set([
   "primary",
   "suggestion",
@@ -25,6 +43,9 @@ const MAX_SUGGESTION_LENGTH = 80;
 /** Tail entries may combine a keyword with two modifiers — longer than a bare suggestion. */
 const MAX_TAIL_QUERY_LENGTH = 160;
 const MAX_SEEN = 40_000;
+const MAX_TEMP_POOL = 400;
+const MAX_TEMP_SUMMARY = 1_000;
+const MAX_CYCLE_SEEN = 10_000;
 const MAX_EMITTED = 1_000;
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
@@ -110,8 +131,59 @@ function parsePending(value: unknown, cap: number): PendingVerify[] | null {
   return out;
 }
 
-function parseCounters(value: unknown): SessionCursor["counters"] | null {
-  if (!isRecord(value)) return null;
+/**
+ * The active cycle's temporary harvest pool. Self-healing instead of strict:
+ * the pool is recomputable working state (its searches simply re-run), so a
+ * malformed entry is dropped while the rest of the cursor survives — the
+ * opposite of the verify queues, where a dropped entry would lose a lead the
+ * run already spent requests on.
+ */
+function parseTempCandidates(value: unknown): TempCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const out: TempCandidate[] = [];
+  for (const item of value.slice(0, MAX_TEMP_POOL)) {
+    if (!isRecord(item)) continue;
+    if (typeof item.p !== "string" || item.p.length === 0) continue;
+    if (typeof item.t !== "string") continue;
+    const opt = (field: unknown): string | null =>
+      typeof field === "string" ? field : null;
+    const num = (field: unknown): number | null =>
+      typeof field === "number" && Number.isFinite(field) ? field : null;
+    if (
+      (item.d !== undefined && item.d !== null && typeof item.d !== "string") ||
+      (item.rr !== undefined && item.rr !== null && typeof item.rr !== "string") ||
+      (item.ir !== undefined && item.ir !== null && typeof item.ir !== "string") ||
+      (item.c !== undefined && item.c !== null && typeof item.c !== "string")
+    ) {
+      continue;
+    }
+    if (
+      (item.r !== undefined && item.r !== null && num(item.r) === null) ||
+      (item.i !== undefined && item.i !== null && num(item.i) === null)
+    ) {
+      continue;
+    }
+    const summary = opt(item.s);
+    out.push({
+      p: item.p,
+      t: item.t,
+      d: opt(item.d),
+      r: num(item.r),
+      rr: opt(item.rr),
+      i: num(item.i),
+      ir: opt(item.ir),
+      c: opt(item.c),
+      s:
+        summary !== null && summary.length > MAX_TEMP_SUMMARY
+          ? summary.slice(0, MAX_TEMP_SUMMARY)
+          : summary,
+      gl: typeof item.gl === "string" && item.gl.length === 2 ? item.gl.toUpperCase() : "US",
+    });
+  }
+  return out;
+}
+
+function parseCounters(value: unknown): SessionCursor["counters"] | null {  if (!isRecord(value)) return null;
   const numeric = [
     "discovered",
     "evaluated",
@@ -158,6 +230,9 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {
     "rejectForeign",
     "rejectTextCardBad",
     "rejectTextCardGood",
+    "cycles",
+    "collected",
+    "filtered",
   ] as const;
   for (const key of optional) {
     const current = (value as Record<string, unknown>)[key];
@@ -175,8 +250,11 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {
 export function sanitizeCursor(input: unknown, keyword: string): SessionCursor | null {
   if (!isRecord(input)) return null;
   if (input.keyword !== keyword) return null;
-  if (typeof input.phase !== "string" || !PHASES.has(input.phase)) return null;
-  if (input.phase === "done") return null;
+  if (typeof input.phase !== "string") return null;
+  const phase = PHASES.has(input.phase)
+    ? (input.phase as SessionCursor["phase"])
+    : LEGACY_PHASES[input.phase] ?? null;
+  if (phase === null || phase === "done") return null;
 
   const suggestions = asStringArray(input.suggestions, MAX_SUGGESTION_QUERIES, MAX_SUGGESTION_LENGTH);
   if (!suggestions) return null;
@@ -249,8 +327,37 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
   const suggestIndex = asIndex(input.suggestIndex, suggestPrefixes(keyword).length);
   // Strict: the tail is capped at push time, so a saved planIndex past the
   // rebuilt plan can only mean a tampered or corrupted cursor — restart it.
+  // (Validated against the run-global plan shape, which the crawler narrows
+  // to the active cycle's plan at step start.)
   const planIndex = asIndex(input.planIndex, total);
   if (suggestIndex === null || planIndex === null) return null;
+
+  // Keyword queue: optional so cursors minted before cycles existed resume on
+  // the main keyword. Strict when present — the queue drives every query, so
+  // a malformed one restarts the run instead of searching garbage.
+  const keywordsRaw = input.keywords;
+  const keywords =
+    keywordsRaw === undefined || keywordsRaw === null
+      ? [keyword]
+      : asStringArray(keywordsRaw, MAX_KEYWORDS, MAX_SUGGESTION_LENGTH);
+  if (!keywords || keywords.length === 0) return null;
+  const keywordIndexRaw = input.keywordIndex;
+  const keywordIndex =
+    keywordIndexRaw === undefined || keywordIndexRaw === null
+      ? 0
+      : asIndex(keywordIndexRaw, keywords.length - 1);
+  if (keywordIndex === null) return null;
+
+  // Temporary harvest pool + per-cycle dedupe set: self-healing (see
+  // parseTempCandidates) — worst case the active cycle re-collects.
+  const tempCandidates = parseTempCandidates(input.tempCandidates);
+  const cycleSeen = asStringArray(input.cycleSeen, MAX_CYCLE_SEEN) ?? [];
+  const cycleQueriesRaw = input.cycleQueries;
+  const cycleQueries =
+    cycleQueriesRaw === undefined || cycleQueriesRaw === null
+      ? 0
+      : asIndex(cycleQueriesRaw, MAX_CYCLE_QUERIES);
+  if (cycleQueries === null) return null;
 
   const seen = asStringArray(input.seen, MAX_SEEN);
   const emitted = asStringArray(input.emitted, MAX_EMITTED);
@@ -270,9 +377,14 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     suggestions,
     suggestIndex,
     planIndex,
+    keywords,
+    keywordIndex,
+    tempCandidates,
+    cycleSeen,
+    cycleQueries,
     wave,
     waveDiscovered,
-    phase: input.phase as SessionCursor["phase"],
+    phase,
     seen,
     emitted,
     similarQueue,

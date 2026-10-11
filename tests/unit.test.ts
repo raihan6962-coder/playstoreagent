@@ -176,6 +176,66 @@ describe("sanitizeCursor", () => {
     expect(sanitizeCursor({ ...cursor, dryRounds: "lots" }, "budget tracker")).toBeNull();
   });
 
+  it("defaults the keyword queue, pool and cycle counters for older cursors", () => {
+    const legacy = createInitialCursor("budget tracker") as unknown as Record<string, unknown>;
+    delete legacy.keywords;
+    delete legacy.keywordIndex;
+    delete legacy.tempCandidates;
+    delete legacy.cycleSeen;
+    delete legacy.cycleQueries;
+    const counters = legacy.counters as Record<string, unknown>;
+    delete counters.cycles;
+    delete counters.collected;
+    delete counters.filtered;
+
+    const restored = sanitizeCursor(legacy, "budget tracker");
+    expect(restored?.keywords).toEqual(["budget tracker"]);
+    expect(restored?.keywordIndex).toBe(0);
+    expect(restored?.tempCandidates).toEqual([]);
+    expect(restored?.cycleSeen).toEqual([]);
+    expect(restored?.cycleQueries).toBe(0);
+    expect(restored?.counters.cycles).toBe(0);
+    expect(restored?.counters.collected).toBe(0);
+    expect(restored?.counters.filtered).toBe(0);
+  });
+
+  it("maps legacy search/expand stages onto collect/filter", () => {
+    const cursor = createInitialCursor("budget tracker");
+    expect(sanitizeCursor({ ...cursor, phase: "search" }, "budget tracker")?.phase).toBe("collect");
+    expect(sanitizeCursor({ ...cursor, phase: "expand" }, "budget tracker")?.phase).toBe("filter");
+  });
+
+  it("rejects a keyword index past the queue and an empty queue", () => {
+    const cursor = createInitialCursor("budget tracker");
+    expect(sanitizeCursor({ ...cursor, keywordIndex: 4 }, "budget tracker")).toBeNull();
+    expect(sanitizeCursor({ ...cursor, keywords: [] }, "budget tracker")).toBeNull();
+    expect(sanitizeCursor({ ...cursor, keywords: "nope" }, "budget tracker")).toBeNull();
+  });
+
+  it("drops malformed pool entries instead of restarting the run", () => {
+    // The pool is recomputable working state (its searches simply re-run),
+    // so one bad entry must not discard the whole cursor with it.
+    const cursor = createInitialCursor("budget tracker");
+    const good = {
+      p: "com.example.a",
+      t: "Budget Tracker",
+      d: null,
+      r: 2.1,
+      rr: "2.1",
+      i: 10_000,
+      ir: "10,000+",
+      c: "Finance",
+      s: "Track your budget",
+      gl: "US",
+    };
+    const restored = sanitizeCursor(
+      { ...cursor, tempCandidates: [good, { p: 42 }, null] },
+      "budget tracker",
+    );
+    expect(restored?.tempCandidates).toHaveLength(1);
+    expect(restored?.tempCandidates[0]).toMatchObject({ p: "com.example.a", gl: "US" });
+  });
+
   it("accepts a planIndex that only fits once secondary phrases are included", () => {
     const cursor = createInitialCursor("budget tracker");
     cursor.suggestions = ["budget tracker app"];

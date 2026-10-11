@@ -274,7 +274,7 @@ describe("resume cursor", () => {
     cursor.planIndex = 300;
     cursor.seen = ["com.a", "com.b"];
     cursor.emitted = ["com.a"];
-    cursor.phase = "search";
+    cursor.phase = "collect";
 
     const restored = sanitizeCursor(JSON.parse(JSON.stringify(cursor)), KEYWORD);
     expect(restored).not.toBeNull();
@@ -296,7 +296,9 @@ describe("resume cursor", () => {
 
   it("replays a legacy cursor's waves into the tail and rejects impossible waves", () => {
     const cursor = createInitialCursor(KEYWORD);
-    cursor.phase = "search";
+    // Simulate a cursor minted by the old code: the old "search" stage and
+    // wave-count-only tails. The validator maps the stage onto "collect".
+    (cursor as unknown as Record<string, unknown>).phase = "search";
     cursor.wave = 2;
     // Simulate a cursor minted by the old code: waves existed only as a
     // count, so no tail was stored yet.

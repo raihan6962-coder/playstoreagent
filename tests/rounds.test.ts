@@ -76,8 +76,9 @@ describe("AI keyword rounds", () => {
     });
 
     // Rounds are asked against the MAIN keyword so every phrase stays in its
-    // neighbourhood.
-    expect(generate).toHaveBeenCalledWith(KEYWORD);
+    // neighbourhood, with the tried phrases attached so the model opens
+    // fresh ground instead of reshuffling.
+    expect(generate).toHaveBeenCalledWith(KEYWORD, expect.any(Array));
     expect(cursor.keywords).toContain("budget planner");
     expect(cursor.secondaryRounds).toBeGreaterThanOrEqual(1);
     expect(harness.messages().some((message) => message.includes(`round 1 of ${MAX_SECONDARY_ROUNDS}`))).toBe(
@@ -233,6 +234,82 @@ describe("AI keyword rounds", () => {
     expect(result.reason).toBe("plan-exhausted");
   });
 
+  it("ends a stale cycle early instead of burning its whole plan", async () => {
+    // Every search re-returns seen apps: after hundreds of searches with
+    // nothing new, the cycle gives up and the run moves on — late-cycle
+    // queries otherwise re-request the same seen apps thousands of times.
+    const harness = collect();
+    const client = makeFakeClient({ search: searchRoutes, detail: detailRoute });
+    const cursor = dryCursor();
+    cursor.keywords = [KEYWORD, "budget planner"];
+    cursor.planIndex = 0;
+    cursor.cycleQueries = 0;
+
+    const result = await runGenerationStep({
+      filters: filters(),
+      cursor,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+    });
+
+    expect(cursor.keywordIndex).toBe(1);
+    expect(cursor.counters.cycles).toBeGreaterThanOrEqual(1);
+    // Hundreds of stagnant searches per cycle, not the ~4,300-request plan.
+    expect(cursor.counters.queriesRun).toBeLessThan(1_000);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("converts a main-relevant app discovered in a secondary cycle", async () => {
+    // GOOD answers the main keyword but not "expense manager": found late
+    // (the main cycle never searched here), it must still convert under the
+    // main keyword instead of dying as irrelevant in a cycle that was never
+    // about it.
+    const harness = collect();
+    const client = makeFakeClient({
+      search: searchRoutes,
+      detail: (packageName: string) => {
+        // The zombie stays off-topic on its own page too.
+        if (packageName === "com.example.zombie") {
+          return detailHtml(
+            {
+              packageName: "com.example.zombie",
+              title: "Zombie Run Adventure",
+              rating: "1.9",
+              ratingValue: 1.9,
+              installs: "5,000+",
+              summary: "Run from the undead horde",
+            },
+            [],
+            "5,000+",
+          );
+        }
+        return detailRoute(packageName);
+      },
+    });
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.keywords = [KEYWORD, "expense manager"];
+    cursor.planIndex = planSize(buildCycleQueries(KEYWORD, []));
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 10 }),
+      cursor,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+    });
+
+    const names = harness.leads().map((lead) => lead.packageName).sort();
+    expect(names).toEqual(["com.example.budget", "com.example.budget.mini"]);
+    expect(harness.leads().every((lead) => lead.keyword === KEYWORD)).toBe(true);
+    expect(result.stats.matched).toBe(2);
+    // The funnel now explains itself: over-ceiling, over-install and
+    // off-topic cards are counted at the card level.
+    expect(result.stats.cardDropRating).toBeGreaterThan(0);
+    expect(result.stats.cardDropInstalls).toBeGreaterThan(0);
+    expect(result.stats.cardDropIrrelevant).toBeGreaterThan(0);
+  });
+
   it("judges a secondary cycle against its own keyword and cleans its pool", async () => {
     // "Expense Manager" carries none of the main keyword's words: the main
     // cycle's harvest must skip it, and the secondary cycle must convert it —
@@ -266,6 +343,9 @@ describe("AI keyword rounds", () => {
     expect(harness.leads()[0].keyword).toBe("expense manager");
     expect(result.stats.matched).toBe(1);
     expect(result.stats.collected).toBe(1);
+    // The main cycle's harvest skipped it at the gate (complete text, wrong
+    // topic) instead of spending a verify on it.
+    expect(result.stats.cardDropIrrelevant).toBe(1);
     expect(cursor.counters.cycles).toBe(2);
     // The temporary pool never survives its cycle.
     expect(cursor.tempCandidates).toHaveLength(0);

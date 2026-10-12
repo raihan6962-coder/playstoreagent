@@ -38,13 +38,20 @@ export const MAX_TEMP_CANDIDATES = 400;
  */
 export const MAX_CYCLE_QUERIES = 3_000;
 /** Cap on the keyword queue (main keyword + AI phrases + built-in alternates). */
-export const MAX_KEYWORDS = 60;
+export const MAX_KEYWORDS = 100;
 /**
  * Built-in alternate phrases added to the keyword queue per fallthrough once
  * AI generation goes dry. Small enough that a dry run still terminates
  * promptly, large enough to keep a keyless run productive.
  */
 export const MAX_VARIANT_BACKSTOP = 8;
+/**
+ * Consecutive collect-stage searches that stashed nothing new before the
+ * cycle gives up on its neighbourhood. Late-cycle queries re-return the same
+ * seen apps (measured: half a million duplicates in one run), so a stale
+ * cycle ends after hundreds — not thousands — of wasted requests.
+ */
+export const MAX_STAGNANT_QUERIES = 300;
 
 const VARIANT_SUFFIXES = [
   "app",

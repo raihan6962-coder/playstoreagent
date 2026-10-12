@@ -162,6 +162,15 @@ export interface SessionCounters {
   collected: number;
   /** Harvest-pool cards settled by the filter (queued for verification or dropped). */
   filtered: number;
+  /**
+   * Card-level kills, by cause (reason hits, not cards — one card can trip
+   * several): rating over the ceiling, installs over the cap, keyword text
+   * miss. The verdict funnel for "why did this cycle collect N but verify
+   * almost none".
+   */
+  cardDropRating: number;
+  cardDropInstalls: number;
+  cardDropIrrelevant: number;
 }
 
 export interface GenerationStats extends SessionCounters {
@@ -275,6 +284,13 @@ export interface SessionCursor {
   cycleSeen: string[];
   /** Search requests spent inside the active cycle's collect stage. */
   cycleQueries: number;
+  /**
+   * Consecutive collect-stage searches that stashed nothing new. When a
+   * cycle's neighbourhood goes stale (every card already seen) this trips
+   * first, so a dead cycle ends after hundreds — not thousands — of wasted
+   * requests. Reset by any stash and by every new cycle.
+   */
+  stagnantQueries: number;
   /**
    * How many extra query waves have been appended to the plan. The session
    * keeps generating until the lead limit is hit: when the base plan runs

@@ -64,6 +64,30 @@ describe("PlayClient concurrency", () => {
     ).rejects.toBeInstanceOf(PlayRateLimitError);
   });
 
+  it("treats consent walls as pushback, not parse errors", async () => {
+    // A consent interstitial is throttling: the run must back off and resume
+    // later, never misdiagnose a redesign and die.
+    globalThis.fetch = (async () =>
+      new Response("<html><body>consent wall</body></html>", { status: 200 })) as typeof fetch;
+
+    const client = new PlayClient({ concurrency: 1, intervalMs: 1, retries: 0 });
+    await expect(
+      client.get("https://play.google.com/store/search?c=apps&q=x"),
+    ).rejects.toBeInstanceOf(PlayRateLimitError);
+  });
+
+  it("treats large unusual-traffic pages as pushback", async () => {
+    // Bot walls also arrive as full pages — past the small-body sniff — so
+    // the marker check must not depend on size.
+    const big = `<html><body>${"pad ".repeat(2000)}unusual traffic from your computer network</body></html>`;
+    globalThis.fetch = (async () => new Response(big, { status: 200 })) as typeof fetch;
+
+    const client = new PlayClient({ concurrency: 1, intervalMs: 1, retries: 0 });
+    await expect(
+      client.get("https://play.google.com/store/search?c=apps&q=x"),
+    ).rejects.toBeInstanceOf(PlayRateLimitError);
+  });
+
   it("times out when headers arrive but the body never does", async () => {
     // Regression: the abort timer used to be cleared the moment headers
     // arrived, so a throttled connection that stalled the payload blocked

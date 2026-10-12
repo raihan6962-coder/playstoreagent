@@ -10,7 +10,7 @@ import {
   MAX_SUGGESTION_QUERIES,
   planSize,
 } from "@/lib/playstore/queryPlan";
-import { PlayHttpError } from "@/lib/playstore/client";
+import { PlayClient, PlayHttpError } from "@/lib/playstore/client";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
 
@@ -381,21 +381,68 @@ describe("runGenerationStep", () => {
     expect(client.requests).toBe(0);
   });
 
-  it("reports a hard failure when Play's markup can no longer be read", async () => {
+  it("backs off resumably when Play answers with a consent wall", async () => {
+    // A consent interstitial is throttling, not a redesign: the run pauses
+    // with `rate-limited` (the sweep revives it) instead of dying as a
+    // structure failure. Uses a real client so the pushback routing runs;
+    // the suggest endpoint answers 429 too, which the step must skip fast
+    // instead of re-asking a throttled endpoint all window.
     const harness = collect();
-    const client = makeFakeClient({ search: () => "<html><body>consent wall</body></html>" });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("batchexecute")) {
+        return new Response("slow down", { status: 429 });
+      }
+      if (url.includes("/store/search")) {
+        return new Response("<html><body>consent wall</body></html>", { status: 200 });
+      }
+      const pkg = new URL(url).searchParams.get("id") ?? "";
+      return new Response(detailRoute(pkg), { status: 200 });
+    }) as typeof fetch;
+    const client = new PlayClient({ concurrency: 32, intervalMs: 1, retries: 0 });
+
+    try {
+      const result = await runGenerationStep({
+        filters: filters(),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 8_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(result.reason).toBe("rate-limited");
+      expect(result.cursor).not.toBeNull();
+      expect(result.message).toContain("temporarily rejected");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("survives a transient cluster of unreadable pages instead of failing", async () => {
+    // A handful of garbled pages in a row used to end the whole run; over a
+    // long run such clusters are routine throttling noise. The run carries
+    // on, and only a persistently unreadable storefront still fails it.
+    let calls = 0;
+    const harness = collect();
+    const client = makeFakeClient({
+      search: () => {
+        calls += 1;
+        if (calls <= 10) return "<html><body>garbage without result data</body></html>";
+        return searchRoutes();
+      },
+      detail: detailRoute,
+    });
 
     const result = await runGenerationStep({
-      filters: filters(),
+      filters: filters({ limit: 1 }),
       cursor: createInitialCursor(KEYWORD),
       budgetMs: 8_000,
       emit: harness.emit,
       client,
     });
 
-    expect(result.reason).toBe("failed");
-    expect(result.cursor).toBeNull();
-    expect(result.message).toContain("page structure");
+    expect(harness.leads()).toHaveLength(1);
+    expect(result.reason).toBe("target-reached");
   });
 
   it("keeps counters consistent across a resume", async () => {
@@ -882,7 +929,10 @@ describe("runGenerationStep", () => {
     expect(result.stats.candidates).toBe(0);
     expect(result.stats.homeQueued).toBe(0);
     expect(result.stats.verifyFromCandidate).toBe(0);
-    expect(result.cursor?.candidateQueue).toHaveLength(0);
+    // Nothing to verify and no further keywords: the run ends honestly
+    // instead of burning the window on fetches that measured 0 leads.
+    expect(result.reason).toBe("plan-exhausted");
+    expect(result.cursor).toBeNull();
     expect(harness.leads()).toHaveLength(0);
   });
 

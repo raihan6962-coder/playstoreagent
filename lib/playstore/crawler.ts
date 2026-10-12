@@ -1,4 +1,5 @@
 import { cardCanStillQualify, detailAppQualifies, evaluateApp } from "@/lib/filters/leadFilter";
+import type { Evaluation } from "@/lib/filters/leadFilter";
 import { MAX_CONSECUTIVE_DRY_ROUNDS, MAX_SECONDARY_ROUNDS } from "@/lib/keywords/secondary";
 import { MAX_DESCRIPTION_LENGTH } from "@/lib/parser/appEntries";
 import { roundRating } from "@/lib/parser/rating";
@@ -31,6 +32,7 @@ import {
   keepsKeyword,
   MAX_CYCLE_QUERIES,
   MAX_KEYWORDS,
+  MAX_STAGNANT_QUERIES,
   MAX_SUGGESTION_QUERIES,
   MAX_TEMP_CANDIDATES,
   MAX_VARIANT_BACKSTOP,
@@ -126,10 +128,22 @@ const CARD_TEXT_STUB_LENGTH = 300;
  * the resume cursor small enough to round trip through the browser.
  */
 const MAX_SEEN_PACKAGES = 10_000;
-/** Consecutive malformed pages before we assume Play changed its markup. */
-const MAX_PARSE_FAILURES = 6;
-/** Consecutive transport failures before we give up. */
-const MAX_TRANSPORT_FAILURES = 8;
+/**
+ * Consecutive malformed pages before we assume Play changed its markup. High
+ * on purpose: a throttled session serves bot-wall pages that parse as
+ * garbage, and over a 25k-query run a cluster of half a dozen transient bad
+ * pages is routine — killing the run there once ended an 8-lead run that had
+ * barely started its second cycle. A real redesign still trips this within a
+ * window or two (every search fails), while transient clusters ride through
+ * on the successes that reset the count.
+ */
+const MAX_PARSE_FAILURES = 30;
+/**
+ * Consecutive transport failures before we give up. Same reasoning as the
+ * parse threshold: flaky stretches cluster, and only a persistently dead
+ * route should end the run.
+ */
+const MAX_TRANSPORT_FAILURES = 24;
 /** Remaining time (ms) below which we no longer start a new request. */
 const REQUEST_HEADROOM_MS = 1_500;
 /** A parallel batch needs more slack than a single request. */
@@ -186,6 +200,9 @@ function emptyCounters(): SessionCounters {
     cycles: 0,
     collected: 0,
     filtered: 0,
+    cardDropRating: 0,
+    cardDropInstalls: 0,
+    cardDropIrrelevant: 0,
   };
 }
 
@@ -265,6 +282,7 @@ export function createInitialCursor(keyword: string): SessionCursor {
     tempCandidates: [],
     cycleSeen: [],
     cycleQueries: 0,
+    stagnantQueries: 0,
     wave: 0,
     waveDiscovered: 0,
     phase: "suggest",
@@ -297,10 +315,13 @@ export interface StepOptions {
    * when a keyword's collect → filter cycle ends below target and no queued
    * keyword remains, the supplier is asked for fresh phrases related to the
    * MAIN keyword, and each phrase joins the keyword queue as its own future
-   * cycle. When absent (unit tests, no API key) the run falls back to the
-   * deterministic alternates and then stops honestly.
+   * cycle. `tried` carries the phrases already queued or searched so the
+   * model opens fresh neighbourhoods instead of reshuffling the same head
+   * terms (which just re-returns the same apps). When absent (unit tests, no
+   * API key) the run falls back to the deterministic alternates and then
+   * stops honestly.
    */
-  generateSecondary?: (keyword: string) => Promise<string[]>;
+  generateSecondary?: (keyword: string, tried: string[]) => Promise<string[]>;
   /**
    * Safety backstop: stop with `query-cap` once `counters.queriesRun`
    * reaches this many queries. Granted per run by the state store and topped
@@ -393,13 +414,29 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   ) {
     cursor.cycleQueries = 0;
   }
-  // Counters added with cycles: persisted states minted before them carry no
+  // Counters added after launch: persisted states minted before them carry no
   // such fields — without this the first increment would produce NaN.
-  for (const key of ["cycles", "collected", "filtered"] as const) {
+  for (
+    const key of [
+      "cycles",
+      "collected",
+      "filtered",
+      "cardDropRating",
+      "cardDropInstalls",
+      "cardDropIrrelevant",
+    ] as const
+  ) {
     const current = cursor.counters[key];
     if (typeof current !== "number" || !Number.isFinite(current) || current < 0) {
       cursor.counters[key] = 0;
     }
+  }
+  if (
+    typeof cursor.stagnantQueries !== "number" ||
+    !Number.isFinite(cursor.stagnantQueries) ||
+    cursor.stagnantQueries < 0
+  ) {
+    cursor.stagnantQueries = 0;
   }
   // Stages renamed since: old "search" cursors resume collecting, old
   // "expand" ones resume filtering. Their saved planIndex is clamped to the
@@ -454,6 +491,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.keywordIndex = index;
     cursor.planIndex = 0;
     cursor.cycleQueries = 0;
+    cursor.stagnantQueries = 0;
     cursor.cycleSeen = [];
     cycleSeenSet.clear();
     cursor.tempCandidates = [];
@@ -513,15 +551,44 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   }
 
   /**
+   * Card verdict with union relevance: judged against the cycle's keyword
+   * first, falling back to the main keyword. A secondary phrase's harvest is
+   * relevant to that phrase — but an app the earlier cycles missed that
+   * answers the MAIN keyword must still convert instead of dying as
+   * "not-relevant" in a cycle that was never about it. The returned lead (if
+   * any) already carries the matching keyword, since the verdict was built
+   * with that keyword's filters.
+   */
+  const evaluateCycled = (
+    app: StoreApp,
+    seenSet: ReadonlySet<string>,
+  ): { evaluation: Evaluation; keyword: string } => {
+    const primary = evaluateApp(app, activeFilters, seenSet);
+    if (!primary.reasons.includes("not-relevant")) {
+      return { evaluation: primary, keyword: activeCycleKeyword() };
+    }
+    if (activeFilters.keyword === filters.keyword) {
+      return { evaluation: primary, keyword: activeCycleKeyword() };
+    }
+    const fallback = evaluateApp(app, { ...activeFilters, keyword: filters.keyword }, seenSet);
+    if (!fallback.reasons.includes("not-relevant")) {
+      return { evaluation: fallback, keyword: filters.keyword };
+    }
+    return { evaluation: primary, keyword: activeCycleKeyword() };
+  };
+
+  /**
    * Stashes fresh search/expansion cards into the active cycle's temporary
    * harvest pool — no verdict yet. The filter stage judges the whole pool at
    * once, after collection ends. Packages already settled (`seen`) or already
    * pooled this cycle are skipped as duplicates. Pool overflow still counts
    * as discovered (the pool refills from the same searches next cycle, once
-   * the filter has drained it).
+   * the filter has drained it). Returns how many cards made progress (stashed
+   * or upgraded) — the stagnation guard's input.
    */
-  const stashTemp = (apps: StoreApp[], cardGl: string = filters.country): void => {
+  const stashTemp = (apps: StoreApp[], cardGl: string = filters.country): number => {
     const countryFinal = cardGl === filters.country;
+    let progress = 0;
     for (const app of apps) {
       // A home-storefront card supersedes a foreign one already pooled: its
       // printed rating is final, and pooling the foreign card first must not
@@ -543,6 +610,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           s: clipSummary(app.summary),
           gl: cardGl,
         };
+        progress += 1;
         continue;
       }
       if (seen.has(app.packageName) || cycleSeenSet.has(app.packageName)) {
@@ -560,19 +628,20 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         cursor.counters.lowestRatingSeen =
           lowest === null || app.rating < lowest ? app.rating : lowest;
       }
-      // Relevance pre-check: a card whose complete text already fails the
-      // cycle's keyword can never convert this cycle — skip it so the pool
-      // holds only maybes instead of known rejects. Stub or missing text
-      // still stashes (the detail page may complete the keyword), and every
-      // skipped card stays collectible for later cycles (never marked seen
-      // here, and the settle verdict below unmarks irrelevant drops too).
-      const precheck = evaluateApp(app, activeFilters, seen);
+      // Relevance pre-check: a card whose complete text already fails BOTH
+      // the cycle's keyword and the main keyword can never convert — skip it
+      // so the pool holds only maybes instead of known rejects. Stub or
+      // missing text still stashes (the detail page may complete the
+      // keyword), and every skipped card stays collectible for later cycles
+      // (never marked seen here).
+      const precheck = evaluateCycled(app, seen);
       if (
-        precheck.reasons.includes("not-relevant") &&
+        precheck.evaluation.reasons.includes("not-relevant") &&
         app.summary !== null &&
         app.summary.length >= CARD_TEXT_STUB_LENGTH &&
         app.summary.length < MAX_DESCRIPTION_LENGTH
       ) {
+        cursor.counters.cardDropIrrelevant += 1;
         continue;
       }
       if (cursor.tempCandidates.length >= MAX_TEMP_CANDIDATES) continue;
@@ -590,7 +659,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         gl: cardGl,
       });
       cursor.counters.collected += 1;
+      progress += 1;
     }
+    return progress;
   };
 
   /** Rebuilds the judgable card from a pooled entry (detail fills the rest). */
@@ -616,20 +687,24 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   /**
    * Settles one pooled card: the card-level verdict (match → verify queue,
    * partial text or missing installs → candidate queue, hopeless → dropped).
-   * Returns true when the lead target has been reached. Judged against the
-   * *cycle's* keyword — a secondary phrase's harvest is relevant to that
-   * phrase, and judging it against the main keyword would reject everything
-   * the cycle searched for. `cardGl` is the storefront that served the card
+   * Returns true when the lead target has been reached. Judged with union
+   * relevance (see {@link evaluateCycled}): the cycle's keyword first, the
+   * main keyword as fallback. `cardGl` is the storefront that served the card
    * (see {@link cardCanStillQualify}).
    */
   const settleCard = (app: StoreApp, cardGl: string): boolean => {
     const countryFinal = cardGl === filters.country;
-    const evaluation = evaluateApp(app, activeFilters, seen);
+    const { evaluation } = evaluateCycled(app, seen);
 
     if (evaluation.reasons.includes("duplicate")) {
       cursor.counters.duplicates += 1;
       return false;
     }
+    // Card-level kill funnel, by cause (reason hits, not cards): why a cycle
+    // can collect plenty yet verify almost none.
+    if (evaluation.reasons.includes("rating-too-high")) cursor.counters.cardDropRating += 1;
+    if (evaluation.reasons.includes("installs-too-high")) cursor.counters.cardDropInstalls += 1;
+    if (evaluation.reasons.includes("not-relevant")) cursor.counters.cardDropIrrelevant += 1;
 
       // A card seen abroad may still qualify at home: the BD detail page
       // never prints *lower* than the foreign card (probe: 10 of 10 agreed or
@@ -996,7 +1071,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       transportFailures = 0;
       currentQuery = entry.query;
 
-      stashTemp(result.apps, entry.gl);
+      if (stashTemp(result.apps, entry.gl) > 0) cursor.stagnantQueries = 0;
+      else cursor.stagnantQueries += 1;
       return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
@@ -1203,10 +1279,11 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           // reserved for verifications whose numbers never confirmed.
           const evalSeen = new Set(seen);
           evalSeen.delete(entry.p);
-          // Relevance is judged against the cycle's keyword: an app verified
-          // from a secondary phrase's harvest must prove *that* phrase, or
-          // secondary cycles could never convert.
-          const evaluation = evaluateApp(app, activeFilters, evalSeen);
+          // Union relevance, same as the settle verdict: an app queued from
+          // a secondary harvest that answers the main keyword must still be
+          // allowed to convert here, or settling would queue fetches the
+          // verification then rejects.
+          const evaluation = evaluateCycled(app, evalSeen).evaluation;
           if (evaluation.status === "match" && evaluation.lead) {
             settled = true;
             target = emitLead(evaluation.lead, { from: queue, origin });
@@ -1371,6 +1448,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     });
 
     const collected: string[] = [];
+    let suggestThrottled = false;
     await Promise.all(
       batch.map(async (prefix) => {
         try {
@@ -1386,6 +1464,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             if (keepsKeyword(cursor.keyword, label)) collected.push(label);
           }
         } catch (error) {
+          // Pushback on suggestions means the session is throttled: stop
+          // asking and let the search stage (which reports rate-limited
+          // properly) decide. Without this the loop burns the whole window
+          // re-asking an endpoint that already said no — each pushback
+          // doubles the request spacing, so a throttled suggest round alone
+          // can eat minutes.
+          if (error instanceof PlayRateLimitError) suggestThrottled = true;
           if (!suggestFailed) {
             suggestFailed = true;
             emit({
@@ -1404,6 +1489,11 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (!suggestions.some((item) => item.toLowerCase() === label.toLowerCase())) {
         suggestions.push(label);
       }
+    }
+
+    if (suggestThrottled) {
+      startCycle(0);
+      break;
     }
   }
 
@@ -1446,7 +1536,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       });
       let fresh: string[] = [];
       try {
-        fresh = await generate(cursor.keyword);
+        fresh = await generate(cursor.keyword, cursor.keywords);
       } catch {
         fresh = [];
       }
@@ -1569,6 +1659,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         cursor.counters.matched < filters.limit &&
         cursor.tempCandidates.length < MAX_TEMP_CANDIDATES &&
         cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
         (options.queryBudget === undefined ||
           cursor.counters.queriesRun < options.queryBudget) &&
         hasTimeForRequest(BATCH_HEADROOM_MS) &&
@@ -1651,9 +1742,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     ) {
       // Harvest unfinished (the pool filled mid-plan and drained, or the
       // window yielded): resume collecting the same cycle instead of
-      // abandoning its remaining plan.
+      // abandoning its remaining plan — unless the neighbourhood went stale
+      // (hundreds of searches with nothing new), in which case the cycle is
+      // done and the run moves on.
       if (
         cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
         entryAt(queries, cursor.planIndex, filters.country) !== null
       ) {
         cursor.phase = "collect";

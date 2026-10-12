@@ -63,6 +63,8 @@ class RateGate {
   private readonly baseIntervalMs: number;
   private intervalMs: number;
   private rewarded = 0;
+  private lastPenaltyAt = 0;
+  private pressureUntil = 0;
 
   constructor(intervalMs: number) {
     this.baseIntervalMs = intervalMs;
@@ -71,6 +73,13 @@ class RateGate {
 
   async wait(): Promise<void> {
     const run = this.chain.then(async () => {
+      // Pressure valve: a pushback is already in force. Fail fast instead of
+      // sleeping into the backoff spacing behind a server that just said no —
+      // without this, a throttled 32-wide batch serialises through seconds
+      // of sleeps and stalls the whole session on one bad moment.
+      if (Date.now() < this.pressureUntil) {
+        throw new PlayRateLimitError("Play Store is throttling requests.");
+      }
       const delay = Math.max(0, this.nextStartAt - Date.now());
       if (delay > 0) await sleep(delay);
       this.nextStartAt = Date.now() + this.intervalMs;
@@ -79,14 +88,30 @@ class RateGate {
     return run;
   }
 
-  /** Play pushed back: slow down, up to a ceiling. */
+  /**
+   * Play pushed back: slow down, up to a ceiling. Collapses concurrent
+   * pushback into one escalation per second — a 32-wide throttled batch must
+   * not multiply the spacing 32 times and stall the session for minutes
+   * after a single bad moment. Sustained throttling across seconds still
+   * escalates normally. Every pushback (even a collapsed one) extends the
+   * pressure valve so the requests already queued behind it keep failing
+   * fast instead of sleeping into a server that just said no.
+   */
   penalize(): void {
+    const now = Date.now();
+    if (now - this.lastPenaltyAt < 1_000) {
+      this.pressureUntil = Math.max(this.pressureUntil, now + this.intervalMs);
+      return;
+    }
+    this.lastPenaltyAt = now;
     this.intervalMs = Math.min(Math.max(this.intervalMs * 2, 400), 4_000);
+    this.pressureUntil = Math.max(this.pressureUntil, now + this.intervalMs);
     this.rewarded = 0;
   }
 
   /** Steady success: creep back towards the configured pace. */
   reward(): void {
+    this.pressureUntil = 0;
     this.rewarded += 1;
     if (this.rewarded < 10 || this.intervalMs <= this.baseIntervalMs) return;
     this.intervalMs = Math.max(this.baseIntervalMs, Math.round(this.intervalMs / 2));
@@ -120,6 +145,13 @@ function looksBlocked(body: string, status: number): boolean {
   if (status === 429) return true;
   if (status === 503 && /unusual traffic|captcha|sorry/i.test(body)) return true;
   if (body.length > 0 && body.length < 4_000 && /unusual traffic|not a robot|captcha/i.test(body)) {
+    return true;
+  }
+  // Bot walls and consent interstitials also arrive as full pages: Play
+  // serves them instead of results when it throttles a session, so they are
+  // pushback (back off and resume later), not a markup change. Without this
+  // a throttled run misdiagnoses itself as a redesign and dies.
+  if (/before you continue|consent wall|consent\.google\.com|unusual traffic/i.test(body)) {
     return true;
   }
   return false;
@@ -260,12 +292,18 @@ export class PlayClient {
         this.gate.reward();
         return { status, body: text, url };
       } catch (error) {
-        if (error instanceof PlayHttpError && !error.retryable) throw error;
-
-        lastError =
-          error instanceof Error
-            ? new PlayHttpError(error.message, 0, true)
-            : new PlayHttpError("Unknown network error.", 0, true);
+        // Pressure-valve rejections keep their identity: they are throttling
+        // verdicts, not transport noise, so the caller backs off instead of
+        // retrying into the same wall. (Not counted: only the pushback that
+        // raised the pressure was an actual Play response.)
+        if (error instanceof PlayRateLimitError) {
+          lastError = error;
+        } else if (error instanceof PlayHttpError && !error.retryable) throw error;
+        else
+          lastError =
+            error instanceof Error
+              ? new PlayHttpError(error.message, 0, true)
+              : new PlayHttpError("Unknown network error.", 0, true);
       } finally {
         this.semaphore.release();
       }

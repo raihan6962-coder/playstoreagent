@@ -57,6 +57,20 @@ describe("secondary keyword generation", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("tells the model which phrases are already tried", async () => {
+    vi.stubEnv("GROQ_API_KEY", "test-key");
+    const fetchMock = vi.fn(async () => groqResponse('["fresh phrase"]'));
+    vi.stubGlobal("fetch", fetchMock);
+    await generateSecondaryKeywords("budget tracker", ["expense manager", "money tracker"]);
+    const calls = fetchMock.mock.calls as unknown as Array<[unknown, RequestInit | undefined]>;
+    const init = calls[0][1] as RequestInit;
+    const prompt = (JSON.parse(String(init.body)) as { messages: Array<{ content: string }> })
+      .messages[0].content;
+    expect(prompt).toContain("expense manager");
+    expect(prompt).toContain("money tracker");
+    expect(prompt).toContain("MOBILE APPS");
+  });
+
   it("returns an empty list on HTTP errors, bad payloads and network failures", async () => {
     vi.stubEnv("GROQ_API_KEY", "test-key");
 

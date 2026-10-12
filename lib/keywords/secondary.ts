@@ -44,12 +44,22 @@ export const MAX_SECONDARY_ROUNDS = 15;
  */
 export const MAX_CONSECUTIVE_DRY_ROUNDS = 3;
 
-function promptFor(keyword: string): string {
+function promptFor(keyword: string, tried: string[]): string {
+  const triedList =
+    tried.length === 0
+      ? "(none yet)"
+      : tried
+          .slice(0, 30)
+          .map((phrase) => `"${phrase}"`)
+          .join(", ");
   return [
-    `You are an app-marketplace keyword planner.`,
+    `You are an app-marketplace keyword planner for an outreach business that emails app owners offering help with their ratings and reviews.`,
     `The main search keyword is: "${keyword}".`,
-    `List ${MAX_SECONDARY} distinct search phrases a Play Store user would type to find apps in the same app category or product neighbourhood as this keyword.`,
-    `Prefer niche long-tail phrases over the main keyword: specific features, use cases, adjectives and platforms (for example "offline budget tracker", "budget tracker for students", "tiny expense tracker").`,
+    `It refers to MOBILE APPS in one specific category — never physical products, hardware, devices, places, brands, or any other meaning of these words (for example, "wallet" means finance apps, never leather goods; "tracker" means an app, never a GPS device). Every phrase you return must be searchable on the Play Store and return mobile apps.`,
+    `List up to ${MAX_SECONDARY} distinct Play Store search phrases a user would type to find apps in the SAME app category or product neighbourhood as the main keyword.`,
+    `Favour phrases for competitive consumer sub-categories where an app's rating visibly drives its downloads — owners there feel a low rating and actively want better reviews. Avoid phrases that only surface big established utilities whose owners ignore ratings.`,
+    `Favour specific long-tail phrases (features, use cases, audiences — for example "offline budget tracker", "budget tracker for students", "tiny expense tracker") over head terms: they surface newer, smaller apps, which are the ones most likely to sit under a low rating ceiling.`,
+    `Each phrase must open a DIFFERENT search neighbourhood — not synonyms or reshuffles of each other, of the main keyword, or of these already-tried phrases: ${triedList}.`,
     `Each phrase must be 1-4 words, plain search-box style, no quotes, no punctuation, and must not be the main keyword itself.`,
     `Return ONLY a JSON array of strings, nothing else.`,
   ].join(" ");
@@ -89,9 +99,14 @@ export function normalizeSecondary(raw: string[], keyword: string): string[] {
 
 /**
  * Asks Groq for secondary search phrases related to `keyword`.
- * Resolves to `[]` on any error — never rejects.
+ * `tried` lists phrases already queued or searched, so the model opens fresh
+ * neighbourhoods instead of reshuffling the same head terms (which just
+ * re-returns the same apps). Resolves to `[]` on any error — never rejects.
  */
-export async function generateSecondaryKeywords(keyword: string): Promise<string[]> {
+export async function generateSecondaryKeywords(
+  keyword: string,
+  tried: string[] = [],
+): Promise<string[]> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey || apiKey.length === 0) return [];
 
@@ -104,7 +119,7 @@ export async function generateSecondaryKeywords(keyword: string): Promise<string
       },
       body: JSON.stringify({
         model: MODEL,
-        messages: [{ role: "user", content: promptFor(keyword) }],
+        messages: [{ role: "user", content: promptFor(keyword, tried) }],
         temperature: 0.4,
         max_completion_tokens: 6000,
       }),

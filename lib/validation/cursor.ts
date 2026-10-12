@@ -5,6 +5,7 @@ import {
   MAX_CYCLE_QUERIES,
   MAX_EXTRA_TAIL,
   MAX_KEYWORDS,
+  MAX_STAGNANT_QUERIES,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
   planSize,
@@ -233,6 +234,9 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {  if (
     "cycles",
     "collected",
     "filtered",
+    "cardDropRating",
+    "cardDropInstalls",
+    "cardDropIrrelevant",
   ] as const;
   for (const key of optional) {
     const current = (value as Record<string, unknown>)[key];
@@ -358,6 +362,12 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
       ? 0
       : asIndex(cycleQueriesRaw, MAX_CYCLE_QUERIES);
   if (cycleQueries === null) return null;
+  const stagnantRaw = input.stagnantQueries;
+  const stagnantQueries =
+    stagnantRaw === undefined || stagnantRaw === null
+      ? 0
+      : asIndex(stagnantRaw, MAX_STAGNANT_QUERIES);
+  if (stagnantQueries === null) return null;
 
   const seen = asStringArray(input.seen, MAX_SEEN);
   const emitted = asStringArray(input.emitted, MAX_EMITTED);
@@ -382,6 +392,7 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     tempCandidates,
     cycleSeen,
     cycleQueries,
+    stagnantQueries,
     wave,
     waveDiscovered,
     phase,

@@ -2,10 +2,15 @@
  * Best-effort, in-memory rate limiter. There is no database in this project by
  * design, so this protects a single warm instance rather than the whole fleet.
  * Shared by the SSE generate route and the run-control routes.
+ *
+ * Sized for one admin dashboard, not the public internet: polling, creating,
+ * stopping and resuming runs from a couple of tabs must never trip it
+ * (rapid Start clicks during a slow first minute used to paint a "Too many
+ * requests" banner over a perfectly healthy run). Floods still hit the wall
+ * quickly, and Vercel's edge protection sits in front of all of this.
  */
-
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 12;
+const RATE_LIMIT = 40;
 
 const hits = new Map<string, number[]>();
 const failures = new Map<string, number[]>();

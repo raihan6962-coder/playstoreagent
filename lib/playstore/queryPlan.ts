@@ -28,9 +28,14 @@ export const MAX_WAVES = 16;
 export const MAX_EXTRA_TAIL = 3_000;
 /**
  * Harvest-pool cap per keyword cycle: how many cards one keyword may stash
- * into its temporary pool before the filter stage starts judging them.
+ * into its temporary pool before the filter stage starts judging them. Small
+ * on purpose — a 100-card pool fills in seconds, so the first verified leads
+ * stream within the first minute instead of after a full multi-minute
+ * harvest, and the persisted cursor stays light. The cycle keeps
+ * harvest → filter → resume going until its plan runs out, so a small pool
+ * never reduces the total harvest, only its batching.
  */
-export const MAX_TEMP_CANDIDATES = 400;
+export const MAX_TEMP_CANDIDATES = 100;
 /**
  * Search requests spent collecting a single keyword cycle before its filter
  * runs regardless. Bounds a duplicate-heavy cycle: repeats keep costing

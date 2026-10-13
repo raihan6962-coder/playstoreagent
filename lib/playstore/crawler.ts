@@ -308,6 +308,15 @@ export interface StepOptions {
   budgetMs: number;
   emit: (event: GenerationEvent) => void;
   client?: PlayClient;
+  /**
+   * Patient client for detail pages (verify/enrich/expand). A slow detail
+   * fetch gates a lead, while a slow search only costs one query among
+   * thousands — so searches fail fast (a tarpitted connection must never
+   * hold all 32 slots for half a minute) and details get their retries.
+   * Defaults to `client` when the caller supplies one (tests), else a
+   * patient default.
+   */
+  detailClient?: PlayClient;
   /** Return true when the caller went away; the step then wraps up early. */
   aborted?: () => boolean;
   /**
@@ -369,6 +378,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   const { filters, budgetMs, emit } = options;
   const cursor = options.cursor;
   const client =
+    options.client ??
+    new PlayClient({
+      concurrency: SEARCH_CONCURRENCY,
+      intervalMs: CLIENT_INTERVAL_MS,
+      timeoutMs: 8_000,
+      retries: 1,
+    });
+  const detailClient =
+    options.detailClient ??
     options.client ??
     new PlayClient({ concurrency: SEARCH_CONCURRENCY, intervalMs: CLIENT_INTERVAL_MS });
   const startedAt = Date.now();
@@ -515,8 +533,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.seen = Array.from(seen).slice(-MAX_SEEN_PACKAGES);
     cursor.emitted = Array.from(emitted);
     cursor.suggestions = suggestions.slice(0, MAX_SUGGESTION_QUERIES);
-    cursor.counters.requests += client.requests;
-    cursor.counters.rateLimitHits += client.rateLimitHits;
+    cursor.counters.requests +=
+      client.requests + (detailClient === client ? 0 : detailClient.requests);
+    cursor.counters.rateLimitHits +=
+      client.rateLimitHits + (detailClient === client ? 0 : detailClient.rateLimitHits);
     // `budget-exhausted` and `rate-limited` keep their phase so the next
     // tick resumes mid-flow; `query-cap` does too — a Resume grants the next
     // query tranche and the run must pick up exactly where it stopped.
@@ -1115,7 +1135,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     });
 
     try {
-      const detail = await fetchAppDetail(client, seed.p, "en", filters.country);
+      const detail = await fetchAppDetail(detailClient, seed.p, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       parseFailures = 0;
       transportFailures = 0;
@@ -1166,7 +1186,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     });
 
     try {
-      const detail = await fetchAppDetail(client, pkg, "en", filters.country);
+      const detail = await fetchAppDetail(detailClient, pkg, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       enrichRequests += 1;
       parseFailures = 0;
@@ -1257,7 +1277,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     };
 
     try {
-      const detail = await fetchAppDetail(client, entry.p, "en", filters.country);
+      const detail = await fetchAppDetail(detailClient, entry.p, "en", filters.country);
       cursor.counters.pagesFetched += 1;
       parseFailures = 0;
       transportFailures = 0;

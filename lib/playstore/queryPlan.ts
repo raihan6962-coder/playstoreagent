@@ -27,24 +27,50 @@ export const MAX_WAVES = 16;
  */
 export const MAX_EXTRA_TAIL = 3_000;
 /**
- * Harvest-pool cap per keyword cycle: how many cards one keyword may stash
- * into its temporary pool before the filter stage starts judging them. Small
- * on purpose — a 100-card pool fills in seconds, so the first verified leads
- * stream within the first minute instead of after a full multi-minute
- * harvest, and the persisted cursor stays light. The cycle keeps
- * harvest → filter → resume going until its plan runs out, so a small pool
- * never reduces the total harvest, only its batching.
+ * How many cards one keyword cycle harvests BEFORE any of them is judged.
+ * This is the shape of a cycle: a keyword is swept wide and deep until its
+ * pool holds this many distinct apps, and only then does the filter stage
+ * start turning them into leads.
+ *
+ * Why a floor this high: filtering early starves the run. A single search
+ * card prints the rating of whichever storefront answered, so under a strict
+ * ceiling (≤3.5) most cards are rejects — and every reject spent in an early
+ * 100-card batch is a request that was not spent finding *more* candidates.
+ * A wider harvest multiplies the pool the filter gets to judge from, which is
+ * the only lever that actually raises lead yield per keyword. Measured on the
+ * "crypto" run: 799 distinct cards discovered produced 3 leads, because the
+ * 100-card pool cap meant most of that supply was dropped before it was ever
+ * looked at.
+ *
+ * A cycle that cannot reach the target is not a failure — see
+ * {@link MAX_CYCLE_QUERIES}, {@link MAX_STAGNANT_QUERIES} and
+ * {@link MAX_LEAD_DROUGHT_QUERIES}: when the keyword's plan runs out or its
+ * neighbourhood goes dry, the cycle filters whatever it harvested and moves
+ * on to the next keyword.
  */
-export const MAX_TEMP_CANDIDATES = 100;
+export const HARVEST_TARGET = 1_000;
+/**
+ * Hard cap on one keyword cycle's harvest pool, sized above
+ * {@link HARVEST_TARGET} so a batch that overshoots the target still lands
+ * whole (the pool stops growing once the target is reached, so this only
+ * matters for the in-flight window that crosses it).
+ *
+ * The pool is NOT held in the persisted cursor any more: at this size it
+ * would be hundreds of KB written on every checkpoint. It lives in its own
+ * store file (`runs/{id}.pool.json`, see runs.ts) so the cursor stays small
+ * and resumable, and so the collected apps survive a rate limit mid-harvest.
+ */
+export const MAX_TEMP_CANDIDATES = 1_200;
 /**
  * Search requests spent collecting a single keyword cycle before its filter
  * runs regardless. Bounds a duplicate-heavy cycle: repeats keep costing
  * requests, and the run-level query budget is the only other backstop. Sized
- * so a cycle covers roughly its whole distinct-query plan at the trimmed
- * core sweep width, then rotates to a fresh keyword instead of re-requesting
- * the same seen apps.
+ * above the request cost of reaching {@link HARVEST_TARGET} distinct cards on
+ * a healthy keyword (measured ~3 new cards per query, so ~1000 apps costs
+ * ~350 queries) with headroom for the storefront cross product, then rotates
+ * to a fresh keyword instead of re-requesting the same seen apps.
  */
-export const MAX_CYCLE_QUERIES = 2_000;
+export const MAX_CYCLE_QUERIES = 4_000;
 /** Cap on the keyword queue (main keyword + AI phrases + built-in alternates). */
 export const MAX_KEYWORDS = 100;
 /**
@@ -57,9 +83,29 @@ export const MAX_VARIANT_BACKSTOP = 8;
  * Consecutive collect-stage searches that stashed nothing new before the
  * cycle gives up on its neighbourhood. Late-cycle queries re-return the same
  * seen apps (measured: half a million duplicates in one run), so a stale
- * cycle ends after hundreds — not thousands — of wasted requests.
+ * cycle ends after hundreds — not thousands — of wasted requests. A cycle
+ * that trips this still filters everything it harvested, it just does not
+ * keep paying for a neighbourhood that has nothing left to give.
  */
 export const MAX_STAGNANT_QUERIES = 300;
+/**
+ * Consecutive collect-stage searches since the last verified lead, before the
+ * cycle abandons its keyword. Distinct from {@link MAX_STAGNANT_QUERIES}:
+ * that guard trips when *no new cards* appear, but a keyword can keep
+ * discovering fresh apps that all fail the rating/install ceilings.
+ *
+ * Sized as a backstop ABOVE a full harvest, not as an early exit: a cycle
+ * harvests {@link HARVEST_TARGET} apps before filtering any of them, so a cap
+ * below that would end every keyword at a fraction of its pool and reintroduce
+ * the starvation this harvest floor exists to remove (the "Crypto" run: 252
+ * queries, 3 leads, because 150 of those queries were spent abandoning the
+ * keyword while hundreds of undiscovered cards remained). One keyword's whole
+ * query plan costs roughly {@link MAX_CYCLE_QUERIES} requests, so this cap
+ * only ever fires on a plan that is being extended indefinitely — the real
+ * "wrong neighbourhood" signal is the target-plus-no-leads case, which is
+ * decided after the pool is filtered, not during collection.
+ */
+export const MAX_LEAD_DROUGHT_QUERIES = 2_500;
 
 const VARIANT_SUFFIXES = [
   "app",

@@ -84,6 +84,13 @@ function supabaseRest(pathname: string, init?: RequestInit): Promise<Response> {
   }
   return fetch(`${url.replace(/\/+$/, "")}/rest/v1/state_files${pathname}`, {
     ...init,
+    // A stalled Supabase connection used to hang a checkpoint write forever:
+    // the step's final `await checkpointWrites` never resolved, the lease was
+    // never released, and the run sat wedged (checkpoints ticking but the
+    // budget long gone) until the lease aged out. 20s is well under the
+    // checkpoint interval's worst case and any transient failure just retries
+    // on the next write.
+    signal: AbortSignal.timeout(20_000),
     headers: {
       apikey: key,
       Authorization: `Bearer ${key}`,

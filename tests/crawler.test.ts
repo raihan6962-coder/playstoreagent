@@ -10,6 +10,7 @@ import {
   MAX_SUGGESTION_QUERIES,
   planSize,
 } from "@/lib/playstore/queryPlan";
+import { emptyPool } from "@/lib/playstore/harvest";
 import { PlayClient, PlayHttpError } from "@/lib/playstore/client";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
@@ -523,6 +524,129 @@ describe("runGenerationStep", () => {
     expect(cursor.counters.cycles).toBeGreaterThanOrEqual(1);
     expect(harness.messages().some((message) => message.includes("budget planner"))).toBe(true);
     expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("harvests the full target before filtering a single card", async () => {
+    const harness = collect();
+    // Every query returns a fresh card, so the keyword has plenty of supply
+    // and the cycle must fill its whole harvest inbox before any card is
+    // judged. Under the old 100-card pool this cycle filtered 10 times and
+    // threw away most of what it found.
+    let seed = 0;
+    const searched: string[] = [];
+    const client = makeFakeClient({
+      search: (url) => {
+        searched.push(url);
+        seed += 1;
+        return searchHtml([
+          makeAppEntry({
+            packageName: `com.example.app${seed}`,
+            title: `Budget Tracker ${seed}`,
+            rating: "4.6",
+            ratingValue: 4.6,
+            installs: "10,000+",
+          }),
+        ]);
+      },
+      detail: (pkg) =>
+        detailHtml({
+          packageName: pkg,
+          title: `Budget Tracker ${pkg}`,
+          rating: "4.6",
+          ratingValue: 4.6,
+          installs: "10,000+",
+        }),
+    });
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "collect";
+    const pool = emptyPool(KEYWORD, 0);
+
+    const result = await runGenerationStep({
+      filters: filters({ limit: 100 }),
+      cursor,
+      pool,
+      harvestTarget: 40,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+    });
+
+    // Every card harvested before the filter stage opened — the filter message
+    // can only be emitted once the pool reached the target.
+    expect(cursor.counters.collected).toBeGreaterThanOrEqual(40);
+    const messages = harness.messages();
+    const filterAt = messages.findIndex((message) => message.includes("filtering by rating"));
+    expect(filterAt).toBeGreaterThan(-1);
+    // The pool size reported at the moment filtering opened was the full
+    // harvest, not an early batch.
+    expect(messages[filterAt]).toMatch(/Collected ([4-9]\d|\d{3,}) apps/);
+    // 40 cards at ~1 per query means the cycle spent 40+ searches collecting
+    // before judging anything.
+    expect(searched.length).toBeGreaterThanOrEqual(40);
+    // No card is judged while the cycle is still short of its target.
+    expect(cursor.counters.filtered).toBeGreaterThan(0);
+    expect(result.reason).toBe("plan-exhausted");
+  });
+
+  it("keeps the harvest pool across steps so a rate limit never loses collected apps", async () => {
+    const harness = collect();
+    let seed = 0;
+    const client = makeFakeClient({
+      search: () => {
+        seed += 1;
+        return searchHtml([
+          makeAppEntry({
+            packageName: `com.example.app${seed}`,
+            title: `Budget Tracker ${seed}`,
+            rating: "4.6",
+            ratingValue: 4.6,
+            installs: "10,000+",
+          }),
+        ]);
+      },
+      detail: (pkg) =>
+        detailHtml({
+          packageName: pkg,
+          title: `Budget Tracker ${pkg}`,
+          rating: "4.6",
+          ratingValue: 4.6,
+          installs: "10,000+",
+        }),
+    });
+    const cursor = createInitialCursor(KEYWORD);
+    cursor.phase = "collect";
+    // A pool the caller loaded from its own store file — the shape a resumed
+    // tick hands in after the previous step was cut short.
+    const pool = emptyPool(KEYWORD, 0);
+    pool.cards = Array.from({ length: 12 }, (_, index) => ({
+      p: `com.example.saved${index}`,
+      t: `Budget Tracker ${index}`,
+      d: "Studio",
+      r: 4.6,
+      rr: "4.6",
+      i: 10_000,
+      ir: "10,000+",
+      c: "Finance",
+      s: null,
+      gl: "US",
+    }));
+    pool.collected = pool.cards.length;
+
+    await runGenerationStep({
+      filters: filters({ limit: 100 }),
+      cursor,
+      pool,
+      harvestTarget: 40,
+      budgetMs: 20_000,
+      emit: harness.emit,
+      client,
+    });
+
+    // The resumed cycle built on the saved pool instead of re-collecting it:
+    // the 12 carried-in cards were judged, and only the shortfall was
+    // collected on top (28 new cards to reach the 40 target).
+    expect(cursor.counters.collected).toBeGreaterThanOrEqual(28);
+    expect(cursor.counters.filtered).toBeGreaterThanOrEqual(40);
   });
 
   it("stops honestly when the keyword cycles are exhausted", async () => {

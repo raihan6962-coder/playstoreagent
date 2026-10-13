@@ -1,6 +1,6 @@
 import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
-import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
+import { buildPlanQueries, HARVEST_TARGET, planSize } from "@/lib/playstore/queryPlan";
 import { allowRequest, clientIp } from "@/lib/server/rateLimit";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
@@ -87,6 +87,8 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     currentQuery: null,
     phase: cursor.phase,
     wave: cursor.wave,
+    poolSize: 0,
+    harvestTarget: HARVEST_TARGET,
     elapsedMs: 0,
   };
 }

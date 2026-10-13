@@ -181,15 +181,24 @@ export interface GenerationStats extends SessionCounters {
   phase: SessionPhase;
   /** Extra query waves appended so far (0 = the base plan). */
   wave: number;
+  /** Cards sitting in the active keyword cycle's unfiltered harvest pool. */
+  poolSize: number;
+  /** How many cards a keyword must harvest before filtering starts. */
+  harvestTarget: number;
   elapsedMs: number;
 }
 
 /**
  * One card of a keyword cycle's temporary harvest pool: everything a cycle's
  * searches found, saved before any filtering decision. Slim on purpose — just
- * the fields the card-level verdict needs. The pool lives inside the cursor
- * (single-writer, resumable across ticks) and is discarded the moment the
- * cycle's filter drains it, so it can never bloat the persisted state.
+ * the fields the card-level verdict needs.
+ *
+ * @deprecated The pool is no longer carried in the cursor: at the 1000-card
+ * harvest floor it is hundreds of KB, far past what a per-checkpoint cursor
+ * write can carry. Cards now live in the run's own pool file (see
+ * `lib/playstore/harvest.ts`). The shape is kept because the pool file holds
+ * exactly these fields, and cursors minted before the split still carry a
+ * (short) pool here — the crawler migrates it on the next step.
  */
 export interface TempCandidate {
   /** Package name. */
@@ -266,12 +275,10 @@ export interface SessionCursor {
   /** Index of the keyword whose cycle is currently active. */
   keywordIndex: number;
   /**
-   * The active cycle's temporary harvest pool (see {@link TempCandidate}).
-   * Search results land here during the collect stage; the filter stage
-   * consumes them in order. Always empty outside an unfinished cycle — a
-   * finished cycle discards its pool instead of carrying it forward, which is
-   * what keeps the persisted cursor small no matter how many apps a keyword
-   * surfaced.
+   * @deprecated Moved out of the cursor into the run's own pool file (see
+   * `lib/playstore/harvest.ts`) — a 1000-card harvest no longer round-trips
+   * through the cursor. Only cursors minted before the split still carry a
+   * pool here; the crawler migrates it and clears this field on the next step.
    */
   tempCandidates: TempCandidate[];
   /**
@@ -291,6 +298,17 @@ export interface SessionCursor {
    * requests. Reset by any stash and by every new cycle.
    */
   stagnantQueries: number;
+  /**
+   * Consecutive collect-stage searches since the last verified lead. A
+   * keyword can keep discovering fresh cards that all fail the rating or
+   * installs ceilings (a head keyword's neighbourhood is dominated by
+   * popular, high-rated apps), so the card-stagnation guard never trips even
+   * though no lead is ever produced. When this counter crosses its cap the
+   * cycle abandons the keyword and rotates to the next one — the neighbourhood
+   * is simply wrong for the current filters. Reset by every lead and by every
+   * new cycle.
+   */
+  leadDrought: number;
   /**
    * How many extra query waves have been appended to the plan. The session
    * keeps generating until the lead limit is hit: when the base plan runs

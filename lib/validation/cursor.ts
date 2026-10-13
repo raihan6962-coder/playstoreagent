@@ -5,6 +5,7 @@ import {
   MAX_CYCLE_QUERIES,
   MAX_EXTRA_TAIL,
   MAX_KEYWORDS,
+  MAX_LEAD_DROUGHT_QUERIES,
   MAX_STAGNANT_QUERIES,
   MAX_SUGGESTION_QUERIES,
   MAX_WAVES,
@@ -44,7 +45,15 @@ const MAX_SUGGESTION_LENGTH = 80;
 /** Tail entries may combine a keyword with two modifiers — longer than a bare suggestion. */
 const MAX_TAIL_QUERY_LENGTH = 160;
 const MAX_SEEN = 40_000;
-const MAX_TEMP_POOL = 400;
+/**
+ * Cap on `tempCandidates` still accepted from a client-supplied cursor. The
+ * pool moved out of the cursor into the run's own pool file (a 1000-card
+ * harvest no longer round-trips here); only cursors minted before the split
+ * carry one, and the crawler migrates whatever it finds. Trimmed, not
+ * rejected, so an oversized legacy pool costs a re-collect instead of a lost
+ * session.
+ */
+const MAX_TEMP_POOL = 1_200;
 const MAX_TEMP_SUMMARY = 1_000;
 const MAX_CYCLE_SEEN = 10_000;
 const MAX_EMITTED = 1_000;
@@ -368,6 +377,12 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
       ? 0
       : asIndex(stagnantRaw, MAX_STAGNANT_QUERIES);
   if (stagnantQueries === null) return null;
+  const droughtRaw = input.leadDrought;
+  const leadDrought =
+    droughtRaw === undefined || droughtRaw === null
+      ? 0
+      : asIndex(droughtRaw, MAX_LEAD_DROUGHT_QUERIES);
+  if (leadDrought === null) return null;
 
   const seen = asStringArray(input.seen, MAX_SEEN);
   const emitted = asStringArray(input.emitted, MAX_EMITTED);
@@ -393,6 +408,7 @@ export function sanitizeCursor(input: unknown, keyword: string): SessionCursor |
     cycleSeen,
     cycleQueries,
     stagnantQueries,
+    leadDrought,
     wave,
     waveDiscovered,
     phase,

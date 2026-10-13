@@ -107,6 +107,29 @@ export function ProgressPanel({
         </div>
       )}
 
+      {/* The current keyword's inbox: how much of its harvest target is
+          collected and waiting to be filtered. */}
+      {stats && stats.harvestTarget > 0 && (
+        <div className="mt-3">
+          <div className="flex items-baseline justify-between text-xs">
+            <span className="text-zinc-400">
+              Harvesting this keyword — {stats.poolSize}/{stats.harvestTarget} apps collected
+            </span>
+            <span className="font-mono text-zinc-500">
+              {stats.phase === "filter" ? "filtering" : stats.phase}
+            </span>
+          </div>
+          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+            <div
+              className="h-full rounded-full bg-sky-500 transition-all duration-500"
+              style={{
+                width: `${Math.min(100, Math.round((stats.poolSize / stats.harvestTarget) * 100))}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {done && (
         <div className="mt-4 flex flex-col gap-1">
           <p className="text-sm font-medium text-zinc-100">{done.message}</p>

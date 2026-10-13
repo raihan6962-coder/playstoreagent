@@ -24,7 +24,8 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
-import { buildPlanQueries, planSize } from "@/lib/playstore/queryPlan";
+import { emptyPool, parsePool, type HarvestPool } from "@/lib/playstore/harvest";
+import { buildPlanQueries, HARVEST_TARGET, planSize } from "@/lib/playstore/queryPlan";
 import { mutateJson, readJson, StoreError, writeJson } from "@/lib/server/stateStore";
 import { notifyTelegram, notifyTime } from "@/lib/server/telegram";
 import type {
@@ -111,6 +112,20 @@ function leadsPath(runId: string): string {
   return `runs/${runId}.leads.json`;
 }
 
+/**
+ * The active keyword cycle's unfiltered harvest pool. Kept out of the state
+ * file on purpose: a cycle collects {@link HARVEST_TARGET} (1000) apps before
+ * filtering any of them, which is hundreds of KB — far too much to rewrite on
+ * every 10s checkpoint. Its own file means the collected apps survive a rate
+ * limit, a cold start, or an instance death mid-harvest, and it makes the
+ * collect-1000 → filter shape visible in storage (pool file = inbox, leads
+ * file = outbox). Single-writer, like the state file: the tick holding the
+ * lease owns it for the duration of its step.
+ */
+function poolPath(runId: string): string {
+  return `runs/${runId}.pool.json`;
+}
+
 /** Storage path of a run's leads — shared with the task/email layer. */
 export function runLeadsPath(runId: string): string {
   return leadsPath(runId);
@@ -166,6 +181,8 @@ function emptyStats(filters: LeadFilters, cursor: SessionCursor): GenerationStat
     currentQuery: null,
     phase: cursor.phase,
     wave: cursor.wave,
+    poolSize: 0,
+    harvestTarget: HARVEST_TARGET,
     elapsedMs: 0,
   };
 }
@@ -355,6 +372,27 @@ export async function executeTick(
   let leadsDirty = false;
   let leads: Lead[] = [];
   let checkpointWrites: Promise<unknown> = Promise.resolve();
+  /**
+   * The active keyword cycle's harvest pool, loaded from its own store file
+   * and written back on every checkpoint (and once more before the step
+   * returns). The crawler mutates it in place, so dirtiness is detected by
+   * comparing the live pool against the last saved snapshot — writing an
+   * unchanged 300KB pool every 10s would be pure waste.
+   */
+  const pool: HarvestPool = emptyPool(state.cursor.keyword, state.cursor.keywordIndex ?? 0);
+  let savedPool = { keyword: "", keywordIndex: -1, count: -1 };
+  const poolChanged = (): boolean =>
+    pool.cards.length !== savedPool.count ||
+    pool.keyword !== savedPool.keyword ||
+    pool.keywordIndex !== savedPool.keywordIndex;
+  const savePool = async (): Promise<void> => {
+    await writeJson(poolPath(runId), pool, `psa: pool ${runId}`);
+    savedPool = {
+      keyword: pool.keyword,
+      keywordIndex: pool.keywordIndex,
+      count: pool.cards.length,
+    };
+  };
   // Holder object: the done message is assigned inside emit(), which TS's
   // control-flow analysis cannot see when we read it after the step.
   const lastDone: { value: { reason: DoneReason; message: string } | null } = {
@@ -372,6 +410,11 @@ export async function executeTick(
         await writeJson(leadsPath(runId), leads, `psa: leads ${runId}`);
         leadsDirty = false;
       }
+      // The harvest pool travels ahead of the state write that points at it:
+      // the pool is the resumable data, the cursor only records which phase
+      // the cycle is in, so a crash between the two must never leave the
+      // cursor claiming a filter stage over a pool that was never saved.
+      if (poolChanged()) await savePool();
       state.version += 1;
       state.seq += 1;
       state.updatedAt = Date.now();
@@ -388,6 +431,20 @@ export async function executeTick(
     // failure path below (log + release the lease), not reject the after()
     // callback and leave the lease stuck until it expires.
     leads = (await readJson<Lead[]>(leadsPath(runId), true)) ?? [];
+
+    // The harvest pool likewise. A pool bound to a different keyword cycle is
+    // discarded by `parsePool` (its cards were harvested for a different
+    // relevance verdict), so a run that moved on never filters a stale inbox.
+    const storedPool = await readJson<HarvestPool>(poolPath(runId), true);
+    const parsed = parsePool(
+      storedPool,
+      state.cursor.keywords[state.cursor.keywordIndex] ?? state.cursor.keyword,
+      state.cursor.keywordIndex,
+    );
+    pool.keyword = parsed.keyword;
+    pool.keywordIndex = parsed.keywordIndex;
+    pool.collected = parsed.collected;
+    pool.cards = parsed.cards;
 
     // Start checkpointing before the Groq prime call: it is not abortable, so
     // it needs keepalive writes (and Stop visibility) of its own.
@@ -460,6 +517,7 @@ export async function executeTick(
     const result = await runGenerationStep({
       filters: state.filters,
       cursor: state.cursor,
+      pool,
       budgetMs: TICK_BUDGET_MS,
       emit,
       generateSecondary: generateSecondaryKeywords,
@@ -473,11 +531,18 @@ export async function executeTick(
 
     state.cursor = result.cursor ?? state.cursor;
     state.stats = withElapsed(result.stats, state);
+    // Mirror the pool's live size into the stats the dashboard polls, so the
+    // "harvested x/1000" progress is visible between checkpoints too.
+    state.stats.poolSize = pool.cards.length;
 
     // Leads first, then state: the state file carries leadsVersion, so it has
-    // to be written after the leads file it points at. The final state write
-    // also releases the lease — before the chained tick's beginTick, which is
-    // what lets that tick acquire the mutex.
+    // to be written after the leads file it points at. The pool is written
+    // before both for the same reason — the state file is what says which
+    // phase the cycle is in, so it must never be newer than the data that
+    // phase resumes from. The final state write also releases the lease —
+    // before the chained tick's beginTick, which is what lets that tick
+    // acquire the mutex.
+    if (poolChanged()) await savePool();
     if (leadsDirty) {
       state.leadsVersion += 1;
       await writeJson(leadsPath(runId), leads, `psa: leads ${runId}`);

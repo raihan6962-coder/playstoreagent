@@ -29,9 +29,11 @@ import { keywordVariants } from "./keywords";
 import {
   buildCycleQueries,
   entryAt,
+  HARVEST_TARGET,
   keepsKeyword,
   MAX_CYCLE_QUERIES,
   MAX_KEYWORDS,
+  MAX_LEAD_DROUGHT_QUERIES,
   MAX_STAGNANT_QUERIES,
   MAX_SUGGESTION_QUERIES,
   MAX_TEMP_CANDIDATES,
@@ -39,6 +41,7 @@ import {
   planSize,
   suggestPrefixes,
 } from "./queryPlan";
+import { emptyPool, type HarvestPool, toPoolCard } from "./harvest";
 import { searchApps } from "./search";
 import { fetchSearchSuggestions } from "./suggest";
 
@@ -283,6 +286,7 @@ export function createInitialCursor(keyword: string): SessionCursor {
     cycleSeen: [],
     cycleQueries: 0,
     stagnantQueries: 0,
+    leadDrought: 0,
     wave: 0,
     waveDiscovered: 0,
     phase: "suggest",
@@ -332,6 +336,24 @@ export interface StepOptions {
    */
   generateSecondary?: (keyword: string, tried: string[]) => Promise<string[]>;
   /**
+   * The active keyword cycle's harvest pool: the collected-but-unfiltered
+   * apps. Supplied by the caller (runs.ts loads/saves it from its own store
+   * file) so a step can hand the pool back at its end and a resumed step picks
+   * up the same inbox. Defaults to an in-memory pool for unit tests.
+   *
+   * The pool is deliberately NOT part of the cursor any more: at a 1000-card
+   * harvest floor it is hundreds of KB, far past what a per-checkpoint cursor
+   * write can carry. See harvest.ts.
+   */
+  pool?: HarvestPool;
+  /**
+   * Override the per-keyword harvest floor (defaults to
+   * {@link HARVEST_TARGET}). Tests use a small value to exercise the
+   * collect-then-filter shape without fabricating a thousand cards; production
+   * always uses the default.
+   */
+  harvestTarget?: number;
+  /**
    * Safety backstop: stop with `query-cap` once `counters.queriesRun`
    * reaches this many queries. Granted per run by the state store and topped
    * up on every Resume, so an unproductive niche can never spin forever
@@ -353,6 +375,7 @@ function buildStats(
   startedAt: number,
   currentQuery: string | null,
   queriesTotal: number,
+  poolSize = 0,
 ): GenerationStats {
   return {
     ...cursor.counters,
@@ -362,6 +385,8 @@ function buildStats(
     currentQuery,
     phase: cursor.phase,
     wave: cursor.wave,
+    poolSize,
+    harvestTarget: HARVEST_TARGET,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -410,6 +435,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   let transportFailures = 0;
   let suggestFailed = false;
   let currentQuery: string | null = null;
+  // The active cycle's harvest pool. Supplied by the caller (own store file,
+  // so it survives a rate limit or an instance death mid-harvest); defaults
+  // to an in-memory pool for unit tests. `cursor.tempCandidates` is no longer
+  // the pool — see harvest.ts.
+  const pool: HarvestPool =
+    options.pool ?? emptyPool(cursor.keyword, cursor.keywordIndex ?? 0);
 
   // --- keyword-cycle state (migrates cursors minted before cycles existed) ---
   if (!Array.isArray(cursor.keywords) || cursor.keywords.length === 0) {
@@ -456,17 +487,36 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   ) {
     cursor.stagnantQueries = 0;
   }
+  if (
+    typeof cursor.leadDrought !== "number" ||
+    !Number.isFinite(cursor.leadDrought) ||
+    cursor.leadDrought < 0
+  ) {
+    cursor.leadDrought = 0;
+  }
   // Stages renamed since: old "search" cursors resume collecting, old
   // "expand" ones resume filtering. Their saved planIndex is clamped to the
   // current cycle's plan below (the old run-global plan no longer exists —
   // unsearched tail queries are superseded by the new cycles).
   if ((cursor.phase as string) === "search") cursor.phase = "collect";
   else if ((cursor.phase as string) === "expand") cursor.phase = "filter";
+  // One-time migration: cursors minted while the pool still lived in the
+  // cursor carry their collected cards in `tempCandidates`. Adopt them into
+  // the external pool (bound to the active cycle) and clear the field, so a
+  // run that was mid-harvest when this shipped does not re-collect from
+  // scratch. New cursors never write the field again.
+  if (Array.isArray(cursor.tempCandidates) && cursor.tempCandidates.length > 0) {
+    if (pool.cards.length === 0) {
+      pool.cards = cursor.tempCandidates.slice(0, MAX_TEMP_CANDIDATES).map(toPoolCard);
+      pool.collected = Math.max(pool.collected, pool.cards.length);
+    }
+    cursor.tempCandidates = [];
+  }
   const cycleSeenSet = new Set(cursor.cycleSeen);
   // Package → pool index, rebuilt from the persisted pool: a home-storefront
   // card supersedes a foreign one already pooled (see stashTemp).
   const tempIndex = new Map<string, number>();
-  cursor.tempCandidates.forEach((entry, index) => {
+  pool.cards.forEach((entry, index) => {
     if (!tempIndex.has(entry.p)) tempIndex.set(entry.p, index);
   });
 
@@ -510,9 +560,14 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     cursor.planIndex = 0;
     cursor.cycleQueries = 0;
     cursor.stagnantQueries = 0;
+    cursor.leadDrought = 0;
     cursor.cycleSeen = [];
     cycleSeenSet.clear();
-    cursor.tempCandidates = [];
+    pool.keywordIndex = index;
+    pool.keyword = activeCycleKeyword();
+    pool.cards = [];
+    pool.collected = 0;
+    tempIndex.clear();
     cursor.phase = "collect";
     rebuildCyclePlan();
     emit({
@@ -520,12 +575,19 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       stats: stats(),
       message:
         `Collecting apps for “${activeCycleKeyword()}” (cycle ${index + 1}) — ` +
-        `up to ${MAX_TEMP_CANDIDATES} before filtering…`,
+        `harvesting up to ${HARVEST_TARGET} before filtering…`,
     });
   };
 
   const stats = () =>
-    buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
+    buildStats(cursor, filters, startedAt, currentQuery, totalPlan, pool.cards.length);
+  /**
+   * How many cards this cycle must harvest before the filter stage starts.
+   * A run may aim lower than {@link HARVEST_TARGET} (tests, and the
+   * harvest-size option), never higher.
+   */
+  const harvestLimit = (): number =>
+    Math.max(0, Math.min(HARVEST_TARGET, options.harvestTarget ?? HARVEST_TARGET));
   const hasTimeForRequest = (headroom = REQUEST_HEADROOM_MS) =>
     options.aborted?.() !== true && Date.now() + headroom < deadline;
 
@@ -545,6 +607,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // Terminal verdict: the temporary harvest and every working queue are
       // wiped so the persisted state stays light — the leads themselves live
       // in their own file and are never touched here.
+      pool.cards = [];
+      pool.collected = 0;
+      tempIndex.clear();
       cursor.tempCandidates = [];
       cursor.cycleSeen = [];
       cursor.pendingQueue = [];
@@ -625,9 +690,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       // before (a marked foreign card made the later home search hit the
       // duplicate path). Anything already settled stays skipped.
       const pooledAt = tempIndex.get(app.packageName);
-      const pooled = pooledAt !== undefined ? cursor.tempCandidates[pooledAt] : undefined;
+      const pooled = pooledAt !== undefined ? pool.cards[pooledAt] : undefined;
       if (countryFinal && pooled !== undefined && pooled.gl !== filters.country) {
-        cursor.tempCandidates[pooledAt as number] = {
+        pool.cards[pooledAt as number] = {
           p: app.packageName,
           t: app.title,
           d: app.developer,
@@ -673,20 +738,26 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         cursor.counters.cardDropIrrelevant += 1;
         continue;
       }
-      if (cursor.tempCandidates.length >= MAX_TEMP_CANDIDATES) continue;
-      tempIndex.set(app.packageName, cursor.tempCandidates.length);
-      cursor.tempCandidates.push({
-        p: app.packageName,
-        t: app.title,
-        d: app.developer,
-        r: app.rating,
-        rr: app.ratingRaw,
-        i: app.installs,
-        ir: app.installsRaw,
-        c: app.category,
-        s: clipSummary(app.summary),
-        gl: cardGl,
-      });
+      // The pool stops growing once the harvest target is reached: anything
+      // past it is left for a later cycle rather than pushed out of the inbox
+      // (and, with it, dropped from the filter entirely).
+      if (pool.cards.length >= Math.min(MAX_TEMP_CANDIDATES, harvestLimit())) continue;
+      tempIndex.set(app.packageName, pool.cards.length);
+      pool.cards.push(
+        toPoolCard({
+          p: app.packageName,
+          t: app.title,
+          d: app.developer,
+          r: app.rating,
+          rr: app.ratingRaw,
+          i: app.installs,
+          ir: app.installsRaw,
+          c: app.category,
+          s: clipSummary(app.summary),
+          gl: cardGl,
+        }),
+      );
+      pool.collected += 1;
       cursor.counters.collected += 1;
       progress += 1;
     }
@@ -890,6 +961,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
     emitted.add(lead.packageName);
     cursor.counters.matched += 1;
+    cursor.leadDrought = 0;
     if (attribution) {
       // The card-verified overflow path produces what the pending queue would
       // have held, so it counts as a pending lead without a fetch.
@@ -1102,6 +1174,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
       if (stashTemp(result.apps, entry.gl) > 0) cursor.stagnantQueries = 0;
       else cursor.stagnantQueries += 1;
+      cursor.leadDrought += 1;
       return "ok";
     } catch (error) {
       if (error instanceof PlayRateLimitError) return "rate-limited";
@@ -1657,8 +1730,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     // --------------------------------------------------------------- collect --
     // One keyword's harvest: searches ONLY — no verify, enrich or expand pulls
     // compete for slots, so the pool fills at full search concurrency. Cards
-    // land in the temporary pool (`stashTemp`); the filter stage judges them
-    // after collection ends.
+    // land in the harvest pool (`stashTemp`); the filter stage judges them
+    // only once the pool reaches HARVEST_TARGET (or the keyword runs out of
+    // supply), so the widest possible candidate set is what gets filtered.
     if (cursor.phase === "collect") {
       if (
         options.queryBudget !== undefined &&
@@ -1686,9 +1760,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       pullCollectTask,
       () =>
         cursor.counters.matched < filters.limit &&
-        cursor.tempCandidates.length < MAX_TEMP_CANDIDATES &&
+        pool.cards.length < harvestLimit() &&
         cursor.cycleQueries < MAX_CYCLE_QUERIES &&
         cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
+        cursor.leadDrought < MAX_LEAD_DROUGHT_QUERIES &&
         (options.queryBudget === undefined ||
           cursor.counters.queriesRun < options.queryBudget) &&
         hasTimeForRequest(BATCH_HEADROOM_MS) &&
@@ -1704,20 +1779,44 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     ) {
       return finishQueryCap();
     }
-    // Harvest window over: judge the pool now (even on a time-out — the next
-    // step resumes in the filter stage instead of re-collecting).
+
+    // The window closed for one of these reasons: the harvest target was hit,
+    // the lead target was hit, the keyword's plan ran out, its neighbourhood
+    // went stale, or the step ran out of time. All but the last mean "this
+    // keyword is done, judge what it collected" — on a pause the pool is
+    // handed back to the store and the next step resumes harvesting, so a
+    // rate limit never costs the collected apps.
+    const supplyLeft = entryAt(queries, cursor.planIndex, filters.country) !== null;
+    const harvestComplete =
+      pool.cards.length >= harvestLimit() ||
+      cursor.counters.matched >= filters.limit ||
+      !supplyLeft ||
+      cursor.cycleQueries >= MAX_CYCLE_QUERIES ||
+      cursor.stagnantQueries >= MAX_STAGNANT_QUERIES ||
+      cursor.leadDrought >= MAX_LEAD_DROUGHT_QUERIES;
+
+    if (!harvestComplete) {
+      // Time or query budget ran out mid-harvest: keep the phase so the next
+      // step continues collecting this same keyword's pool.
+      return finish(
+        "budget-exhausted",
+        `Collected ${pool.cards.length}/${harvestLimit()} apps for “${activeCycleKeyword()}” — resume to keep harvesting this keyword.`,
+        true,
+      );
+    }
+
     emit({
       type: "progress",
       stats: stats(),
       message:
-        `Collected ${cursor.tempCandidates.length} apps for “${activeCycleKeyword()}” — ` +
+        `Collected ${pool.cards.length} apps for “${activeCycleKeyword()}” — ` +
         `filtering by rating ≤ ${activeFilters.maxRating} and installs ≤ ${activeFilters.maxInstalls} now…`,
     });
     cursor.phase = "filter";
     }
 
   // ---------------------------------------------------------------- filter --
-  // One keyword's verdict: settle the temporary pool in order (match → verify
+  // One keyword's verdict: settle the harvested pool in order (match → verify
   // queue, partial text or missing installs → candidate queue, hopeless →
   // dropped), then drain the verify queues while walking similar-app seeds.
   // Expansion discoveries rejoin the same pool. When pool and queues are all
@@ -1725,16 +1824,28 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   if (cursor.phase === "filter") {
     // Settle pass: pure CPU, no requests — every pooled card gets its
     // card-level verdict and leaves the pool (queued or dropped). Settling
-    // consumes the temporary store, so a finished cycle carries nothing over.
+    // consumes the pool, so a finished cycle carries nothing over.
     let hitTarget = false;
-    while (cursor.tempCandidates.length > 0 && hasTimeForRequest(REQUEST_HEADROOM_MS)) {
-      const pooled = cursor.tempCandidates.shift();
+    while (pool.cards.length > 0 && hasTimeForRequest(REQUEST_HEADROOM_MS)) {
+      const pooled = pool.cards.shift();
       if (!pooled) break;
+      tempIndex.delete(pooled.p);
       cursor.counters.filtered += 1;
       if (settleCard(tempToApp(pooled), pooled.gl)) {
         hitTarget = true;
         break;
       }
+    }
+    // `shift()` renumbered every surviving entry, so the package → index map
+    // is stale now. Expansion below pushes into the same pool via `stashTemp`,
+    // and a stale index there would let a home-storefront card overwrite a
+    // DIFFERENT app's pooled data — a silently corrupted lead. Rebuilding a
+    // 1000-entry map is free next to the network work around it.
+    if (tempIndex.size > 0) {
+      tempIndex.clear();
+      pool.cards.forEach((entry, index) => {
+        if (!tempIndex.has(entry.p)) tempIndex.set(entry.p, index);
+      });
     }
     if (hitTarget) {
       cursor.phase = "enrich";
@@ -1765,33 +1876,44 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
 
     if (
-      cursor.tempCandidates.length === 0 &&
+      pool.cards.length === 0 &&
       cursor.pendingQueue.length === 0 &&
       cursor.candidateQueue.length === 0
     ) {
-      // Harvest unfinished (the pool filled mid-plan and drained, or the
-      // window yielded): resume collecting the same cycle instead of
-      // abandoning its remaining plan — unless the neighbourhood went stale
-      // (hundreds of searches with nothing new), in which case the cycle is
-      // done and the run moves on.
+      // Expansion walk finished the cycle's inbox. If the keyword has queries
+      // left and has not yet harvested its target, go back and collect more
+      // before the run moves on — the harvest floor is what makes this
+      // keyword's pool worth filtering.
       if (
+        pool.cards.length < harvestLimit() &&
+        entryAt(queries, cursor.planIndex, filters.country) !== null &&
         cursor.cycleQueries < MAX_CYCLE_QUERIES &&
         cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
-        entryAt(queries, cursor.planIndex, filters.country) !== null
+        cursor.leadDrought < MAX_LEAD_DROUGHT_QUERIES
       ) {
         cursor.phase = "collect";
         continue;
       }
       // Cycle complete: pool bookkeeping discarded (already empty), the
       // cycle counted, then either stop on target or open the next keyword.
+      // The harvest size is read BEFORE the pool is wiped — the summary line
+      // below has to report what this cycle actually collected.
+      const harvested = pool.collected;
+      pool.cards = [];
+      pool.collected = 0;
+      tempIndex.clear();
       cursor.tempCandidates = [];
       cursor.cycleSeen = [];
       cycleSeenSet.clear();
       cursor.counters.cycles += 1;
+      const droughtNote =
+        cursor.leadDrought >= MAX_LEAD_DROUGHT_QUERIES
+          ? ` — no leads after ${cursor.leadDrought} searches, trying a related keyword`
+          : "";
       emit({
         type: "progress",
         stats: stats(),
-        message: `Finished “${activeCycleKeyword()}” — ${cursor.counters.matched}/${filters.limit} leads so far.`,
+        message: `Finished “${activeCycleKeyword()}”${droughtNote} — harvested ${harvested} apps — ${cursor.counters.matched}/${filters.limit} leads so far.`,
       });
       if (cursor.counters.matched >= filters.limit) {
         cursor.phase = "enrich";
@@ -1802,7 +1924,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       return advanced;
     }
 
-    if (verifyOutcomes.length === 0 && cursor.tempCandidates.length === 0) {
+    if (verifyOutcomes.length === 0 && pool.cards.length === 0) {
       // The queues hold only entries already retried this step (transport
       // kept failing them): nothing more can settle before the next step.
       return finish(

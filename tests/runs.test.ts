@@ -303,6 +303,33 @@ describe("run orchestration", () => {
     expect(telegramPosts()).toHaveLength(0);
   });
 
+  it("pings Telegram when the sweep cannot restart a stalled run", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    process.env.TELEGRAM_CHAT_ID = "chat-42";
+    const stalled = await createRun(filters());
+    await ageRun(stalled.runId);
+    // The tick endpoint is down: kicks fail, and the run must not suffer in
+    // silence until the next sweep an hour later.
+    const original = mock.fetchMock.getMockImplementation() as (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => Promise<Response>;
+    mock.fetchMock.mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (String(input).includes("/tick")) throw new TypeError("fetch failed");
+        return original(input, init);
+      },
+    );
+
+    const result = await sweepStalledRuns(ORIGIN);
+
+    expect(result.kicked).toBe(0);
+    const posts = telegramPosts();
+    expect(posts).toHaveLength(1);
+    expect(posts[0].text).toContain("could not restart");
+    expect(posts[0].text).toContain(stalled.runId.slice(0, 8));
+  });
+
   it("reports a rate-limited store instead of pruning on failed reads", async () => {
     const run = await createRun(filters());
     await ageRun(run.runId);

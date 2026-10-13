@@ -34,9 +34,12 @@ export const MAX_TEMP_CANDIDATES = 400;
 /**
  * Search requests spent collecting a single keyword cycle before its filter
  * runs regardless. Bounds a duplicate-heavy cycle: repeats keep costing
- * requests, and the run-level query budget is the only other backstop.
+ * requests, and the run-level query budget is the only other backstop. Sized
+ * so a cycle covers roughly its whole distinct-query plan at the trimmed
+ * core sweep width, then rotates to a fresh keyword instead of re-requesting
+ * the same seen apps.
  */
-export const MAX_CYCLE_QUERIES = 3_000;
+export const MAX_CYCLE_QUERIES = 2_000;
 /** Cap on the keyword queue (main keyword + AI phrases + built-in alternates). */
 export const MAX_KEYWORDS = 100;
 /**
@@ -173,29 +176,21 @@ export const PLAN_LOCALES: PlanLocale[] = [
 ];
 
 /**
- * Storefronts swept for every query after the head ones. Trimmed from the
- * original dozen en-country list: measured (research2.test.ts R6) the
- * en-countries mostly return the same apps, so every extra one delays the
- * *next* query — and at a strict rating ceiling the head-page results carry
- * almost no qualifying cards, so covering more distinct queries beats
- * re-covering the same apps in one more country (a live probe found zero
- * cards at or below 3.5 stars in the first 25 results of a head query on both
- * the BD and KR storefronts). The non-English storefronts stay: measured
- * (research R7) they surface genuinely unique card sets.
+ * Storefronts swept for every query after the head ones. Deliberately narrow:
+ * measured live, foreign storefronts convert ~1 lead per 30 verifications
+ * (cross-storefront drift kills almost everything at the home detail page),
+ * while every extra locale multiplies the requests each cycle burns. Fewer
+ * locales per query means more DISTINCT queries per cycle budget — broader
+ * harvest, faster rotation — and the run's own country still goes first on
+ * every query, so the highest-converting cards are never missed. The head
+ * queries keep the full sweep (cheapest wide net for the exact keyword).
  */
 export const CORE_LOCALES: PlanLocale[] = [
   ...["US", "GB", "IN", "PK", "ID", "NG"].map((gl) => ({ hl: "en", gl })),
   { hl: "en", gl: "US", price: "paid" },
   { hl: "es", gl: "MX" },
   { hl: "pt", gl: "BR" },
-  { hl: "de", gl: "DE" },
-  { hl: "hi", gl: "IN" },
   { hl: "bn", gl: "BD" },
-  { hl: "id", gl: "ID" },
-  { hl: "fr", gl: "FR" },
-  { hl: "ja", gl: "JP" },
-  { hl: "ar", gl: "EG" },
-  { hl: "tr", gl: "TR" },
 ];
 
 /** Head queries that receive the full storefront sweep. */

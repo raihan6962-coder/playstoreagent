@@ -754,8 +754,8 @@ const CHAIN_TIME_BUDGET_MS = 280_000;
 const KICK_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 25_000 };
 /** Resume answers a button click — fail fast; sweep and client retry anyway. */
 const RESUME_POLICY: TickPolicy = { attempts: 2, backoffsMs: [2_000], timeoutMs: 8_000 };
-/** The sweep's own 120s route budget — it may restart several runs. */
-const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 15_000 };
+/** The sweep's own 120s route budget — it may restart several runs. Cold starts routinely exceed 10s, and a timed-out kick leaves the run stalled with nobody told. */
+const SWEEP_POLICY: TickPolicy = { attempts: 2, backoffsMs: [3_000], timeoutMs: 25_000 };
 
 /**
  * One self-chain hop: POST the tick route, retrying briefly on transient
@@ -921,6 +921,14 @@ export async function sweepStalledRuns(origin: string): Promise<SweepResult> {
         result.kicked += 1;
         const quietMin = Math.max(1, Math.round((Date.now() - state.updatedAt) / 60_000));
         kickedRuns.push(`${runId.slice(0, 8)} (${quietMin}m quiet)`);
+      } else {
+        // A kick that fails twice is not a recovered run — and the next
+        // sweep is an hour away, so say so now instead of staying silent
+        // while the run sits stalled.
+        const quietMin = Math.max(1, Math.round((Date.now() - state.updatedAt) / 60_000));
+        await notifyTelegram(
+          `⚠️ Sweep could not restart run ${runId.slice(0, 8)} (${quietMin}m quiet, 2 tries) — press Resume in the dashboard. (${notifyTime(Date.now())})`,
+        );
       }
     } catch (error) {
       // The store stopped answering (typically rate-limited): abort without

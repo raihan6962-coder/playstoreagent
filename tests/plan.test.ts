@@ -259,9 +259,10 @@ describe("run's own storefront in the sweep", () => {
     expect(core).toHaveLength(CORE_LOCALES.length);
     expect(head[0]).toMatchObject({ gl: "AE" });
     expect(core[0]).toMatchObject({ gl: "AE" });
-    // The English slot the country swapped into is still swept by its
-    // language storefront (for AE that slot was English FR).
-    expect(core.some((locale) => locale.gl === "FR" && locale.hl === "fr")).toBe(true);
+    // The swapped-out English slot's language is still swept by its language
+    // storefront (bn-BD here); the home locale it gains verifies far better
+    // than the overlapping en-country it replaces.
+    expect(core.some((locale) => locale.gl === "BD" && locale.hl === "bn")).toBe(true);
     expect(core.some((locale) => locale.gl === "US")).toBe(true);
   });
 });

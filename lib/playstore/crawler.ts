@@ -522,6 +522,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     // query tranche and the run must pick up exactly where it stopped.
     if (reason !== "budget-exhausted" && reason !== "rate-limited" && reason !== "query-cap") {
       cursor.phase = "done";
+      // Terminal verdict: the temporary harvest and every working queue are
+      // wiped so the persisted state stays light — the leads themselves live
+      // in their own file and are never touched here.
+      cursor.tempCandidates = [];
+      cursor.cycleSeen = [];
+      cursor.pendingQueue = [];
+      cursor.candidateQueue = [];
+      cursor.similarQueue = [];
+      cursor.enrichQueue = [];
     }
     const finalStats = buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
     const result = attachCursor ? cursor : null;

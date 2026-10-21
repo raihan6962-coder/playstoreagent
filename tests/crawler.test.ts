@@ -1427,8 +1427,49 @@ describe("runGenerationStep", () => {
       // The floor is 200 in this mode, not the usual 1000.
       expect(result.stats.harvestTarget).toBe(200);
       const messages = harness.messages();
-      const filterAt = messages.findIndex((message) => message.includes("filtering by rating"));
+      const filterAt = messages.findIndex((message) =>
+        message.includes("judging them on the keyword alone"),
+      );
       expect(filterAt).toBeGreaterThan(-1);
+    });
+
+    it("turns the rating and install ceilings off", async () => {
+      // The normal rules keep only the two apps that pass both ceilings.
+      const strict = collect();
+      const strictResult = await runGenerationStep({
+        filters: filters({ limit: 10 }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: strict.emit,
+        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
+      });
+      expect(strict.leads().map((lead) => lead.packageName).sort()).toEqual([
+        "com.example.budget",
+        "com.example.budget.mini",
+      ]);
+      expect(strictResult.stats.matched).toBe(2);
+
+      // In the mode the ceilings are off: the 4.6-rated app and the
+      // 10-million-installs app come through too. Only the irrelevant one
+      // stays out — the keyword is the only rule left.
+      const loose = collect();
+      const looseResult = await runGenerationStep({
+        filters: filters({ limit: 10, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: loose.emit,
+        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
+      });
+      expect(loose.leads().map((lead) => lead.packageName).sort()).toEqual([
+        "com.example.budget",
+        "com.example.budget.mini",
+        "com.example.famous",
+        "com.example.huge",
+      ]);
+      expect(looseResult.stats.matched).toBe(4);
+      // The ceiling counters stay at zero — nothing was dropped by a number.
+      expect(looseResult.stats.cardDropRating).toBe(0);
+      expect(looseResult.stats.cardDropInstalls).toBe(0);
     });
 
     it("gives the second run of a keyword none of the first run's apps", async () => {

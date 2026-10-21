@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { cardCanStillQualify, evaluateApp, FOREIGN_RATING_WINDOW, toLead } from "@/lib/filters/leadFilter";
+import {
+  cardCanStillQualify,
+  detailAppQualifies,
+  evaluateApp,
+  FOREIGN_RATING_WINDOW,
+  leadPassesFilters,
+  toLead,
+} from "@/lib/filters/leadFilter";
 import type { LeadFilters, StoreApp } from "@/types/lead";
 
 const filters: LeadFilters = {
@@ -146,5 +153,67 @@ describe("cardCanStillQualify", () => {
     expect(cardCanStillQualify({ rating: 2.0, installs: 1_000_000 }, filters, true)).toBe(false);
     expect(cardCanStillQualify({ rating: 2.0, installs: 1_000_000 }, filters, false)).toBe(false);
     expect(cardCanStillQualify({ rating: null, installs: 10_000 }, filters, false)).toBe(true);
+  });
+});
+
+describe("new apps only mode", () => {
+  const solo: LeadFilters = { ...filters, newAppsOnly: true };
+
+  it("keeps an app the rating ceiling would have dropped", () => {
+    const result = evaluateApp(app({ rating: 4.8, ratingRaw: "4.8" }), solo, new Set());
+    expect(result.status).toBe("match");
+    expect(result.lead?.packageName).toBe("com.example.budget");
+  });
+
+  it("keeps an app the install ceiling would have dropped", () => {
+    const result = evaluateApp(
+      app({ installs: 900_000_000, installsRaw: "900,000,000+" }),
+      solo,
+      new Set(),
+    );
+    expect(result.status).toBe("match");
+  });
+
+  it("keeps an app with no rating and no install count", () => {
+    const result = evaluateApp(
+      app({ rating: null, ratingRaw: null, installs: null, installsRaw: null }),
+      solo,
+      new Set(),
+    );
+    expect(result.status).toBe("match");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("still drops an app that does not carry the keyword", () => {
+    const result = evaluateApp(
+      app({ title: "Zombie Run", summary: "run away", rating: 4.9, ratingRaw: "4.9" }),
+      solo,
+      new Set(),
+    );
+    expect(result.status).toBe("reject");
+    expect(result.reasons).toContain("not-relevant");
+  });
+
+  it("still drops a duplicate", () => {
+    const result = evaluateApp(app(), solo, new Set(["com.example.budget"]));
+    expect(result.reasons).toEqual(["duplicate"]);
+  });
+
+  it("never lets a ceiling disqualify a card", () => {
+    expect(cardCanStillQualify({ rating: 4.9, installs: 900_000_000 }, solo, true)).toBe(true);
+    expect(cardCanStillQualify({ rating: 4.9, installs: 900_000_000 }, solo, false)).toBe(true);
+  });
+
+  it("keeps a lead whose numbers break the ceilings", () => {
+    const lead = toLead(app({ rating: 4.9, ratingRaw: "4.9" }), solo);
+    expect(leadPassesFilters(lead, solo)).toBe(true);
+    // The same lead under the normal rules is dropped.
+    expect(leadPassesFilters(lead, filters)).toBe(false);
+  });
+
+  it("never disqualifies a detail page", () => {
+    expect(detailAppQualifies({ rating: null } as StoreApp, solo)).toBe(true);
+    expect(detailAppQualifies({ rating: 4.9 } as StoreApp, solo)).toBe(true);
+    expect(detailAppQualifies({ rating: 4.9 } as StoreApp, filters)).toBe(false);
   });
 });

@@ -35,6 +35,16 @@ export interface Evaluation {
 
 export const PLAY_BASE_URL = "https://play.google.com";
 
+/**
+ * "New apps only" mode collects on the keyword alone. The rating ceiling and
+ * the install cap are not rules in that mode — the operator asked for every
+ * app the keyword surfaces — so the numbers are only ever shown, never used
+ * to drop a row.
+ */
+function keywordOnly(filters: LeadFilters): boolean {
+  return filters.newAppsOnly === true;
+}
+
 export function buildPlayStoreUrl(packageName: string, hl = "en", gl = "US"): string {
   return `${PLAY_BASE_URL}/store/apps/details?id=${encodeURIComponent(packageName)}&hl=${hl}&gl=${gl}`;
 }
@@ -78,6 +88,11 @@ export function toLead(app: StoreApp, filters: LeadFilters): Lead {
  *
  * Missing rating, missing installs and unparseable install values never
  * qualify as a confirmed lead.
+ *
+ * In "new apps only" mode the first two rules do not exist — the keyword
+ * decides alone. A card with no printed rating or no install count still
+ * counts there: the detail page fills the numbers in, and a lead that never
+ * gets one is still a lead worth mailing.
  */
 export function evaluateApp(
   app: StoreApp,
@@ -103,6 +118,25 @@ export function evaluateApp(
 
   if (!relevance.relevant) {
     reasons.push("not-relevant");
+  }
+
+  if (keywordOnly(filters)) {
+    if (reasons.length === 0) {
+      return {
+        status: "match",
+        reasons: [],
+        lead: toLead(app, filters),
+        matchedTerms: relevance.matchedTerms,
+        primaryTerms: relevance.primaryTerms,
+      };
+    }
+    return {
+      status: "reject",
+      reasons,
+      lead: null,
+      matchedTerms: relevance.matchedTerms,
+      primaryTerms: relevance.primaryTerms,
+    };
   }
 
   if (app.rating === null) {
@@ -151,8 +185,12 @@ export function evaluateApp(
  * Play prints (see {@link roundRating}).
  */
 export function leadPassesFilters(lead: Lead, filters: LeadFilters): boolean {
-  if (lead.rating === null || roundRating(lead.rating) > filters.maxRating) return false;
-  if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
+  // "New apps only" mode: the numbers are not rules, so they never disqualify
+  // a row. Only whether the listing still carries the keyword is.
+  if (!keywordOnly(filters)) {
+    if (lead.rating === null || roundRating(lead.rating) > filters.maxRating) return false;
+    if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
+  }
 
   const tokens = tokenizeKeyword(filters.keyword);
   const relevance = scoreRelevance(
@@ -187,6 +225,9 @@ export function filterLeads(leads: Lead[], filters: LeadFilters): Lead[] {
  * own description — {@link leadPassesFilters} does that on the client.
  */
 export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean {
+  // "New apps only" mode: a detail page never disqualifies an app, because
+  // the ceilings are not rules there. Relevance was decided on the card.
+  if (keywordOnly(filters)) return true;
   if (app.rating === null) return false;
   if (roundRating(app.rating) > filters.maxRating) return false;
   if (app.installs !== null && app.installs > filters.maxInstalls) return false;
@@ -224,6 +265,9 @@ export function cardCanStillQualify(
   filters: LeadFilters,
   countryFinal: boolean,
 ): boolean {
+  // "New apps only" mode: no ceiling can disqualify a card. The keyword was
+  // already checked, so a relevant card is always worth a detail fetch.
+  if (keywordOnly(filters)) return true;
   if (app.installs !== null && app.installs > filters.maxInstalls) return false;
   if (app.rating !== null) {
     const printed = roundRating(app.rating);

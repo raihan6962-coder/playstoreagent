@@ -642,7 +642,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       stats: stats(),
       message:
         `Collecting apps for “${activeCycleKeyword()}” (cycle ${index + 1}) — ` +
-        `harvesting up to ${HARVEST_TARGET} before filtering…`,
+        (soloMode
+          ? `harvesting new apps only, up to ${SOLO_HARVEST_TARGET} before judging them…`
+          : `harvesting up to ${HARVEST_TARGET} before filtering…`),
     });
   };
 
@@ -1941,7 +1943,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       stats: stats(),
       message:
         `Collected ${pool.cards.length} apps for “${activeCycleKeyword()}” — ` +
-        `filtering by rating ≤ ${activeFilters.maxRating} and installs ≤ ${activeFilters.maxInstalls} now…`,
+        (soloMode
+          ? `judging them on the keyword alone now…`
+          : `filtering by rating ≤ ${activeFilters.maxRating} and installs ≤ ${activeFilters.maxInstalls} now…`),
     });
     cursor.phase = "filter";
     }

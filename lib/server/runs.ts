@@ -217,7 +217,10 @@ function heartbeat(state: RunState): string {
     target: state.stats.target,
     queriesRun: state.stats.queriesRun,
   };
-  return `Still working — ${matched}/${target} leads after ${queriesRun} queries.`;
+  // "New apps only" mode has no target, so quoting one would be a lie.
+  const count =
+    state.filters.newAppsOnly === true ? `${matched} new leads` : `${matched}/${target} leads`;
+  return `Still working — ${count} after ${queriesRun} queries.`;
 }
 
 export interface CreateRunResult {

@@ -93,23 +93,41 @@ export function SearchForm({
           </Field>
         </div>
 
-        <Field label="Max rating" error={errors.maxRating} hint="0.5 – 5.0, only apps at or below this score">
+        <Field
+          label="Max rating"
+          error={errors.maxRating}
+          hint={
+            values.newAppsOnly
+              ? "Off in new-apps-only mode — every app the keyword surfaces is collected"
+              : "0.5 – 5.0, only apps at or below this score"
+          }
+        >
           <input
             className={fieldClass}
             value={values.maxRating}
             onChange={set("maxRating")}
             inputMode="decimal"
             placeholder="3"
+            disabled={values.newAppsOnly}
           />
         </Field>
 
-        <Field label="Max installs" error={errors.maxInstalls} hint="10000, 10K, 100K or 1M">
+        <Field
+          label="Max installs"
+          error={errors.maxInstalls}
+          hint={
+            values.newAppsOnly
+              ? "Off in new-apps-only mode"
+              : "10000, 10K, 100K or 1M"
+          }
+        >
           <input
             className={fieldClass}
             value={values.maxInstalls}
             onChange={set("maxInstalls")}
             inputMode="text"
             placeholder="5000000"
+            disabled={values.newAppsOnly}
           />
         </Field>
 
@@ -140,14 +158,14 @@ export function SearchForm({
           onChange={toggleNewAppsOnly}
           className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
         />
-        <span className="flex flex-col gap-0.5">
-          <span className="text-sm font-medium text-zinc-100">New apps only</span>
-          <span className="text-xs leading-relaxed text-zinc-500">
-            Stay on this one keyword and skip every app it has already produced in an earlier
-            run. The lead target is ignored — the run collects every new lead the keyword can
-            still give.
+          <span className="flex flex-col gap-0.5">
+            <span className="text-sm font-medium text-zinc-100">New apps only</span>
+            <span className="text-xs leading-relaxed text-zinc-500">
+              Stay on this one keyword and skip every app it has already produced in an earlier
+              run. The rating ceiling, the install cap and the lead target are all off — the run
+              collects every app this keyword surfaces.
+            </span>
           </span>
-        </span>
       </label>
 
       <div className="flex flex-wrap items-center gap-3">

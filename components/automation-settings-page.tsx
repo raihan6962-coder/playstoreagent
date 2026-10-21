@@ -327,28 +327,40 @@ export function AutomationSettingsPage() {
                 autoFocus
               />
             </Field>
-            <Field label="Max rating" hint="0.5 – 5.0">
+            <Field
+              label="Max rating"
+              hint={
+                values.newAppsOnly
+                  ? "Off in new-apps-only mode — every app the keyword surfaces is collected"
+                  : "0.5 – 5.0"
+              }
+            >
               <input
                 className={fieldClass}
                 value={values.maxRating}
                 onChange={(event) => set("maxRating", event.target.value)}
                 inputMode="decimal"
                 placeholder="3.5"
+                disabled={values.newAppsOnly}
               />
             </Field>
-            <Field label="Max installs" hint="10000, 10K, 100K or 1M">
+            <Field
+              label="Max installs"
+              hint={values.newAppsOnly ? "Off in new-apps-only mode" : "10000, 10K, 100K or 1M"}
+            >
               <input
                 className={fieldClass}
                 value={values.maxInstalls}
                 onChange={(event) => set("maxInstalls", event.target.value)}
                 placeholder="500000"
+                disabled={values.newAppsOnly}
               />
             </Field>
             <Field
               label="Lead target"
               hint={
                 values.newAppsOnly
-                  ? "Ignored in new-apps-only mode — the task takes every lead the keyword has left"
+                  ? "Off in new-apps-only mode — the task takes every app the keyword has left"
                   : "1 – 1,000"
               }
             >
@@ -382,8 +394,8 @@ export function AutomationSettingsPage() {
                   <span className="text-sm font-medium text-zinc-100">New apps only</span>
                   <span className="text-xs leading-relaxed text-zinc-500">
                     Stay on this one keyword and skip every app it has already produced in an
-                    earlier run. The lead target is ignored — the task collects every new lead
-                    the keyword can still give.
+                    earlier run. The rating ceiling, the install cap and the lead target are all
+                    off — the task collects every app this keyword surfaces.
                   </span>
                 </span>
               </label>
@@ -516,7 +528,7 @@ export function AutomationSettingsPage() {
                   <p className="mt-1 text-xs text-zinc-500">
                     {new Date(task.startAt).toLocaleString()} ·{" "}
                     {task.newAppsOnly === true
-                      ? "every new lead the keyword has left"
+                      ? "every app this keyword surfaces"
                       : `target ${task.limit} leads`}{" "}
                     · rating ≤ {task.maxRating} · installs ≤{" "}
                     {task.maxInstalls.toLocaleString("en-US")} · every {task.intervalSeconds}s

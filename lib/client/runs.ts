@@ -5,7 +5,6 @@
  * survive the tab closing.
  */
 
-import { guardAuth } from "@/lib/client/guard";
 import type {
   CreateRunResponse,
   RunActionResponse,
@@ -79,7 +78,6 @@ export async function createRun(input: CreateRunInput): Promise<AttachedRun> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
-  guardAuth(response);
   if (!response.ok) throw await readError(response);
   const payload = (await response.json()) as CreateRunResponse;
   const run = { runId: payload.runId, token: payload.token };
@@ -105,7 +103,6 @@ export async function fetchSnapshot(
     headers: { "x-run-token": run.token },
     cache: "no-store",
   });
-  guardAuth(response);
   if (!response.ok) throw await readError(response);
   return (await response.json()) as RunSnapshotResponse;
 }
@@ -119,7 +116,6 @@ export async function runAction(
     headers: { "Content-Type": "application/json", "x-run-token": run.token },
     body: JSON.stringify({ action }),
   });
-  guardAuth(response);
   if (!response.ok) throw await readError(response);
   return (await response.json()) as RunActionResponse;
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, usePathname } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 
 function icon(paths: ReactNode): ReactNode {
@@ -96,28 +96,7 @@ const LINKS: { href: string; label: string; hint: string; icon: ReactNode }[] = 
 /** Sticky glass bar with the 3-line menu that opens the section drawer. */
 export function TopBar() {
   const [open, setOpen] = useState(false);
-  const [email, setEmail] = useState<string | null>(null);
   const pathname = usePathname();
-  const router = useRouter();
-
-  useEffect(() => {
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      try {
-        const response = await fetch("/api/auth/me", { cache: "no-store" });
-        if (!cancelled && response.ok) {
-          const data = (await response.json()) as { email?: string };
-          if (data.email) setEmail(data.email);
-        }
-      } catch {
-        /* the drawer works without the chip */
-      }
-    }, 0);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -127,14 +106,6 @@ export function TopBar() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open]);
-
-  const logout = async () => {
-    try {
-      await fetch("/api/auth/logout", { method: "POST" });
-    } finally {
-      router.push("/login");
-    }
-  };
 
   return (
     <>
@@ -242,27 +213,6 @@ export function TopBar() {
                 );
               })}
             </ul>
-          </div>
-
-          <div className="border-t border-white/5 px-5 py-4">
-            <div className="mb-3 flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-3">
-              <span className="relative flex h-2 w-2">
-                <span className="psa-dot absolute inline-flex h-full w-full rounded-full bg-emerald-400" />
-              </span>
-              <span className="min-w-0 flex-1 truncate text-xs text-zinc-300">
-                {email ?? "admin session"}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => void logout()}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-zinc-300 transition hover:border-red-400/40 hover:bg-red-400/10 hover:text-red-300"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} className="h-4 w-4">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-              Sign out
-            </button>
           </div>
         </aside>
       </>

@@ -1,4 +1,3 @@
-import { guardAuth } from "@/lib/client/guard";
 import type {
   GenerationEvent,
   GenerateRequest,
@@ -33,8 +32,6 @@ export async function runGeneration(options: RunOptions): Promise<GenerationEven
     onEvent({ type: "error", message: "Could not reach the server. Check your connection." });
     return null;
   }
-
-  guardAuth(response);
 
   if (!response.ok) {
     let message = `Request failed with status ${response.status}.`;

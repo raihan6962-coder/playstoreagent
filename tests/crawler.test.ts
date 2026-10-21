@@ -82,7 +82,7 @@ function searchRoutes() {
   ]);
 }
 
-function detailRoute(packageName: string): string {
+function detailRoute(packageName: string, releasedAt: number | null = null): string {
   const all = [GOOD, GOOD_TWO, TOO_POPULAR_RATING, TOO_MANY_INSTALLS, IRRELEVANT];
   const main = all.find((entry) => entry.packageName === packageName);
   if (!main) return searchHtml([]);
@@ -95,6 +95,7 @@ function detailRoute(packageName: string): string {
     { ...main, summary },
     similar.map((entry) => ({ ...entry })),
     main.installs ?? "10,000+",
+    releasedAt,
   );
 }
 
@@ -1254,9 +1255,15 @@ describe("runGenerationStep", () => {
     expect(result.stats.matched).toBe(0);
   });
 
-  describe("new apps only mode", () => {
+  describe("newly published mode", () => {
+    const WINDOW = 30;
+    /** Epoch ms for "a few days ago" — inside the window. */
+    const RECENT = Date.now() - 5 * 86_400_000;
+    /** Epoch ms for "years ago" — outside the window. */
+    const OLD = Date.now() - 900 * 86_400_000;
+
     /** A keyword that keeps producing one fresh app per search. */
-    function endlessSearches(): {
+    function endlessSearches(releasedAt: number | null = RECENT): {
       client: PlayClient;
       searched: () => number;
     } {
@@ -1277,27 +1284,158 @@ describe("runGenerationStep", () => {
           ]);
         },
         detail: (pkg) =>
-          detailHtml({
-            packageName: pkg,
-            title: `Budget Tracker ${pkg}`,
-            rating: "2.1",
-            ratingValue: 2.1,
-            installs: "10,000+",
-          }),
+          detailHtml(
+            {
+              packageName: pkg,
+              title: `Budget Tracker ${pkg}`,
+              rating: "2.1",
+              ratingValue: 2.1,
+              installs: "10,000+",
+            },
+            [],
+            "10,000+",
+            releasedAt,
+          ),
       });
       return { client, searched: () => searches };
     }
 
+    it("collects a listing published inside the window", async () => {
+      const harness = collect();
+      const { client } = endlessSearches(RECENT);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(result.stats.matched).toBeGreaterThan(0);
+      expect(harness.leads().length).toBeGreaterThan(0);
+      expect(result.stats.publishedTooOld).toBe(0);
+    });
+
+    it("drops a listing published before the window", async () => {
+      const harness = collect();
+      const { client } = endlessSearches(OLD);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(harness.leads()).toHaveLength(0);
+      expect(result.stats.matched).toBe(0);
+      expect(result.stats.publishedTooOld).toBeGreaterThan(0);
+    });
+
+    it("drops a listing the store records no release date for", async () => {
+      const harness = collect();
+      const { client } = endlessSearches(null);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      // No date means "not provably new" — unknown is not new.
+      expect(harness.leads()).toHaveLength(0);
+      expect(result.stats.publishedTooOld).toBeGreaterThan(0);
+    });
+
+    it("stops at the lead target", async () => {
+      const harness = collect();
+      const { client } = endlessSearches(RECENT);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 2, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(result.stats.matched).toBe(2);
+      expect(result.reason).toBe("target-reached");
+    });
+
+    it("turns the rating and install ceilings off", async () => {
+      // The normal rules keep only the two apps that pass both ceilings.
+      const strict = collect();
+      const strictResult = await runGenerationStep({
+        filters: filters({ limit: 10 }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: strict.emit,
+        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
+      });
+      expect(strict.leads().map((lead) => lead.packageName).sort()).toEqual([
+        "com.example.budget",
+        "com.example.budget.mini",
+      ]);
+      expect(strictResult.stats.matched).toBe(2);
+
+      // In the mode the ceilings are off: the 4.6-rated app and the
+      // 10-million-installs app come through too. Only the irrelevant one
+      // stays out — the keyword and the publish date are the rules now.
+      const loose = collect();
+      const looseResult = await runGenerationStep({
+        filters: filters({ limit: 10, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: loose.emit,
+        client: makeFakeClient({
+          search: () => searchRoutes(),
+          detail: (pkg) => detailRoute(pkg, RECENT),
+        }),
+      });
+      expect(loose.leads().map((lead) => lead.packageName).sort()).toEqual([
+        "com.example.budget",
+        "com.example.budget.mini",
+        "com.example.famous",
+        "com.example.huge",
+      ]);
+      expect(looseResult.stats.matched).toBe(4);
+      expect(looseResult.stats.cardDropRating).toBe(0);
+      expect(looseResult.stats.cardDropInstalls).toBe(0);
+    });
+
+    it("stays on the one keyword instead of generating related ones", async () => {
+      const harness = collect();
+      const { client } = endlessSearches(RECENT);
+      const generateSecondary = vi.fn(async () => ["related phrase"]);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+        generateSecondary,
+      });
+
+      expect(generateSecondary).not.toHaveBeenCalled();
+      expect(result.cursor?.keywords ?? [KEYWORD]).toEqual([KEYWORD]);
+    });
+
     it("skips the apps the keyword already produced", async () => {
       const harness = collect();
-      const { client } = endlessSearches();
+      const { client } = endlessSearches(RECENT);
       const known = new KnownApps(KEYWORD);
       // The first app the searches will produce is already known.
       known.add("com.example.fresh1");
 
       const cursor = createInitialCursor(KEYWORD);
       const result = await runGenerationStep({
-        filters: filters({ limit: 1, newAppsOnly: true }),
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
         cursor,
         known,
         budgetMs: 20_000,
@@ -1314,47 +1452,13 @@ describe("runGenerationStep", () => {
       expect(result.stats.matched).toBeGreaterThan(0);
     });
 
-    it("ignores the lead target and keeps collecting", async () => {
-      const harness = collect();
-      const { client } = endlessSearches();
-      const cursor = createInitialCursor(KEYWORD);
-
-      const result = await runGenerationStep({
-        filters: filters({ limit: 1, newAppsOnly: true }),
-        cursor,
-        budgetMs: 20_000,
-        emit: harness.emit,
-        client,
-      });
-
-      // A normal run stops at its target; this one must go past it.
-      expect(result.stats.matched).toBeGreaterThan(1);
-      expect(result.reason).not.toBe("target-reached");
-    });
-
-    it("stops at the target when the mode is off", async () => {
-      const harness = collect();
-      const { client } = endlessSearches();
-
-      const result = await runGenerationStep({
-        filters: filters({ limit: 1 }),
-        cursor: createInitialCursor(KEYWORD),
-        budgetMs: 20_000,
-        emit: harness.emit,
-        client,
-      });
-
-      expect(result.stats.matched).toBe(1);
-      expect(result.reason).toBe("target-reached");
-    });
-
     it("records the apps it judged in the keyword's memory", async () => {
       const harness = collect();
-      const { client } = endlessSearches();
+      const { client } = endlessSearches(RECENT);
       const known = new KnownApps(KEYWORD);
 
       await runGenerationStep({
-        filters: filters({ limit: 1, newAppsOnly: true }),
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
         cursor: createInitialCursor(KEYWORD),
         known,
         budgetMs: 20_000,
@@ -1367,27 +1471,9 @@ describe("runGenerationStep", () => {
       for (const name of judged) expect(known.has(name)).toBe(true);
     });
 
-    it("stays on the one keyword instead of generating related ones", async () => {
-      const harness = collect();
-      const { client } = endlessSearches();
-      const generateSecondary = vi.fn(async () => ["related phrase"]);
-
-      const result = await runGenerationStep({
-        filters: filters({ limit: 5, newAppsOnly: true }),
-        cursor: createInitialCursor(KEYWORD),
-        budgetMs: 20_000,
-        emit: harness.emit,
-        client,
-        generateSecondary,
-      });
-
-      expect(generateSecondary).not.toHaveBeenCalled();
-      expect(result.cursor?.keywords ?? [KEYWORD]).toEqual([KEYWORD]);
-    });
-
     it("files an app under the keyword that produced it, not the main one", async () => {
       const harness = collect();
-      const { client } = endlessSearches();
+      const { client } = endlessSearches(RECENT);
       // The memory belongs to the main keyword; a cycle that moves on to a
       // related keyword must not file that keyword's apps under this one.
       const known = new KnownApps(KEYWORD);
@@ -1414,10 +1500,10 @@ describe("runGenerationStep", () => {
 
     it("uses a low harvest floor so leads arrive early", async () => {
       const harness = collect();
-      const { client } = endlessSearches();
+      const { client } = endlessSearches(RECENT);
 
       const result = await runGenerationStep({
-        filters: filters({ limit: 5, newAppsOnly: true }),
+        filters: filters({ limit: 5, publishedWithinDays: WINDOW }),
         cursor: createInitialCursor(KEYWORD),
         budgetMs: 20_000,
         emit: harness.emit,
@@ -1431,98 +1517,6 @@ describe("runGenerationStep", () => {
         message.includes("judging them on the keyword alone"),
       );
       expect(filterAt).toBeGreaterThan(-1);
-    });
-
-    it("turns the rating and install ceilings off", async () => {
-      // The normal rules keep only the two apps that pass both ceilings.
-      const strict = collect();
-      const strictResult = await runGenerationStep({
-        filters: filters({ limit: 10 }),
-        cursor: createInitialCursor(KEYWORD),
-        budgetMs: 20_000,
-        emit: strict.emit,
-        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
-      });
-      expect(strict.leads().map((lead) => lead.packageName).sort()).toEqual([
-        "com.example.budget",
-        "com.example.budget.mini",
-      ]);
-      expect(strictResult.stats.matched).toBe(2);
-
-      // In the mode the ceilings are off: the 4.6-rated app and the
-      // 10-million-installs app come through too. Only the irrelevant one
-      // stays out — the keyword is the only rule left.
-      const loose = collect();
-      const looseResult = await runGenerationStep({
-        filters: filters({ limit: 10, newAppsOnly: true }),
-        cursor: createInitialCursor(KEYWORD),
-        budgetMs: 20_000,
-        emit: loose.emit,
-        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
-      });
-      expect(loose.leads().map((lead) => lead.packageName).sort()).toEqual([
-        "com.example.budget",
-        "com.example.budget.mini",
-        "com.example.famous",
-        "com.example.huge",
-      ]);
-      expect(looseResult.stats.matched).toBe(4);
-      // The ceiling counters stay at zero — nothing was dropped by a number.
-      expect(looseResult.stats.cardDropRating).toBe(0);
-      expect(looseResult.stats.cardDropInstalls).toBe(0);
-    });
-
-    it("gives the second run of a keyword none of the first run's apps", async () => {
-      // The same three apps every time — what a keyword that has been hunted
-      // before keeps offering.
-      const apps = [GOOD, GOOD_TWO, {
-        packageName: "com.example.budget.third",
-        title: "Budget Tracker Third",
-        rating: "2.3",
-        ratingValue: 2.3,
-        installs: "5,000+",
-      }];
-      const client = makeFakeClient({
-        search: () => searchHtml(apps.map((entry) => makeAppEntry(entry))),
-        detail: (pkg) => {
-          const main = apps.find((entry) => entry.packageName === pkg);
-          return detailHtml(
-            { ...(main ?? GOOD), summary: "Track your budget" },
-            [],
-            main?.installs ?? "10,000+",
-          );
-        },
-      });
-      const known = new KnownApps(KEYWORD);
-
-      // First run: the apps are new, so they come through as leads.
-      const first = collect();
-      const firstResult = await runGenerationStep({
-        filters: filters({ limit: 10, newAppsOnly: true }),
-        cursor: createInitialCursor(KEYWORD),
-        known,
-        budgetMs: 20_000,
-        emit: first.emit,
-        client,
-      });
-      expect(first.leads().length).toBe(3);
-      expect(firstResult.stats.matched).toBe(3);
-      expect(known.size).toBeGreaterThan(0);
-
-      // Second run: every one of them is known, so none is offered again.
-      const second = collect();
-      const secondResult = await runGenerationStep({
-        filters: filters({ limit: 10, newAppsOnly: true }),
-        cursor: createInitialCursor(KEYWORD),
-        known,
-        budgetMs: 20_000,
-        emit: second.emit,
-        client,
-      });
-      expect(second.leads()).toHaveLength(0);
-      expect(secondResult.stats.matched).toBe(0);
-      expect(secondResult.stats.knownSkipped).toBeGreaterThan(0);
-      expect(secondResult.stats.collected).toBe(0);
     });
   });
 });

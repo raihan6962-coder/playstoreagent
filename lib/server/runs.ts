@@ -185,7 +185,7 @@ function emptyStats(filters: LeadFilters, cursor: SessionCursor): GenerationStat
     wave: cursor.wave,
     poolSize: 0,
     harvestTarget: HARVEST_TARGET,
-    newAppsOnly: filters.newAppsOnly === true,
+    newAppsOnly: (filters.publishedWithinDays ?? 0) > 0,
     elapsedMs: 0,
   };
 }
@@ -219,7 +219,7 @@ function heartbeat(state: RunState): string {
   };
   // "New apps only" mode has no target, so quoting one would be a lie.
   const count =
-    state.filters.newAppsOnly === true ? `${matched} new leads` : `${matched}/${target} leads`;
+    (state.filters.publishedWithinDays ?? 0) > 0 ? `${matched} new leads` : `${matched}/${target} leads`;
   return `Still working — ${count} after ${queriesRun} queries.`;
 }
 
@@ -479,7 +479,7 @@ export async function executeTick(
     // fires rounds 2..MAX itself whenever the plan runs dry mid-step).
     // "New apps only" mode never leaves the keyword it was given, so it
     // skips the generation round entirely.
-    if (!state.cursor.secondaryTried && state.filters.newAppsOnly !== true) {
+    if (!state.cursor.secondaryTried && (state.filters.publishedWithinDays ?? 0) <= 0) {
       appendLog(state, "phase", `Generating related search keywords for “${state.keyword}”…`);
       const prime = await primeRoundOne(state.cursor);
       if (prime.generated > 0) {

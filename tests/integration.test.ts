@@ -61,6 +61,34 @@ liveDescribe("live Play Store", () => {
   );
 
   it(
+    "reads a real listing's first-release date",
+    async () => {
+      const client = new PlayClient();
+      // A listing the store tracks a release date for.
+      const detail = await fetchAppDetail(client, "com.jvnconsultancy.writebengalialphabet");
+
+      expect(detail.app?.releasedAt).not.toBeNull();
+      const released = detail.app?.releasedAt ?? 0;
+      // A plausible date in the past, not in the future and not in 1970.
+      expect(released).toBeGreaterThan(Date.UTC(2020, 0, 1));
+      expect(released).toBeLessThan(Date.now());
+      console.log(`[live] released ${new Date(released).toISOString().slice(0, 10)}`);
+    },
+    60_000,
+  );
+
+  it(
+    "has no release date for a listing the store no longer dates",
+    async () => {
+      const client = new PlayClient();
+      // Listed in 2011: Play leaves the release row empty for listings this old.
+      const detail = await fetchAppDetail(client, "com.google.android.apps.translate");
+      expect(detail.app?.releasedAt).toBeNull();
+    },
+    60_000,
+  );
+
+  it(
     "runs a small end-to-end generation against the live store",
     async () => {
       const maxRating = 4;
@@ -72,6 +100,10 @@ liveDescribe("live Play Store", () => {
       const result = await runGenerationStep({
         filters: { keyword: "budget tracker", maxRating, maxInstalls, limit, country: "US" },
         cursor: createInitialCursor("budget tracker"),
+        // A production run harvests a thousand cards before it filters any of
+        // them; a live probe has seconds, not minutes, so it uses a small
+        // floor to reach the filter stage at all.
+        harvestTarget: 60,
         budgetMs: 75_000,
         emit: (event) => {
           events.push(event);
@@ -81,7 +113,8 @@ liveDescribe("live Play Store", () => {
 
       console.log(
         `[live] reason=${result.reason} discovered=${result.stats.discovered} ` +
-          `evaluated=${result.stats.evaluated} matched=${result.stats.matched} ` +
+          `collected=${result.stats.collected} evaluated=${result.stats.evaluated} ` +
+          `matched=${result.stats.matched} ` +
           `queries=${result.stats.queriesRun}/${result.stats.queriesTotal} ` +
           `lowestRating=${result.stats.lowestRatingSeen}`,
       );

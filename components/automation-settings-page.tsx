@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { lintTemplate } from "@/lib/templateLint";
+import { DEFAULT_WINDOW_DAYS, PUBLISHED_WINDOWS } from "@/lib/validation/input";
 import type { AutomationTask, Mailbox, TaskStatus } from "@/types/automation";
 
 const fieldClass =
@@ -28,8 +29,10 @@ interface FormValues {
   templateSubject: string;
   templateBody: string;
   intervalSeconds: string;
-  /** "New apps only": one keyword, no lead cap, no app the keyword already produced. */
-  newAppsOnly: boolean;
+  /**
+   * "Newly published apps": the store window in days, or "" for the mode off.
+   */
+  publishedWithinDays: string;
 }
 
 function pad(value: number): string {
@@ -55,7 +58,7 @@ function emptyForm(): FormValues {
     templateSubject: "",
     templateBody: "",
     intervalSeconds: "30",
-    newAppsOnly: false,
+    publishedWithinDays: "",
   };
 }
 
@@ -102,6 +105,8 @@ export function AutomationSettingsPage() {
   const [formError, setFormError] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
+  /** The "newly published" mode is on when a window is chosen. */
+  const newAppsMode = values.publishedWithinDays !== "";
 
   const refresh = useCallback(async () => {
     try {
@@ -171,7 +176,7 @@ export function AutomationSettingsPage() {
       templateSubject: task.templateSubject,
       templateBody: task.templateBody,
       intervalSeconds: String(task.intervalSeconds),
-      newAppsOnly: task.newAppsOnly === true,
+      publishedWithinDays: task.publishedWithinDays ? String(task.publishedWithinDays) : "",
     });
     setFormError("");
     setFormOpen(true);
@@ -206,7 +211,9 @@ export function AutomationSettingsPage() {
       templateSubject: values.templateSubject,
       templateBody: values.templateBody,
       intervalSeconds: Number(values.intervalSeconds),
-      newAppsOnly: values.newAppsOnly,
+      publishedWithinDays: values.publishedWithinDays
+        ? Number(values.publishedWithinDays)
+        : null,
     };
 
     setSaving(true);
@@ -330,8 +337,8 @@ export function AutomationSettingsPage() {
             <Field
               label="Max rating"
               hint={
-                values.newAppsOnly
-                  ? "Off in new-apps-only mode — every app the keyword surfaces is collected"
+                newAppsMode
+                  ? "Off in newly-published mode — the publish date decides"
                   : "0.5 – 5.0"
               }
             >
@@ -341,36 +348,28 @@ export function AutomationSettingsPage() {
                 onChange={(event) => set("maxRating", event.target.value)}
                 inputMode="decimal"
                 placeholder="3.5"
-                disabled={values.newAppsOnly}
+                disabled={newAppsMode}
               />
             </Field>
             <Field
               label="Max installs"
-              hint={values.newAppsOnly ? "Off in new-apps-only mode" : "10000, 10K, 100K or 1M"}
+              hint={newAppsMode ? "Off in newly-published mode" : "10000, 10K, 100K or 1M"}
             >
               <input
                 className={fieldClass}
                 value={values.maxInstalls}
                 onChange={(event) => set("maxInstalls", event.target.value)}
                 placeholder="500000"
-                disabled={values.newAppsOnly}
+                disabled={newAppsMode}
               />
             </Field>
-            <Field
-              label="Lead target"
-              hint={
-                values.newAppsOnly
-                  ? "Off in new-apps-only mode — the task takes every app the keyword has left"
-                  : "1 – 1,000"
-              }
-            >
+            <Field label="Lead target" hint="1 – 1,000">
               <input
                 className={fieldClass}
                 value={values.limit}
                 onChange={(event) => set("limit", event.target.value)}
                 inputMode="numeric"
                 placeholder="100"
-                disabled={values.newAppsOnly}
               />
             </Field>
             <Field label="Starting time" wide hint="Your local date + time — the task starts then (± a minute while the tab is closed)">
@@ -383,22 +382,45 @@ export function AutomationSettingsPage() {
             </Field>
 
             <div className="sm:col-span-2 lg:col-span-3">
-              <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 transition hover:border-emerald-400/40">
-                <input
-                  type="checkbox"
-                  checked={values.newAppsOnly}
-                  onChange={(event) => set("newAppsOnly", event.target.checked)}
-                  className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
-                />
-                <span className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium text-zinc-100">New apps only</span>
-                  <span className="text-xs leading-relaxed text-zinc-500">
-                    Stay on this one keyword and skip every app it has already produced in an
-                    earlier run. The rating ceiling, the install cap and the lead target are all
-                    off — the task collects every app this keyword surfaces.
-                  </span>
-                </span>
-              </label>
+              <div className="flex flex-col gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3">
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                  <label className="flex cursor-pointer items-center gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={newAppsMode}
+                      onChange={(event) =>
+                        set(
+                          "publishedWithinDays",
+                          event.target.checked ? String(DEFAULT_WINDOW_DAYS) : "",
+                        )
+                      }
+                      className="h-4 w-4 accent-emerald-500"
+                    />
+                    <span className="text-sm font-medium text-zinc-100">Newly published apps</span>
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-zinc-400">
+                    Published within
+                    <select
+                      className="rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 outline-none transition focus:border-emerald-500 disabled:opacity-50"
+                      value={values.publishedWithinDays || String(DEFAULT_WINDOW_DAYS)}
+                      onChange={(event) => set("publishedWithinDays", event.target.value)}
+                      disabled={!newAppsMode}
+                    >
+                      {PUBLISHED_WINDOWS.map((days) => (
+                        <option key={days} value={days}>
+                          {days} days
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <p className="text-xs leading-relaxed text-zinc-500">
+                  Only apps the store says were published inside that window — a brand-new
+                  listing, not an old one with a fresh update. The task stays on this one
+                  keyword, and the rating ceiling and install cap step aside because the publish
+                  date is what makes an app new. The lead target still applies.
+                </p>
+              </div>
             </div>
 
             <div className="sm:col-span-2 lg:col-span-3">
@@ -519,16 +541,16 @@ export function AutomationSettingsPage() {
                     >
                       {task.status.replace("-", " ")}
                     </span>
-                    {task.newAppsOnly === true && (
+                    {task.publishedWithinDays ? (
                       <span className="rounded-full border border-sky-400/40 bg-sky-400/10 px-2 py-0.5 text-[11px] uppercase tracking-wide text-sky-300">
-                        new apps only
+                        new · {task.publishedWithinDays}d
                       </span>
-                    )}
+                    ) : null}
                   </div>
                   <p className="mt-1 text-xs text-zinc-500">
                     {new Date(task.startAt).toLocaleString()} ·{" "}
-                    {task.newAppsOnly === true
-                      ? "every app this keyword surfaces"
+                    {task.publishedWithinDays
+                      ? `published in the last ${task.publishedWithinDays} days`
                       : `target ${task.limit} leads`}{" "}
                     · rating ≤ {task.maxRating} · installs ≤{" "}
                     {task.maxInstalls.toLocaleString("en-US")} · every {task.intervalSeconds}s

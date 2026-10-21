@@ -28,6 +28,15 @@ export interface StoreApp {
    * package-scoped number.
    */
   ratingSource?: "jsonld" | "af" | "visible";
+  /**
+   * When the listing was first published, in epoch milliseconds.
+   *
+   * Only a detail page carries it — search cards never do, exactly like
+   * `email` and `ratingsCount`. Null when the store records no release date
+   * for the listing (Play leaves the row empty for old listings), which
+   * means "not provably new", not "unknown".
+   */
+  releasedAt?: number | null;
 }
 
 export type InstallCertainty = "exact" | "bucket" | "unknown";
@@ -56,13 +65,18 @@ export interface LeadFilters {
    */
   country: string;
   /**
-   * "New apps only": the run stays on this one keyword and ignores every
-   * package it has already judged for it, so the harvest pool fills with
-   * apps the keyword has never produced before. The lead target is ignored
-   * too — the run keeps going until the keyword's supply of new apps runs
-   * out, because "as many as possible" is the point of the mode.
+   * "Newly published apps": only listings published within this many days
+   * qualify, and the run stays on this one keyword.
+   *
+   * The window is what makes an app *new* — the install count is not,
+   * because a listing can sit at ten installs for years (measured: one app
+   * with 10+ installs was first released in 2023). A listing with no
+   * recorded release date never qualifies: it cannot be proven new.
+   *
+   * Undefined or zero means the mode is off: the rating ceiling, the install
+   * cap and the target apply as they always do.
    */
-  newAppsOnly?: boolean;
+  publishedWithinDays?: number;
 }
 
 export type SessionPhase = "suggest" | "collect" | "filter" | "enrich" | "done";
@@ -185,6 +199,11 @@ export interface SessionCounters {
   cardDropRating: number;
   cardDropInstalls: number;
   cardDropIrrelevant: number;
+  /**
+   * Listings the "newly published" mode skipped because the store records a
+   * first-release date older than the window (or none at all).
+   */
+  publishedTooOld: number;
 }
 
 export interface GenerationStats extends SessionCounters {
@@ -425,8 +444,11 @@ export interface GenerateRequest {
   maxRating: number;
   maxInstalls: number;
   limit: number;
-  /** "New apps only": one keyword, no lead cap, no app the keyword has already produced. */
-  newAppsOnly?: boolean;
+  /**
+   * "Newly published apps": only listings published within this many days
+   * qualify, and the run stays on this one keyword.
+   */
+  publishedWithinDays?: number;
   /** Two-letter Play Store country; defaults to the requester's region. */
   country?: string;
   cursor?: SessionCursor | null;

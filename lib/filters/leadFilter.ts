@@ -36,13 +36,13 @@ export interface Evaluation {
 export const PLAY_BASE_URL = "https://play.google.com";
 
 /**
- * "New apps only" mode collects on the keyword alone. The rating ceiling and
- * the install cap are not rules in that mode — the operator asked for every
- * app the keyword surfaces — so the numbers are only ever shown, never used
- * to drop a row.
+ * "Newly published apps" mode collects on the keyword alone. The rating
+ * ceiling and the install cap are not rules in that mode — the operator asked
+ * for apps the keyword has just surfaced — so the numbers are only ever
+ * shown, never used to drop a row.
  */
 function keywordOnly(filters: LeadFilters): boolean {
-  return filters.newAppsOnly === true;
+  return typeof filters.publishedWithinDays === "number" && filters.publishedWithinDays > 0;
 }
 
 export function buildPlayStoreUrl(packageName: string, hl = "en", gl = "US"): string {
@@ -190,6 +190,12 @@ export function leadPassesFilters(lead: Lead, filters: LeadFilters): boolean {
   if (!keywordOnly(filters)) {
     if (lead.rating === null || roundRating(lead.rating) > filters.maxRating) return false;
     if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
+  }
+  // The "newly published" window: a listing with no recorded release date
+  // cannot be proven new, so it never passes.
+  if (filters.publishedWithinDays !== undefined && filters.publishedWithinDays > 0) {
+    if (lead.releasedAt === null || lead.releasedAt === undefined) return false;
+    if (lead.releasedAt < Date.now() - filters.publishedWithinDays * 86_400_000) return false;
   }
 
   const tokens = tokenizeKeyword(filters.keyword);

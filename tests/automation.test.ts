@@ -90,7 +90,7 @@ function seedTask(partial: Partial<AutomationTask> = {}): AutomationTask {
     maxRating: 3.5,
     maxInstalls: 500_000,
     limit: 100,
-    newAppsOnly: false,
+    publishedWithinDays: null,
     startAt: now + 60_000,
     mailboxIds: [],
     templateSubject: "About {{app}}",
@@ -295,28 +295,28 @@ describe("automation: task validation & CRUD", () => {
     expect(storedTasks(mock.files)[0].id).toBe(task.id);
   });
 
-  it("carries the new-apps-only switch on the task", async () => {
+  it("carries the newly-published window on the task", async () => {
     const mailbox = await addMailbox({ label: "box", webAppUrl: APPS_URL, dailyQuota: 100 });
 
-    // Off unless asked for.
+    // Off unless the operator picks a window.
     const plain = await validateTask(validPayload({ mailboxIds: [mailbox.id] }));
     if (!plain.ok) throw new Error("expected valid payload");
-    expect(plain.value.newAppsOnly).toBe(false);
+    expect(plain.value.publishedWithinDays).toBeNull();
 
-    // On when the form sends it.
+    // On when the form sends a window.
     const solo = await validateTask(
-      validPayload({ mailboxIds: [mailbox.id], newAppsOnly: true }),
+      validPayload({ mailboxIds: [mailbox.id], publishedWithinDays: 30 }),
     );
     if (!solo.ok) throw new Error("expected valid payload");
-    expect(solo.value.newAppsOnly).toBe(true);
+    expect(solo.value.publishedWithinDays).toBe(30);
 
     const task = await createTask(solo.value);
-    expect(task.newAppsOnly).toBe(true);
-    expect((await listTasks())[0].newAppsOnly).toBe(true);
+    expect(task.publishedWithinDays).toBe(30);
+    expect((await listTasks())[0].publishedWithinDays).toBe(30);
 
-    // A non-boolean is refused rather than silently switching the mode on.
+    // A window nobody can publish inside is refused.
     const bad = await validateTask(
-      validPayload({ mailboxIds: [mailbox.id], newAppsOnly: "on" }),
+      validPayload({ mailboxIds: [mailbox.id], publishedWithinDays: 100_000 }),
     );
     expect(bad.ok).toBe(false);
   });

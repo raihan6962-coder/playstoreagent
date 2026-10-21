@@ -210,6 +210,7 @@ function emptyCounters(): SessionCounters {
     cardDropRating: 0,
     cardDropInstalls: 0,
     cardDropIrrelevant: 0,
+    publishedTooOld: 0,
   };
 }
 
@@ -400,7 +401,7 @@ function buildStats(
     wave: cursor.wave,
     poolSize,
     harvestTarget,
-    newAppsOnly: filters.newAppsOnly === true,
+    newAppsOnly: (filters.publishedWithinDays ?? 0) > 0,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -457,13 +458,13 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     options.pool ?? emptyPool(cursor.keyword, cursor.keywordIndex ?? 0);
 
   /**
-   * "New apps only" mode. The run stays on the one keyword it was given and
-   * ignores every package that keyword has already produced, so the pool
-   * fills with apps the operator has not seen before. The lead target is
-   * ignored as well — the mode's promise is "as many as this keyword can
-   * still give", not "stop at N".
+   * "Newly published apps" mode. The run stays on the one keyword it was
+   * given and only collects listings the store says were published inside
+   * the window — the rating ceiling and the install cap step aside, because
+   * the date is what makes an app new, not its numbers.
    */
-  const soloMode = filters.newAppsOnly === true;
+  const soloMode =
+    typeof filters.publishedWithinDays === "number" && filters.publishedWithinDays > 0;
   /**
    * The keyword's cross-run memory. Only meaningful in solo mode, but it is
    * written by every run: a keyword's memory must reflect everything it has
@@ -487,9 +488,38 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     known !== null &&
     known.keyword === activeCycleKeyword() &&
     known.has(packageName);
-  /** True once the run has enough leads — never true in solo mode. */
-  const targetReached = (): boolean =>
-    !soloMode && cursor.counters.matched >= filters.limit;
+  /**
+   * True once the run has enough leads.
+   *
+   * The "newly published" mode respects the target too: the operator sets
+   * how many new apps they want, and the run stops there. What the mode
+   * changes is *which* apps count, not whether there is a target.
+   */
+  const targetReached = (): boolean => cursor.counters.matched >= filters.limit;
+  /**
+   * The "newly published" window in days, or null when the mode is off.
+   */
+  const publishedWindowDays = (): number | null => {
+    const days = filters.publishedWithinDays;
+    return typeof days === "number" && Number.isFinite(days) && days > 0
+      ? Math.floor(days)
+      : null;
+  };
+  /**
+   * Was this listing published inside the window?
+   *
+   * A listing the store records no release date for cannot be proven new, so
+   * it never qualifies — the honest answer to "is this new?" is "unknown",
+   * and unknown is not new. The install count is not a substitute: a listing
+   * can sit at ten installs for years (measured: one app with 10+ installs
+   * was first released in 2023).
+   */
+  const isRecentlyPublished = (releasedAt: number | null | undefined): boolean => {
+    const days = publishedWindowDays();
+    if (days === null) return true;
+    if (releasedAt === null || releasedAt === undefined) return false;
+    return releasedAt >= Date.now() - days * 86_400_000;
+  };
   /**
    * "3 new leads" in solo mode, "3/100 leads" otherwise — the target is
    * ignored there, so quoting it would be a lie.
@@ -971,7 +1001,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         // Safety valve: the verify queue is overflowing (hundreds of matches
         // inside one window). Show the card-verified lead instead of silently
         // discarding a candidate that already passed every card-side rule.
-        if (stillQualifies) {
+        //
+        // "Newly published" mode has no card-side rule for what it is after:
+        // the release date lives on the detail page, so a card-verified lead
+        // would be published who-knows-when. The card waits for a verify slot
+        // instead of being shown as a new app.
+        if (stillQualifies && publishedWindowDays() === null) {
           if (
             emitLead(lead, {
               from: "card",
@@ -979,6 +1014,11 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
             })
           )
             return true;
+          return false;
+        }
+        if (stillQualifies) {
+          // The card keeps its place in the cycle's inbox: the next harvest
+          // settles it again and it reaches a verify slot.
           return false;
         }
         // Foreign card inside the drift dead band: the card already predicted
@@ -1502,8 +1542,18 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           // verification then rejects.
           const evaluation = evaluateCycled(app, evalSeen).evaluation;
           if (evaluation.status === "match" && evaluation.lead) {
-            settled = true;
-            target = emitLead(evaluation.lead, { from: queue, origin });
+            // "Newly published" mode: the listing's first-release date is the
+            // verdict, not its numbers. The detail page is the only place the
+            // date exists, so this is where the rule bites — a card that
+            // matched the keyword but was published long ago is not a new app
+            // and never becomes a lead.
+            if (!isRecentlyPublished(app.releasedAt)) {
+              cursor.counters.publishedTooOld += 1;
+              textRejected = true;
+            } else {
+              settled = true;
+              target = emitLead(evaluation.lead, { from: queue, origin });
+            }
           } else if (!evaluation.reasons.includes("not-relevant")) {
             // Kept the keyword but broke a ceiling: the closest misses make
             // the best expansion seeds (their neighborhood tends to match).

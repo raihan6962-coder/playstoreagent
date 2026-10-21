@@ -8,6 +8,12 @@ export const MAX_LEADS = 1_000;
 export const MIN_RATING = 0.5;
 export const MAX_RATING = 5;
 export const MAX_INSTALLS = 1_000_000_000;
+/** Longest "published within" window the store's own history can answer. */
+export const MAX_WINDOW_DAYS = 3_650;
+/** Windows the "newly published" mode offers, in days. */
+export const PUBLISHED_WINDOWS = [7, 30, 90, 180, 365] as const;
+/** The window the mode starts on. */
+export const DEFAULT_WINDOW_DAYS = 90;
 /** Ratings/links default to the storefront most of this app's users open. */
 export const DEFAULT_COUNTRY = "BD";
 
@@ -115,14 +121,23 @@ export function validateLimit(input: unknown): ValidationResult<number> {
 }
 
 /**
- * A boolean switch. Anything that is not exactly `true` is off — a form
- * that sends "on", 1 or "true" as a string must not silently switch a mode
- * on that the operator did not intend.
+ * The "newly published" window, in days. Null means the mode is off.
+ *
+ * Zero is read as "off" rather than "published today" — a zero-day window
+ * would collect nothing, and the honest reading of an unset field is that the
+ * operator did not ask for the mode.
  */
-export function validateBoolean(input: unknown): ValidationResult<boolean> {
-  if (input === undefined || input === null) return { ok: true, value: false };
-  if (typeof input !== "boolean") {
-    return { ok: false, error: "This option must be either on or off." };
+export function validateWindow(input: unknown): ValidationResult<number | null> {
+  if (input === undefined || input === null || input === "") {
+    return { ok: true, value: null };
   }
-  return { ok: true, value: input };
+  const value = typeof input === "string" ? Number(input) : input;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { ok: false, error: "The published-within window must be a number of days." };
+  }
+  const days = Math.round(value);
+  if (days < 0 || days > MAX_WINDOW_DAYS) {
+    return { ok: false, error: `The published-within window must be between 1 and ${MAX_WINDOW_DAYS} days.` };
+  }
+  return { ok: true, value: days === 0 ? null : days };
 }

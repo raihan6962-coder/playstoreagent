@@ -50,10 +50,36 @@ export function searchHtml(entries: unknown[][]): string {
   )}</script></body></html>`;
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** The date format Play prints in the app-info row ("Jun 5, 2025"). */
+function printedDate(ms: number): string {
+  const date = new Date(ms);
+  return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
+}
+
+/**
+ * The `ds:5` app-info block, in the layout Play uses: the release date sits
+ * at index 10, the install row at 13 (see lib/parser/releaseDate.ts).
+ */
+function appInfoBlock(title: string, installsLabel: string, releasedAt: number | null): unknown {
+  const info: unknown[] = new Array(14).fill(null);
+  info[0] = [title];
+  info[9] = ["Everyone", [null, 2, [512, 512], [null, null, "https://play-lh.googleusercontent.com/x=s64"]]];
+  info[10] =
+    releasedAt === null
+      ? null
+      : [printedDate(releasedAt), [Math.floor(releasedAt / 1000), 0]];
+  info[13] = [installsLabel, 10, 25, installsLabel];
+  // The app-info block lives at data[1][2].
+  return [null, [null, null, info]];
+}
+
 export function detailHtml(
   main: EntryOptions,
   similar: EntryOptions[] = [],
   installsLabel = "10,000+",
+  releasedAt: number | null = null,
 ): string {
   const jsonLd = {
     "@context": "https://schema.org",
@@ -72,15 +98,25 @@ export function detailHtml(
 
   const afData = [main, ...similar].map((entry) => [makeAppEntry(entry)]);
   const emailAnchor = main.email
-    ? `<a class="Si6A0c RrSxVb" href="mailto:${main.email}" target="_blank" aria-label="Support email mailto:${main.email} will open in your email app"></a>`
+    ? `<a class="Si6A0c RrSxVb" href="mailto:${main.email}" target="_blank" aria-label="Support email mailto:${main.email} will open your email app"></a>`
     : "";
+  // The page prints the listing's last update; the release date lives only in
+  // the data blob, exactly as the store does it.
+  const updatedOn =
+    releasedAt === null
+      ? ""
+      : `<div class="TKjAsc"><div><div class="lXlx5">Updated on</div><div class="xg1aie">${printedDate(
+          releasedAt + 86_400_000,
+        )}</div></div></div>`;
 
   return `<html><head><meta property="og:url" content="https://play.google.com/store/apps/details?id=${main.packageName}&hl=en"></head>
 <body>
 <script type="application/ld+json" nonce="abc123">${JSON.stringify(jsonLd)}</script>
 <div class="WsMG1c">${installsLabel}</div><div class="ClM7O">Downloads</div>
 <div class="fgfPI">${emailAnchor}</div>
+${updatedOn}
 <script>${afScript("ds:8", afData)}</script>
+<script>${afScript("ds:5", appInfoBlock(main.title, installsLabel, releasedAt))}</script>
 </body></html>`;
 }
 

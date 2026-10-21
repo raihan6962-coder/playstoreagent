@@ -6,11 +6,11 @@ import { allowRequest, clientIp } from "@/lib/server/rateLimit";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
   parseInstallInput,
-  validateBoolean,
   validateCountry,
   validateKeyword,
   validateLimit,
   validateMaxRating,
+  validateWindow,
 } from "@/lib/validation/input";
 import type {
   GenerateRequest,
@@ -60,8 +60,8 @@ function parseRequest(input: unknown, fallbackCountry: string | null): ParsedReq
   const limit = validateLimit(body.limit);
   if (!limit.ok) return { ok: false, error: limit.error };
 
-  const newAppsOnly = validateBoolean(body.newAppsOnly);
-  if (!newAppsOnly.ok) return { ok: false, error: newAppsOnly.error };
+  const publishedWithinDays = validateWindow(body.publishedWithinDays);
+  if (!publishedWithinDays.ok) return { ok: false, error: publishedWithinDays.error };
 
   // The country decides which storefront's ratings the table shows. Prefer the
   // form value, then Vercel's geo header, then the default.
@@ -75,7 +75,7 @@ function parseRequest(input: unknown, fallbackCountry: string | null): ParsedReq
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
       limit: limit.value,
-      newAppsOnly: newAppsOnly.value,
+      publishedWithinDays: publishedWithinDays.value ?? undefined,
       country: country.value,
     },
     cursor: sanitizeCursor(body.cursor, keyword.value),
@@ -95,7 +95,7 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     wave: cursor.wave,
     poolSize: 0,
     harvestTarget: HARVEST_TARGET,
-    newAppsOnly: filters.newAppsOnly === true,
+    newAppsOnly: (filters.publishedWithinDays ?? 0) > 0,
     elapsedMs: 0,
   };
 }

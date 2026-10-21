@@ -156,8 +156,8 @@ describe("cardCanStillQualify", () => {
   });
 });
 
-describe("new apps only mode", () => {
-  const solo: LeadFilters = { ...filters, newAppsOnly: true };
+describe("newly published mode", () => {
+  const solo: LeadFilters = { ...filters, publishedWithinDays: 30 };
 
   it("keeps an app the rating ceiling would have dropped", () => {
     const result = evaluateApp(app({ rating: 4.8, ratingRaw: "4.8" }), solo, new Set());
@@ -205,7 +205,7 @@ describe("new apps only mode", () => {
   });
 
   it("keeps a lead whose numbers break the ceilings", () => {
-    const lead = toLead(app({ rating: 4.9, ratingRaw: "4.9" }), solo);
+    const lead = { ...toLead(app({ rating: 4.9, ratingRaw: "4.9" }), solo), releasedAt: Date.now() };
     expect(leadPassesFilters(lead, solo)).toBe(true);
     // The same lead under the normal rules is dropped.
     expect(leadPassesFilters(lead, filters)).toBe(false);
@@ -215,5 +215,19 @@ describe("new apps only mode", () => {
     expect(detailAppQualifies({ rating: null } as StoreApp, solo)).toBe(true);
     expect(detailAppQualifies({ rating: 4.9 } as StoreApp, solo)).toBe(true);
     expect(detailAppQualifies({ rating: 4.9 } as StoreApp, filters)).toBe(false);
+  });
+
+  it("drops a lead published before the window", () => {
+    const fresh = toLead(app(), solo);
+    const withDate = { ...fresh, releasedAt: Date.now() - 5 * 86_400_000 };
+    const old = { ...fresh, releasedAt: Date.now() - 90 * 86_400_000 };
+    const undated = { ...fresh, releasedAt: null };
+
+    expect(leadPassesFilters(withDate, solo)).toBe(true);
+    expect(leadPassesFilters(old, solo)).toBe(false);
+    // No recorded release date cannot be proven new.
+    expect(leadPassesFilters(undated, solo)).toBe(false);
+    // The same lead passes when the mode is off.
+    expect(leadPassesFilters(undated, filters)).toBe(true);
   });
 });

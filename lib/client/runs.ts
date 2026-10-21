@@ -59,8 +59,11 @@ export interface CreateRunInput {
   maxRating: number;
   maxInstalls: number;
   limit: number;
-  /** "New apps only": one keyword, no lead cap, no app the keyword already produced. */
-  newAppsOnly?: boolean;
+  /**
+   * "Newly published apps": only listings published within this many days
+   * qualify, and the run stays on this one keyword.
+   */
+  publishedWithinDays?: number;
 }
 
 async function readError(response: Response): Promise<RunRequestError> {

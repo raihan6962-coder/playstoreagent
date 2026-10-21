@@ -3,6 +3,7 @@ import { collectStoreApps, looksLikePackageId } from "./appEntries";
 import { extractSoftwareApplication } from "./jsonLd";
 import { parseInstallCount } from "./installs";
 import { parseRating } from "./rating";
+import { parseReleaseDate, readReleaseDateFromAppInfo } from "./releaseDate";
 import { stripHtml, truncate } from "./html";
 import type { StoreApp } from "@/types/lead";
 
@@ -96,6 +97,41 @@ function collectAllApps(html: string): StoreApp[] {
 }
 
 /**
+ * The "Updated on" date the page prints next to the listing.
+ *
+ * Play renders the app-info rows as a label/value pair, so the read is
+ * label-anchored rather than positional — the same discipline the visible
+ * rating read uses. The value is used to sanity-check the release date read
+ * out of the data blob: a listing cannot be released after its last update.
+ */
+const UPDATED_ON_PATTERN = /Updated on<\/div><div[^>]*>([^<]{1,40})</i;
+
+function readUpdatedOn(html: string): number | null {
+  const match = UPDATED_ON_PATTERN.exec(html);
+  if (!match) return null;
+  return parseReleaseDate([match[1].trim()]);
+}
+
+/**
+ * The listing's first-release date, read out of the `ds:5` app-info block.
+ *
+ * Null when the store records no release date for the listing — Play leaves
+ * the row empty for listings old enough that it stopped tracking one. That
+ * is not a failure: a listing with no release date is not a newly published
+ * one, and saying so is the honest answer.
+ */
+function readReleasedAt(html: string): number | null {
+  for (const script of extractAfScripts(html)) {
+    if (script.key !== "ds:5") continue;
+    const data = script.data as unknown[];
+    const appInfo = Array.isArray(data?.[1]) ? (data[1] as unknown[])[2] : undefined;
+    const released = readReleaseDateFromAppInfo(appInfo);
+    if (released !== null) return released;
+  }
+  return null;
+}
+
+/**
  * Parses a Play Store app detail page into the enriched app plus the
  * "similar apps" cluster Play renders on the same page.
  */
@@ -136,6 +172,15 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
         ratingRaw = visible.raw;
         ratingSource = "visible";
       }
+      // The listing's first-release date. Checked against the date the page
+      // prints as "Updated on": a listing can never be released after its own
+      // last update, so a release date that reads later than the update is a
+      // misread and is discarded rather than believed.
+      let releasedAt = readReleasedAt(html);
+      const updatedOn = readUpdatedOn(html);
+      if (releasedAt !== null && updatedOn !== null && releasedAt > updatedOn) {
+        releasedAt = null;
+      }
       app = {
         packageName,
         title,
@@ -143,6 +188,7 @@ export function parseDetailPage(html: string, requestedPackage?: string): Detail
         rating,
         ratingRaw,
         ratingsCount: jsonLd?.ratingsCount ?? null,
+        releasedAt,
         installsRaw: installs.ok ? installs.raw : null,
         installs: installs.value,
         installsUpper: installs.upperBound,

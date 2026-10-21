@@ -223,6 +223,7 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {  if (
   else counters.rateLimitHits = Math.floor(hits);
   // Same for the verification diagnostics.
   const optional = [
+    "publishedTooOld",
     "knownSkipped",
     "candidates",
     "verifyRejected",

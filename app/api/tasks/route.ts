@@ -23,7 +23,7 @@ function publicTask(task: AutomationTask): PublicTask {
     maxRating: task.maxRating,
     maxInstalls: task.maxInstalls,
     limit: task.limit,
-    newAppsOnly: task.newAppsOnly === true,
+    publishedWithinDays: task.publishedWithinDays ?? null,
     startAt: task.startAt,
     mailboxIds: task.mailboxIds,
     templateSubject: task.templateSubject,

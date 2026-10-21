@@ -110,7 +110,7 @@ export function SearchForm({
           error={errors.maxRating}
           hint={
             newAppsMode
-              ? "Off in newly-published mode — the publish date decides"
+              ? "Off in newly-published mode — only unrated apps qualify, so there is no rating to cap"
               : "0.5 – 5.0, only apps at or below this score"
           }
         >
@@ -127,7 +127,11 @@ export function SearchForm({
         <Field
           label="Max installs"
           error={errors.maxInstalls}
-          hint={newAppsMode ? "Off in newly-published mode" : "10000, 10K, 100K or 1M"}
+          hint={
+            newAppsMode
+              ? "Keep this low — a brand-new app has few installs"
+              : "10000, 10K, 100K or 1M"
+          }
         >
           <input
             className={fieldClass}
@@ -135,7 +139,6 @@ export function SearchForm({
             onChange={set("maxInstalls")}
             inputMode="text"
             placeholder="5000000"
-            disabled={newAppsMode}
           />
         </Field>
 
@@ -183,9 +186,9 @@ export function SearchForm({
         </div>
         <p className="text-xs leading-relaxed text-zinc-500">
           Only apps the store says were published inside that window — a brand-new listing, not
-          an old one with a fresh update. The run stays on this one keyword, and the rating
-          ceiling and install cap step aside because the publish date is what makes an app new.
-          The lead target still applies.
+          an old one with a fresh update. The run stays on this one keyword, and it only
+          collects listings nobody has rated yet: a rated app has been around, and a big
+          install count says the same. The lead target still applies.
         </p>
       </div>
 

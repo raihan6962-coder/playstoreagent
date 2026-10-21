@@ -224,6 +224,7 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {  if (
   // Same for the verification diagnostics.
   const optional = [
     "publishedTooOld",
+    "alreadyRated",
     "knownSkipped",
     "candidates",
     "verifyRejected",

@@ -160,18 +160,22 @@ describe("newly published mode", () => {
   const solo: LeadFilters = { ...filters, publishedWithinDays: 30 };
 
   it("keeps an app the rating ceiling would have dropped", () => {
+    // The rating ceiling is not a rule in the mode: a rating is only shown
+    // for an app people have already rated.
     const result = evaluateApp(app({ rating: 4.8, ratingRaw: "4.8" }), solo, new Set());
     expect(result.status).toBe("match");
     expect(result.lead?.packageName).toBe("com.example.budget");
   });
 
-  it("keeps an app the install ceiling would have dropped", () => {
+  it("still drops an app the install ceiling would have dropped", () => {
+    // A brand-new app has few installs, so the cap stays in force.
     const result = evaluateApp(
       app({ installs: 900_000_000, installsRaw: "900,000,000+" }),
       solo,
       new Set(),
     );
-    expect(result.status).toBe("match");
+    expect(result.status).toBe("reject");
+    expect(result.reasons).toContain("installs-too-high");
   });
 
   it("keeps an app with no rating and no install count", () => {
@@ -180,8 +184,8 @@ describe("newly published mode", () => {
       solo,
       new Set(),
     );
-    expect(result.status).toBe("match");
-    expect(result.reasons).toEqual([]);
+    expect(result.status).toBe("reject");
+    expect(result.reasons).toContain("missing-installs");
   });
 
   it("still drops an app that does not carry the keyword", () => {
@@ -199,16 +203,23 @@ describe("newly published mode", () => {
     expect(result.reasons).toEqual(["duplicate"]);
   });
 
-  it("never lets a ceiling disqualify a card", () => {
-    expect(cardCanStillQualify({ rating: 4.9, installs: 900_000_000 }, solo, true)).toBe(true);
-    expect(cardCanStillQualify({ rating: 4.9, installs: 900_000_000 }, solo, false)).toBe(true);
+  it("never lets the rating ceiling disqualify a card, but the install cap does", () => {
+    expect(cardCanStillQualify({ rating: 4.9, installs: 10_000 }, solo, true)).toBe(true);
+    expect(cardCanStillQualify({ rating: 4.9, installs: 10_000 }, solo, false)).toBe(true);
+    expect(cardCanStillQualify({ rating: 4.9, installs: 900_000_000 }, solo, true)).toBe(false);
   });
 
-  it("keeps a lead whose numbers break the ceilings", () => {
+  it("keeps a lead whose rating breaks the ceiling", () => {
     const lead = { ...toLead(app({ rating: 4.9, ratingRaw: "4.9" }), solo), releasedAt: Date.now() };
-    expect(leadPassesFilters(lead, solo)).toBe(true);
-    // The same lead under the normal rules is dropped.
+    // The rating ceiling is not a rule in the mode.
+    expect(leadPassesFilters(lead, solo)).toBe(false); // rated, so not new
+    // The same lead under the normal rules is dropped on the ceiling.
     expect(leadPassesFilters(lead, filters)).toBe(false);
+  });
+
+  it("keeps an unrated lead published inside the window", () => {
+    const lead = { ...toLead(app({ rating: null, ratingRaw: null }), solo), releasedAt: Date.now() };
+    expect(leadPassesFilters(lead, solo)).toBe(true);
   });
 
   it("never disqualifies a detail page", () => {
@@ -218,16 +229,21 @@ describe("newly published mode", () => {
   });
 
   it("drops a lead published before the window", () => {
-    const fresh = toLead(app(), solo);
-    const withDate = { ...fresh, releasedAt: Date.now() - 5 * 86_400_000 };
+    const fresh = { ...toLead(app({ rating: null, ratingRaw: null }), solo), releasedAt: Date.now() - 5 * 86_400_000 };
     const old = { ...fresh, releasedAt: Date.now() - 90 * 86_400_000 };
     const undated = { ...fresh, releasedAt: null };
 
-    expect(leadPassesFilters(withDate, solo)).toBe(true);
+    expect(leadPassesFilters(fresh, solo)).toBe(true);
     expect(leadPassesFilters(old, solo)).toBe(false);
     // No recorded release date cannot be proven new.
     expect(leadPassesFilters(undated, solo)).toBe(false);
     // The same lead passes when the mode is off.
-    expect(leadPassesFilters(undated, filters)).toBe(true);
+    expect(leadPassesFilters(undated, filters)).toBe(false);
+  });
+
+  it("drops a lead people have already rated", () => {
+    const rated = { ...toLead(app({ rating: 4.9, ratingRaw: "4.9" }), solo), releasedAt: Date.now() };
+    // Rated, so it is not a brand-new listing — whatever the date says.
+    expect(leadPassesFilters(rated, solo)).toBe(false);
   });
 });

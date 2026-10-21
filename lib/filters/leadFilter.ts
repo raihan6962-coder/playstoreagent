@@ -37,9 +37,11 @@ export const PLAY_BASE_URL = "https://play.google.com";
 
 /**
  * "Newly published apps" mode collects on the keyword alone. The rating
- * ceiling and the install cap are not rules in that mode — the operator asked
- * for apps the keyword has just surfaced — so the numbers are only ever
- * shown, never used to drop a row.
+ * ceiling is not a rule in that mode: an app nobody has rated yet has no
+ * rating to compare, and the mode's rules are the publish date and the fact
+ * that nobody has rated the listing. The install cap stays in force — a
+ * brand-new app has few installs, and a big install count is itself a sign
+ * that the listing is not new.
  */
 function keywordOnly(filters: LeadFilters): boolean {
   return typeof filters.publishedWithinDays === "number" && filters.publishedWithinDays > 0;
@@ -120,29 +122,15 @@ export function evaluateApp(
     reasons.push("not-relevant");
   }
 
-  if (keywordOnly(filters)) {
-    if (reasons.length === 0) {
-      return {
-        status: "match",
-        reasons: [],
-        lead: toLead(app, filters),
-        matchedTerms: relevance.matchedTerms,
-        primaryTerms: relevance.primaryTerms,
-      };
+  // In the mode the rating ceiling does not apply: an app nobody has rated
+  // yet has no rating to compare. A card with no rating is exactly the
+  // brand-new listing the mode is looking for.
+  if (!keywordOnly(filters)) {
+    if (app.rating === null) {
+      reasons.push("missing-rating");
+    } else if (roundRating(app.rating) > filters.maxRating) {
+      reasons.push("rating-too-high");
     }
-    return {
-      status: "reject",
-      reasons,
-      lead: null,
-      matchedTerms: relevance.matchedTerms,
-      primaryTerms: relevance.primaryTerms,
-    };
-  }
-
-  if (app.rating === null) {
-    reasons.push("missing-rating");
-  } else if (roundRating(app.rating) > filters.maxRating) {
-    reasons.push("rating-too-high");
   }
 
   let status: EvaluationStatus = reasons.length === 0 ? "match" : "reject";
@@ -185,17 +173,19 @@ export function evaluateApp(
  * Play prints (see {@link roundRating}).
  */
 export function leadPassesFilters(lead: Lead, filters: LeadFilters): boolean {
-  // "New apps only" mode: the numbers are not rules, so they never disqualify
-  // a row. Only whether the listing still carries the keyword is.
+  // "Newly published" mode: the rating ceiling is not a rule — an unrated
+  // listing has no rating to compare. The install cap still applies.
   if (!keywordOnly(filters)) {
     if (lead.rating === null || roundRating(lead.rating) > filters.maxRating) return false;
-    if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
   }
+  if (lead.installs === null || lead.installs > filters.maxInstalls) return false;
   // The "newly published" window: a listing with no recorded release date
-  // cannot be proven new, so it never passes.
+  // cannot be proven new, so it never passes. And a listing people have
+  // already rated is not a brand-new one.
   if (filters.publishedWithinDays !== undefined && filters.publishedWithinDays > 0) {
     if (lead.releasedAt === null || lead.releasedAt === undefined) return false;
     if (lead.releasedAt < Date.now() - filters.publishedWithinDays * 86_400_000) return false;
+    if (lead.rating !== null) return false;
   }
 
   const tokens = tokenizeKeyword(filters.keyword);
@@ -231,12 +221,13 @@ export function filterLeads(leads: Lead[], filters: LeadFilters): Lead[] {
  * own description — {@link leadPassesFilters} does that on the client.
  */
 export function detailAppQualifies(app: StoreApp, filters: LeadFilters): boolean {
-  // "New apps only" mode: a detail page never disqualifies an app, because
-  // the ceilings are not rules there. Relevance was decided on the card.
+  // The install cap applies in every mode. The rating ceiling does not apply
+  // in the "newly published" mode: an unrated listing has no rating to
+  // compare, and being unrated is what makes it new.
+  if (app.installs !== null && app.installs > filters.maxInstalls) return false;
   if (keywordOnly(filters)) return true;
   if (app.rating === null) return false;
   if (roundRating(app.rating) > filters.maxRating) return false;
-  if (app.installs !== null && app.installs > filters.maxInstalls) return false;
   return true;
 }
 
@@ -271,10 +262,10 @@ export function cardCanStillQualify(
   filters: LeadFilters,
   countryFinal: boolean,
 ): boolean {
-  // "New apps only" mode: no ceiling can disqualify a card. The keyword was
-  // already checked, so a relevant card is always worth a detail fetch.
-  if (keywordOnly(filters)) return true;
+  // The install cap applies in every mode.
   if (app.installs !== null && app.installs > filters.maxInstalls) return false;
+  // The rating ceiling does not apply in the "newly published" mode.
+  if (keywordOnly(filters)) return true;
   if (app.rating !== null) {
     const printed = roundRating(app.rating);
     const ceiling = countryFinal ? filters.maxRating : filters.maxRating + FOREIGN_RATING_WINDOW;

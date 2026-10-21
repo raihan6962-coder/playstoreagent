@@ -81,7 +81,10 @@ export function detailHtml(
   installsLabel = "10,000+",
   releasedAt: number | null = null,
 ): string {
-  const jsonLd = {
+  // A listing nobody has rated has no aggregate rating at all — the store
+  // omits the block rather than printing an empty one. An unspecified
+  // rating keeps the default (a rated listing).
+  const jsonLd: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     name: main.title,
@@ -89,12 +92,14 @@ export function detailHtml(
     author: { "@type": "Person", name: main.developer ?? "Example Developer" },
     applicationCategory: main.category ?? "Tools",
     image: "https://play-lh.googleusercontent.com/abc=s64",
-    aggregateRating: {
+  };
+  if (main.rating !== null) {
+    jsonLd.aggregateRating = {
       "@type": "AggregateRating",
       ratingValue: main.ratingValue ?? 2.4,
       ratingCount: 57,
-    },
-  };
+    };
+  }
 
   const afData = [main, ...similar].map((entry) => [makeAppEntry(entry)]);
   const emailAnchor = main.email

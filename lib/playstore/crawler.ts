@@ -211,6 +211,7 @@ function emptyCounters(): SessionCounters {
     cardDropInstalls: 0,
     cardDropIrrelevant: 0,
     publishedTooOld: 0,
+    alreadyRated: 0,
   };
 }
 
@@ -1542,13 +1543,21 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           // verification then rejects.
           const evaluation = evaluateCycled(app, evalSeen).evaluation;
           if (evaluation.status === "match" && evaluation.lead) {
-            // "Newly published" mode: the listing's first-release date is the
-            // verdict, not its numbers. The detail page is the only place the
-            // date exists, so this is where the rule bites — a card that
-            // matched the keyword but was published long ago is not a new app
-            // and never becomes a lead.
-            if (!isRecentlyPublished(app.releasedAt)) {
+            // "Newly published" mode: the listing's first-release date and
+            // the absence of any rating are the verdict, not its numbers. The
+            // detail page is the only place the date exists, so this is
+            // where the rule bites — a card that matched the keyword but was
+            // published long ago, or that people have already rated, is not a
+            // new app and never becomes a lead.
+            const tooOld = soloMode && !isRecentlyPublished(app.releasedAt);
+            const alreadyRated = soloMode && app.rating !== null;
+            if (tooOld) {
               cursor.counters.publishedTooOld += 1;
+              textRejected = true;
+            } else if (alreadyRated) {
+              // Rated already: people have found and used the listing, so
+              // it is not the brand-new app the mode is after.
+              cursor.counters.alreadyRated += 1;
               textRejected = true;
             } else {
               settled = true;

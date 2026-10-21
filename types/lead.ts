@@ -204,6 +204,11 @@ export interface SessionCounters {
    * first-release date older than the window (or none at all).
    */
   publishedTooOld: number;
+  /**
+   * Listings the "newly published" mode skipped because people have already
+   * rated them — a rated listing is not a brand-new one.
+   */
+  alreadyRated: number;
 }
 
 export interface GenerationStats extends SessionCounters {

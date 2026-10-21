@@ -1277,8 +1277,9 @@ describe("runGenerationStep", () => {
             makeAppEntry({
               packageName: `com.example.fresh${seed}`,
               title: `Budget Tracker ${seed}`,
-              rating: "2.1",
-              ratingValue: 2.1,
+              // Nobody has rated a brand-new listing: the store prints no
+              // rating for it, and the mode collects only those.
+              rating: null,
               installs: "10,000+",
             }),
           ]);
@@ -1288,8 +1289,7 @@ describe("runGenerationStep", () => {
             {
               packageName: pkg,
               title: `Budget Tracker ${pkg}`,
-              rating: "2.1",
-              ratingValue: 2.1,
+              rating: null,
               installs: "10,000+",
             },
             [],
@@ -1367,45 +1367,76 @@ describe("runGenerationStep", () => {
       expect(result.reason).toBe("target-reached");
     });
 
-    it("turns the rating and install ceilings off", async () => {
-      // The normal rules keep only the two apps that pass both ceilings.
-      const strict = collect();
-      const strictResult = await runGenerationStep({
-        filters: filters({ limit: 10 }),
-        cursor: createInitialCursor(KEYWORD),
-        budgetMs: 20_000,
-        emit: strict.emit,
-        client: makeFakeClient({ search: () => searchRoutes(), detail: detailRoute }),
+    it("turns the rating ceiling off but keeps rated apps out", async () => {
+      const unrated = {
+        packageName: "com.example.budget",
+        title: "Budget Tracker",
+        rating: null,
+        installs: "10,000+",
+      };
+      const rated = {
+        packageName: "com.example.famous",
+        title: "Budget Tracker Classic",
+        rating: "4.8",
+        ratingValue: 4.8,
+        installs: "10,000+",
+      };
+      const client = makeFakeClient({
+        search: () => searchHtml([makeAppEntry(unrated), makeAppEntry(rated)]),
+        detail: (pkg) =>
+          detailHtml(pkg === rated.packageName ? rated : unrated, [], "10,000+", RECENT),
       });
-      expect(strict.leads().map((lead) => lead.packageName).sort()).toEqual([
-        "com.example.budget",
-        "com.example.budget.mini",
-      ]);
-      expect(strictResult.stats.matched).toBe(2);
 
-      // In the mode the ceilings are off: the 4.6-rated app and the
-      // 10-million-installs app come through too. Only the irrelevant one
-      // stays out — the keyword and the publish date are the rules now.
-      const loose = collect();
-      const looseResult = await runGenerationStep({
+      const harness = collect();
+      const result = await runGenerationStep({
         filters: filters({ limit: 10, publishedWithinDays: WINDOW }),
         cursor: createInitialCursor(KEYWORD),
         budgetMs: 20_000,
-        emit: loose.emit,
-        client: makeFakeClient({
-          search: () => searchRoutes(),
-          detail: (pkg) => detailRoute(pkg, RECENT),
-        }),
+        emit: harness.emit,
+        client,
       });
-      expect(loose.leads().map((lead) => lead.packageName).sort()).toEqual([
-        "com.example.budget",
-        "com.example.budget.mini",
-        "com.example.famous",
-        "com.example.huge",
-      ]);
-      expect(looseResult.stats.matched).toBe(4);
-      expect(looseResult.stats.cardDropRating).toBe(0);
-      expect(looseResult.stats.cardDropInstalls).toBe(0);
+
+      // Only the listing nobody has rated yet is a lead.
+      expect(harness.leads().map((lead) => lead.packageName)).toEqual(["com.example.budget"]);
+      // The rated one is dropped for being rated, not for being rated too
+      // highly: the rating ceiling never fired.
+      expect(result.stats.alreadyRated).toBeGreaterThan(0);
+      expect(result.stats.cardDropRating).toBe(0);
+    });
+
+    it("keeps the install cap in force", async () => {
+      // A brand-new app still has to be a small one: a big install count is
+      // itself a sign that the listing is not new.
+      const harness = collect();
+      const client = makeFakeClient({
+        search: () =>
+          searchHtml([
+            makeAppEntry({
+              packageName: "com.example.huge",
+              title: "Budget Tracker Huge",
+              rating: null,
+              installs: "10,000,000+",
+            }),
+          ]),
+        detail: () =>
+          detailHtml(
+            { packageName: "com.example.huge", title: "Budget Tracker Huge", rating: null, installs: "10,000,000+" },
+            [],
+            "10,000,000+",
+            RECENT,
+          ),
+      });
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 10, maxInstalls: 100_000, publishedWithinDays: WINDOW }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(harness.leads()).toHaveLength(0);
+      expect(result.stats.cardDropInstalls).toBeGreaterThan(0);
     });
 
     it("stays on the one keyword instead of generating related ones", async () => {

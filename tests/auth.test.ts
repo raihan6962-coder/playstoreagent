@@ -134,15 +134,62 @@ describe("password sign-in", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("rejects empty submissions without a network call", async () => {
+  it("rejects an empty password without a network call", async () => {
     const { calls } = stubFetch([]);
-    expect(await attemptLogin("10.0.0.1", "", "pw")).toEqual({
-      ok: false,
-      error: "invalid_credentials",
-    });
     expect(await attemptLogin("10.0.0.1", "revnexa0@gmail.com", "")).toEqual({
       ok: false,
       error: "invalid_credentials",
+    });
+    expect(await attemptLogin("10.0.0.1", "", "")).toEqual({
+      ok: false,
+      error: "invalid_credentials",
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("signs in from the password alone, walking the allowlist in order", async () => {
+    const { calls } = stubFetch([
+      Response.json(
+        { error_code: "invalid_credentials", msg: "Invalid login credentials" },
+        { status: 400 },
+      ),
+      Response.json({ user: { email: "raihan6962@gmail.com", email_confirmed_at: "2026-01-01" } }),
+    ]);
+    const outcome = await attemptLogin("10.0.0.3", "", "hunter2hunter2");
+    expect(outcome).toEqual({ ok: true, email: "raihan6962@gmail.com" });
+    expect(calls).toHaveLength(2);
+    const first = JSON.parse(String(calls[0].init?.body)) as Record<string, string>;
+    const second = JSON.parse(String(calls[1].init?.body)) as Record<string, string>;
+    expect(first.email).toBe("revnexa0@gmail.com");
+    expect(second.email).toBe("raihan6962@gmail.com");
+    expect(second.password).toBe("hunter2hunter2");
+  });
+
+  it("rejects a password that no allowlisted account accepts", async () => {
+    const reject = () =>
+      Response.json(
+        { error_code: "invalid_credentials", msg: "Invalid login credentials" },
+        { status: 400 },
+      );
+    const { calls } = stubFetch([reject(), reject()]);
+    expect(await attemptLogin("10.0.0.3", "", "nope")).toEqual({
+      ok: false,
+      error: "invalid_credentials",
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("lets an unreachable Supabase cut the walk short", async () => {
+    const { calls } = stubFetch([]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
+    expect(await attemptLogin("10.0.0.3", "", "pw")).toEqual({
+      ok: false,
+      error: "network",
     });
     expect(calls).toHaveLength(0);
   });

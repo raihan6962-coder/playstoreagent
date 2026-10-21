@@ -10,9 +10,10 @@ import { clientIp } from "@/lib/server/rateLimit";
 export const maxDuration = 15;
 
 /**
- * Verify email+password against Supabase, then mint our own HMAC session
- * cookie. The allowlist and the failure budget are enforced server-side
- * in attemptLogin — this route only shapes the HTTP contract.
+ * Verify a password against Supabase, then mint our own HMAC session cookie.
+ * The address is optional: omitted, the password is tried against every
+ * allowlisted admin. The allowlist and the failure budget are enforced
+ * server-side in attemptLogin — this route only shapes the HTTP contract.
  */
 export async function POST(request: Request): Promise<Response> {
   let body: { email?: unknown; password?: unknown };
@@ -23,7 +24,7 @@ export async function POST(request: Request): Promise<Response> {
   }
   const email = typeof body.email === "string" ? body.email : "";
   const password = typeof body.password === "string" ? body.password : "";
-  if (!email || !password) {
+  if (!password) {
     return NextResponse.json({ error: "invalid_credentials" }, { status: 400 });
   }
 

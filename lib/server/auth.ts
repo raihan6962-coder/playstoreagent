@@ -149,20 +149,16 @@ export interface LoginOutcome {
 }
 
 /**
- * Verify email+password against Supabase's password grant, enforcing the
- * admin allowlist and a per-IP+email failure budget. Every layer that can
- * reject does so without contacting Supabase when it already knows better.
+ * Verify a password against Supabase's password grant for one allowlisted
+ * account, enforcing that account's per-IP failure budget. Every layer that
+ * can reject does so without contacting Supabase when it already knows better.
  */
-export async function attemptLogin(
+async function verifyPassword(
   ip: string,
   email: string,
   password: string,
 ): Promise<LoginOutcome> {
-  const normalized = email.trim().toLowerCase();
-  if (!normalized || !password) return { ok: false, error: "invalid_credentials" };
-  if (!isAdminEmail(normalized)) return { ok: false, error: "access_denied" };
-
-  const budgetKey = `login:${ip}:${normalized}`;
+  const budgetKey = `login:${ip}:${email}`;
   if (!withinFailureBudget(budgetKey, LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_MS)) {
     return { ok: false, error: "rate_limited" };
   }
@@ -183,7 +179,7 @@ export async function attemptLogin(
     const response = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify({ email: normalized, password }),
+      body: JSON.stringify({ email, password }),
       signal: AbortSignal.timeout(15_000),
     });
     const data = (await response.json().catch(() => null)) as
@@ -209,6 +205,48 @@ export async function attemptLogin(
     noteFailure(budgetKey);
     return { ok: false, error: "network" };
   }
+}
+
+/**
+ * Sign in with a password, optionally naming the account. Named, the address
+ * is checked against the allowlist first and exactly one account is tried.
+ * Unnamed — the shape the sign-in screen submits — the password is offered to
+ * every allowlisted admin until one accepts it, so the operator never has to
+ * remember which address owns which password. A session is minted for
+ * whichever account matched, and each candidate keeps its own failure budget
+ * so a typo cannot be laundered across accounts.
+ */
+export async function attemptLogin(
+  ip: string,
+  email: string | null | undefined,
+  password: string,
+): Promise<LoginOutcome> {
+  const normalized = email?.trim().toLowerCase() ?? "";
+  if (!password) return { ok: false, error: "invalid_credentials" };
+  if (normalized && !isAdminEmail(normalized)) {
+    return { ok: false, error: "access_denied" };
+  }
+
+  const candidates = normalized ? [normalized] : adminEmails();
+  /** Rejections a later candidate cannot fix — report them immediately. */
+  const fatal = new Set(["not_configured", "network"]);
+  let sawRateLimit = false;
+  let reported: string | undefined;
+  for (const candidate of candidates) {
+    const outcome = await verifyPassword(ip, candidate, password);
+    if (outcome.ok) return outcome;
+    const error = outcome.error ?? "invalid_credentials";
+    if (fatal.has(error)) return { ok: false, error };
+    if (error === "rate_limited") {
+      sawRateLimit = true;
+      continue;
+    }
+    reported ??= error;
+  }
+  return {
+    ok: false,
+    error: sawRateLimit ? "rate_limited" : (reported ?? "invalid_credentials"),
+  };
 }
 
 function mapPasswordError(

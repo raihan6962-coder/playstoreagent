@@ -4,18 +4,17 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 
 const MESSAGES: Record<string, string> = {
-  invalid_credentials: "Wrong email or password.",
-  access_denied: "This account isn't allowed. Only the workspace admin can sign in.",
+  invalid_credentials: "Wrong password.",
+  access_denied: "That account isn't allowed. Only the workspace admin can sign in.",
   rate_limited: "Too many attempts — wait a few minutes and try again.",
   not_configured: "Sign-in isn't configured yet — the Supabase auth environment is missing.",
   auth_disabled: "Supabase Auth looks disabled for this project.",
-  unverified: "This email address isn't verified yet.",
+  unverified: "This account isn't verified yet.",
   network: "Couldn't reach the sign-in service — check your connection and try again.",
 };
 
 function LoginContent(): React.ReactElement {
   const router = useRouter();
-  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -45,7 +44,7 @@ function LoginContent(): React.ReactElement {
       const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ password }),
       });
       if (response.ok) {
         router.replace("/");
@@ -95,22 +94,6 @@ function LoginContent(): React.ReactElement {
 
           <form onSubmit={submit} className="space-y-4">
             <div>
-              <label htmlFor="email" className="mb-1.5 block text-xs uppercase tracking-[0.18em] text-zinc-500">
-                Email
-              </label>
-              <input
-                id="email"
-                type="email"
-                required
-                autoComplete="username"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                className="w-full rounded-xl border border-white/10 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-100 outline-none transition placeholder:text-zinc-600 focus-visible:border-emerald-400/60"
-                placeholder="admin@example.com"
-              />
-            </div>
-
-            <div>
               <label htmlFor="password" className="mb-1.5 block text-xs uppercase tracking-[0.18em] text-zinc-500">
                 Password
               </label>
@@ -118,6 +101,7 @@ function LoginContent(): React.ReactElement {
                 id="password"
                 type="password"
                 required
+                autoFocus
                 autoComplete="current-password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
@@ -140,7 +124,7 @@ function LoginContent(): React.ReactElement {
           </form>
 
           <p className="mt-5 text-center text-xs leading-relaxed text-zinc-500">
-            Restricted access — sign-in is limited to the workspace admin account.
+            Restricted access — sign-in is limited to the workspace password.
           </p>
         </div>
 

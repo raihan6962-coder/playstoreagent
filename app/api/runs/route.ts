@@ -7,6 +7,7 @@ import {
 import { allowRequest, clientIp } from "@/lib/server/rateLimit";
 import {
   parseInstallInput,
+  validateBoolean,
   validateCountry,
   validateKeyword,
   validateLimit,
@@ -49,6 +50,8 @@ export async function POST(request: Request): Promise<Response> {
   if (!maxInstalls.ok) return jsonError(400, maxInstalls.error);
   const limit = validateLimit(body.limit as number);
   if (!limit.ok) return jsonError(400, limit.error);
+  const newAppsOnly = validateBoolean(body.newAppsOnly);
+  if (!newAppsOnly.ok) return jsonError(400, newAppsOnly.error);
   // The form has no country field: Vercel's geo header decides the
   // storefront, falling back to the default.
   const geoCountry = request.headers.get("x-vercel-ip-country");
@@ -61,6 +64,7 @@ export async function POST(request: Request): Promise<Response> {
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
       limit: limit.value,
+      newAppsOnly: newAppsOnly.value,
       country: country.value,
     });
     const origin = new URL(request.url).origin;

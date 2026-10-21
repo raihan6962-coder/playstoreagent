@@ -56,7 +56,12 @@ const MAX_SEEN = 40_000;
 const MAX_TEMP_POOL = 1_200;
 const MAX_TEMP_SUMMARY = 1_000;
 const MAX_CYCLE_SEEN = 10_000;
-const MAX_EMITTED = 1_000;
+/**
+ * Emitted packages kept for the resume cursor. "New apps only" runs have no
+ * lead cap, so a broad keyword can pass a thousand — the cap has to leave
+ * room for them or a resumed run would re-count a lead it already emitted.
+ */
+const MAX_EMITTED = 5_000;
 const MAX_SIMILAR_QUEUE = 2_000;
 const MAX_EXPANDED = 8_000;
 const MAX_ENRICH_QUEUE = 1_000;
@@ -218,6 +223,7 @@ function parseCounters(value: unknown): SessionCursor["counters"] | null {  if (
   else counters.rateLimitHits = Math.floor(hits);
   // Same for the verification diagnostics.
   const optional = [
+    "knownSkipped",
     "candidates",
     "verifyRejected",
     "verifyTextRejected",

@@ -11,6 +11,7 @@ import {
   planSize,
 } from "@/lib/playstore/queryPlan";
 import { emptyPool } from "@/lib/playstore/harvest";
+import { KnownApps } from "@/lib/playstore/known";
 import { PlayClient, PlayHttpError } from "@/lib/playstore/client";
 import type { GenerationEvent, LeadFilters } from "@/types/lead";
 import { detailHtml, makeAppEntry, makeFakeClient, searchHtml } from "./fixtures";
@@ -1251,5 +1252,236 @@ describe("runGenerationStep", () => {
     expect(harness.leads()).toHaveLength(0);
     expect(result.stats.verifyTextRejected).toBeGreaterThan(0);
     expect(result.stats.matched).toBe(0);
+  });
+
+  describe("new apps only mode", () => {
+    /** A keyword that keeps producing one fresh app per search. */
+    function endlessSearches(): {
+      client: PlayClient;
+      searched: () => number;
+    } {
+      let seed = 0;
+      let searches = 0;
+      const client = makeFakeClient({
+        search: () => {
+          searches += 1;
+          seed += 1;
+          return searchHtml([
+            makeAppEntry({
+              packageName: `com.example.fresh${seed}`,
+              title: `Budget Tracker ${seed}`,
+              rating: "2.1",
+              ratingValue: 2.1,
+              installs: "10,000+",
+            }),
+          ]);
+        },
+        detail: (pkg) =>
+          detailHtml({
+            packageName: pkg,
+            title: `Budget Tracker ${pkg}`,
+            rating: "2.1",
+            ratingValue: 2.1,
+            installs: "10,000+",
+          }),
+      });
+      return { client, searched: () => searches };
+    }
+
+    it("skips the apps the keyword already produced", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+      const known = new KnownApps(KEYWORD);
+      // The first app the searches will produce is already known.
+      known.add("com.example.fresh1");
+
+      const cursor = createInitialCursor(KEYWORD);
+      const result = await runGenerationStep({
+        filters: filters({ limit: 1, newAppsOnly: true }),
+        cursor,
+        known,
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      // The known app never became a lead and never entered the pool.
+      expect(harness.leads().map((lead) => lead.packageName)).not.toContain(
+        "com.example.fresh1",
+      );
+      expect(result.stats.knownSkipped).toBeGreaterThan(0);
+      // The apps that were not known still came through.
+      expect(result.stats.matched).toBeGreaterThan(0);
+    });
+
+    it("ignores the lead target and keeps collecting", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+      const cursor = createInitialCursor(KEYWORD);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 1, newAppsOnly: true }),
+        cursor,
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      // A normal run stops at its target; this one must go past it.
+      expect(result.stats.matched).toBeGreaterThan(1);
+      expect(result.reason).not.toBe("target-reached");
+    });
+
+    it("stops at the target when the mode is off", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 1 }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      expect(result.stats.matched).toBe(1);
+      expect(result.reason).toBe("target-reached");
+    });
+
+    it("records the apps it judged in the keyword's memory", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+      const known = new KnownApps(KEYWORD);
+
+      await runGenerationStep({
+        filters: filters({ limit: 1, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        known,
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      const judged = harness.leads().map((lead) => lead.packageName);
+      expect(judged.length).toBeGreaterThan(0);
+      for (const name of judged) expect(known.has(name)).toBe(true);
+    });
+
+    it("stays on the one keyword instead of generating related ones", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+      const generateSecondary = vi.fn(async () => ["related phrase"]);
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+        generateSecondary,
+      });
+
+      expect(generateSecondary).not.toHaveBeenCalled();
+      expect(result.cursor?.keywords ?? [KEYWORD]).toEqual([KEYWORD]);
+    });
+
+    it("files an app under the keyword that produced it, not the main one", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+      // The memory belongs to the main keyword; a cycle that moves on to a
+      // related keyword must not file that keyword's apps under this one.
+      const known = new KnownApps(KEYWORD);
+      const cursor = createInitialCursor(KEYWORD);
+      cursor.keywords = [KEYWORD, "related phrase"];
+      cursor.keywordIndex = 1;
+      // Start in the collect phase: the suggest phase would open cycle 0
+      // (the main keyword) and this test is about the second cycle.
+      cursor.phase = "collect";
+
+      await runGenerationStep({
+        filters: filters({ limit: 5 }),
+        cursor,
+        known,
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      // Nothing was judged under the main keyword's cycle, so its memory is
+      // untouched.
+      expect(known.size).toBe(0);
+    });
+
+    it("uses a low harvest floor so leads arrive early", async () => {
+      const harness = collect();
+      const { client } = endlessSearches();
+
+      const result = await runGenerationStep({
+        filters: filters({ limit: 5, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        budgetMs: 20_000,
+        emit: harness.emit,
+        client,
+      });
+
+      // The floor is 200 in this mode, not the usual 1000.
+      expect(result.stats.harvestTarget).toBe(200);
+      const messages = harness.messages();
+      const filterAt = messages.findIndex((message) => message.includes("filtering by rating"));
+      expect(filterAt).toBeGreaterThan(-1);
+    });
+
+    it("gives the second run of a keyword none of the first run's apps", async () => {
+      // The same three apps every time — what a keyword that has been hunted
+      // before keeps offering.
+      const apps = [GOOD, GOOD_TWO, {
+        packageName: "com.example.budget.third",
+        title: "Budget Tracker Third",
+        rating: "2.3",
+        ratingValue: 2.3,
+        installs: "5,000+",
+      }];
+      const client = makeFakeClient({
+        search: () => searchHtml(apps.map((entry) => makeAppEntry(entry))),
+        detail: (pkg) => {
+          const main = apps.find((entry) => entry.packageName === pkg);
+          return detailHtml(
+            { ...(main ?? GOOD), summary: "Track your budget" },
+            [],
+            main?.installs ?? "10,000+",
+          );
+        },
+      });
+      const known = new KnownApps(KEYWORD);
+
+      // First run: the apps are new, so they come through as leads.
+      const first = collect();
+      const firstResult = await runGenerationStep({
+        filters: filters({ limit: 10, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        known,
+        budgetMs: 20_000,
+        emit: first.emit,
+        client,
+      });
+      expect(first.leads().length).toBe(3);
+      expect(firstResult.stats.matched).toBe(3);
+      expect(known.size).toBeGreaterThan(0);
+
+      // Second run: every one of them is known, so none is offered again.
+      const second = collect();
+      const secondResult = await runGenerationStep({
+        filters: filters({ limit: 10, newAppsOnly: true }),
+        cursor: createInitialCursor(KEYWORD),
+        known,
+        budgetMs: 20_000,
+        emit: second.emit,
+        client,
+      });
+      expect(second.leads()).toHaveLength(0);
+      expect(secondResult.stats.matched).toBe(0);
+      expect(secondResult.stats.knownSkipped).toBeGreaterThan(0);
+      expect(secondResult.stats.collected).toBe(0);
+    });
   });
 });

@@ -26,6 +26,7 @@ import {
 } from "./client";
 import { fetchAppDetail } from "./detail";
 import { keywordVariants } from "./keywords";
+import { type KnownApps } from "./known";
 import {
   buildCycleQueries,
   entryAt,
@@ -39,6 +40,8 @@ import {
   MAX_TEMP_CANDIDATES,
   MAX_VARIANT_BACKSTOP,
   planSize,
+  SOLO_HARVEST_TARGET,
+  SOLO_MAX_CYCLE_QUERIES,
   suggestPrefixes,
 } from "./queryPlan";
 import { emptyPool, type HarvestPool, toPoolCard } from "./harvest";
@@ -173,6 +176,7 @@ function emptyCounters(): SessionCounters {
     evaluated: 0,
     matched: 0,
     duplicates: 0,
+    knownSkipped: 0,
     queriesRun: 0,
     pagesFetched: 0,
     requests: 0,
@@ -354,6 +358,14 @@ export interface StepOptions {
    */
   harvestTarget?: number;
   /**
+   * The keyword's memory of the apps it already produced, across every
+   * earlier run. Supplied by the caller (the server loads and saves it), and
+   * only read when the "new apps only" mode is on. Every package the filter
+   * judges is written back into it, so the memory grows with the run and
+   * survives it.
+   */
+  known?: KnownApps;
+  /**
    * Safety backstop: stop with `query-cap` once `counters.queriesRun`
    * reaches this many queries. Granted per run by the state store and topped
    * up on every Resume, so an unproductive niche can never spin forever
@@ -376,6 +388,7 @@ function buildStats(
   currentQuery: string | null,
   queriesTotal: number,
   poolSize = 0,
+  harvestTarget = HARVEST_TARGET,
 ): GenerationStats {
   return {
     ...cursor.counters,
@@ -386,7 +399,8 @@ function buildStats(
     phase: cursor.phase,
     wave: cursor.wave,
     poolSize,
-    harvestTarget: HARVEST_TARGET,
+    harvestTarget,
+    newAppsOnly: filters.newAppsOnly === true,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -441,6 +455,56 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   // the pool — see harvest.ts.
   const pool: HarvestPool =
     options.pool ?? emptyPool(cursor.keyword, cursor.keywordIndex ?? 0);
+
+  /**
+   * "New apps only" mode. The run stays on the one keyword it was given and
+   * ignores every package that keyword has already produced, so the pool
+   * fills with apps the operator has not seen before. The lead target is
+   * ignored as well — the mode's promise is "as many as this keyword can
+   * still give", not "stop at N".
+   */
+  const soloMode = filters.newAppsOnly === true;
+  /**
+   * The keyword's cross-run memory. Only meaningful in solo mode, but it is
+   * written by every run: a keyword's memory must reflect everything it has
+   * ever produced, or switching the mode on later would re-offer the apps
+   * the earlier runs already judged.
+   */
+  const known = options.known;
+  /**
+   * Record a package in the keyword's memory — but only for the keyword that
+   * memory belongs to. A run that cycles on to a related keyword must not
+   * file that keyword's apps under the main one: the memory answers "has
+   * THIS keyword produced this app", and only this keyword's own harvests
+   * can answer that.
+   */
+  const remember = (packageName: string): void => {
+    if (known && known.keyword === activeCycleKeyword()) known.add(packageName);
+  };
+  /** Has this keyword already produced the package? */
+  const isKnown = (packageName: string): boolean =>
+    known !== undefined &&
+    known !== null &&
+    known.keyword === activeCycleKeyword() &&
+    known.has(packageName);
+  /** True once the run has enough leads — never true in solo mode. */
+  const targetReached = (): boolean =>
+    !soloMode && cursor.counters.matched >= filters.limit;
+  /**
+   * "3 new leads" in solo mode, "3/100 leads" otherwise — the target is
+   * ignored there, so quoting it would be a lie.
+   */
+  const leadsSoFar = (): string =>
+    soloMode
+      ? `${cursor.counters.matched} new lead${cursor.counters.matched === 1 ? "" : "s"}`
+      : `${cursor.counters.matched}/${filters.limit} leads`;
+  /**
+   * How many searches one keyword cycle may spend. The "new apps only" mode
+   * gets a much larger budget: it has a single keyword, so searching it
+   * harder is the only way to keep finding apps it has not produced yet.
+   */
+  const cycleQueryLimit = (): number =>
+    soloMode ? SOLO_MAX_CYCLE_QUERIES : MAX_CYCLE_QUERIES;
 
   // --- keyword-cycle state (migrates cursors minted before cycles existed) ---
   if (!Array.isArray(cursor.keywords) || cursor.keywords.length === 0) {
@@ -524,7 +588,10 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   // the keyword queue instead of the query plan: every phrase gets its own
   // collect → filter cycle. Idempotent — re-merging an already-queued phrase
   // is a no-op, so repeated steps cannot duplicate the queue.
-  if (cursor.secondary.length > 0) {
+  //
+  // "New apps only" mode skips this: the operator asked for one keyword, and
+  // an AI phrase is a different keyword's neighbourhood.
+  if (cursor.secondary.length > 0 && !soloMode) {
     const queued = new Set(cursor.keywords.map((entry) => entry.toLowerCase()));
     for (const phrase of cursor.secondary) {
       const trimmed = phrase.trim();
@@ -580,14 +647,32 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   };
 
   const stats = () =>
-    buildStats(cursor, filters, startedAt, currentQuery, totalPlan, pool.cards.length);
+    buildStats(
+      cursor,
+      filters,
+      startedAt,
+      currentQuery,
+      totalPlan,
+      pool.cards.length,
+      harvestLimit(),
+    );
   /**
    * How many cards this cycle must harvest before the filter stage starts.
    * A run may aim lower than {@link HARVEST_TARGET} (tests, and the
    * harvest-size option), never higher.
+   *
+   * In "new apps only" mode the floor is much lower on purpose: the pool
+   * only fills with apps the keyword has never produced, so a thousand is a
+   * long time to wait — and there may never be a thousand. A lower floor
+   * lets the filter stage open early and the cycle alternate
+   * collect → filter → collect, so leads start arriving while the run is
+   * still harvesting.
    */
-  const harvestLimit = (): number =>
-    Math.max(0, Math.min(HARVEST_TARGET, options.harvestTarget ?? HARVEST_TARGET));
+  const harvestLimit = (): number => {
+    const requested = options.harvestTarget ?? HARVEST_TARGET;
+    const ceiling = soloMode ? SOLO_HARVEST_TARGET : HARVEST_TARGET;
+    return Math.max(0, Math.min(ceiling, requested));
+  };
   const hasTimeForRequest = (headroom = REQUEST_HEADROOM_MS) =>
     options.aborted?.() !== true && Date.now() + headroom < deadline;
 
@@ -617,7 +702,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       cursor.similarQueue = [];
       cursor.enrichQueue = [];
     }
-    const finalStats = buildStats(cursor, filters, startedAt, currentQuery, totalPlan);
+    const finalStats = buildStats(
+      cursor,
+      filters,
+      startedAt,
+      currentQuery,
+      totalPlan,
+      pool.cards.length,
+      harvestLimit(),
+    );
     const result = attachCursor ? cursor : null;
     emit({ type: "done", reason, message, stats: finalStats, cursor: result });
     return { reason, message, cursor: result, stats: finalStats };
@@ -627,7 +720,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   const finishQueryCap = (): StepResult =>
     finish(
       "query-cap",
-      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${cursor.counters.matched}/${filters.limit} leads — press Resume to grant another tranche and continue.`,
+      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${leadsSoFar()} — press Resume to grant another tranche and continue.`,
       true,
     );
 
@@ -639,7 +732,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   ) {
     return finish(
       "query-cap",
-      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${cursor.counters.matched}/${filters.limit} leads — press Resume to grant another tranche and continue.`,
+      `Reached the ${cursor.counters.queriesRun}-query safety cap with ${leadsSoFar()} — press Resume to grant another tranche and continue.`,
       true,
     );
   }
@@ -711,6 +804,15 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         cursor.counters.duplicates += 1;
         continue;
       }
+      // "New apps only": this keyword already produced this app in an earlier
+      // run, so it is not news. Skipping it here — before the pool, before
+      // the relevance check — is the whole point of the mode: the harvest
+      // budget then buys apps the operator has never seen instead of
+      // re-reading the same cards every run.
+      if (soloMode && isKnown(app.packageName)) {
+        cursor.counters.knownSkipped += 1;
+        continue;
+      }
       if (cursor.cycleSeen.length < MAX_SEEN_PACKAGES) {
         cycleSeenSet.add(app.packageName);
         cursor.cycleSeen.push(app.packageName);
@@ -736,6 +838,12 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
         app.summary.length < MAX_DESCRIPTION_LENGTH
       ) {
         cursor.counters.cardDropIrrelevant += 1;
+        // In "new apps only" mode the run has a single keyword, so a card
+        // whose complete text already fails it can never convert for this
+        // keyword again. Recording that keeps every later run from
+        // re-reading it. A normal run does not: another cycle's keyword
+        // might still want it.
+        if (soloMode) remember(app.packageName);
         continue;
       }
       // The pool stops growing once the harvest target is reached: anything
@@ -819,12 +927,17 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
           (roundRating(app.rating) <= activeFilters.maxRating &&
             !cardCanStillQualify(app, activeFilters, countryFinal)));
       if (!owedHomeCheck && seen.size < MAX_SEEN_PACKAGES) seen.add(app.packageName);
+      // The keyword's cross-run memory follows the same rule: a judged app is
+      // one this keyword has produced, so a later run in "new apps only" mode
+      // must not offer it again. A card still owed a home check stays out —
+      // it has not had its final verdict yet.
+      if (!owedHomeCheck) remember(app.packageName);
       cursor.counters.evaluated += 1;
 
       if (evaluation.status === "match" && evaluation.lead) {
         const lead = evaluation.lead;
         if (emitted.has(lead.packageName)) return false;
-        if (cursor.counters.matched >= activeFilters.limit) return true;
+        if (targetReached()) return true;
 
         // The search card's rating came from whichever storefront answered the
         // query, but the table must show this run's country. Queue the package
@@ -956,8 +1069,8 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       origin: "homeUnrated" | "homeOther" | "foreign";
     },
   ): boolean => {
-    if (emitted.has(lead.packageName)) return cursor.counters.matched >= filters.limit;
-    if (cursor.counters.matched >= filters.limit) return true;
+    if (emitted.has(lead.packageName)) return targetReached();
+    if (targetReached()) return true;
 
     emitted.add(lead.packageName);
     cursor.counters.matched += 1;
@@ -981,7 +1094,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     }
     pushSeed({ p: lead.packageName, i: lead.installs }, queuedSeeds);
     emit({ type: "lead", lead, stats: stats() });
-    return cursor.counters.matched >= filters.limit;
+    return targetReached();
   };
 
   /** Removes a package from the pending-verify queue (verified or gone). */
@@ -1615,6 +1728,24 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       return "continue";
     }
 
+    // "New apps only" mode: the operator asked for this one keyword, so the
+    // run ends here instead of wandering into AI phrases or the built-in
+    // alternates. The keyword's supply of new apps is spent — that is the
+    // answer the mode was asked for.
+    if (soloMode) {
+      if (cursor.enrichQueue.length > 0) {
+        cursor.phase = "enrich";
+        return "continue";
+      }
+      return finish(
+        cursor.counters.discovered === 0 ? "no-results" : "plan-exhausted",
+        `Finished “${filters.keyword}” — ${cursor.counters.matched} new lead${
+          cursor.counters.matched === 1 ? "" : "s"
+        } from ${cursor.counters.collected} new apps (${cursor.counters.knownSkipped} already known).`,
+        false,
+      );
+    }
+
     const generate = options.generateSecondary;
     if (
       generate !== undefined &&
@@ -1715,7 +1846,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   // hits. Every stage resumes mid-flow across steps via the cursor.
   for (;;) {
   while (cursor.phase === "collect" || cursor.phase === "filter") {
-    if (cursor.counters.matched >= filters.limit) {
+    if (targetReached()) {
       cursor.phase = "enrich";
       break;
     }
@@ -1759,9 +1890,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       SEARCH_CONCURRENCY,
       pullCollectTask,
       () =>
-        cursor.counters.matched < filters.limit &&
+        !targetReached() &&
         pool.cards.length < harvestLimit() &&
-        cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        cursor.cycleQueries < cycleQueryLimit() &&
         cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
         cursor.leadDrought < MAX_LEAD_DROUGHT_QUERIES &&
         (options.queryBudget === undefined ||
@@ -1789,9 +1920,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
     const supplyLeft = entryAt(queries, cursor.planIndex, filters.country) !== null;
     const harvestComplete =
       pool.cards.length >= harvestLimit() ||
-      cursor.counters.matched >= filters.limit ||
+      targetReached() ||
       !supplyLeft ||
-      cursor.cycleQueries >= MAX_CYCLE_QUERIES ||
+      cursor.cycleQueries >= cycleQueryLimit() ||
       cursor.stagnantQueries >= MAX_STAGNANT_QUERIES ||
       cursor.leadDrought >= MAX_LEAD_DROUGHT_QUERIES;
 
@@ -1887,7 +2018,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       if (
         pool.cards.length < harvestLimit() &&
         entryAt(queries, cursor.planIndex, filters.country) !== null &&
-        cursor.cycleQueries < MAX_CYCLE_QUERIES &&
+        cursor.cycleQueries < cycleQueryLimit() &&
         cursor.stagnantQueries < MAX_STAGNANT_QUERIES &&
         cursor.leadDrought < MAX_LEAD_DROUGHT_QUERIES
       ) {
@@ -1913,9 +2044,9 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
       emit({
         type: "progress",
         stats: stats(),
-        message: `Finished “${activeCycleKeyword()}”${droughtNote} — harvested ${harvested} apps — ${cursor.counters.matched}/${filters.limit} leads so far.`,
+        message: `Finished “${activeCycleKeyword()}”${droughtNote} — harvested ${harvested} apps — ${leadsSoFar()} so far.`,
       });
-      if (cursor.counters.matched >= filters.limit) {
+      if (targetReached()) {
         cursor.phase = "enrich";
         break;
       }
@@ -1938,7 +2069,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
 
   // ---------------------------------------------------------------- enrich --
   while (cursor.phase === "enrich") {
-    if (cursor.counters.matched >= filters.limit) break;
+    if (targetReached()) break;
 
     // Drain verifications before anything else: every entry here already
     // earned its place from a search or a detail fetch, and a terminal
@@ -2003,7 +2134,7 @@ export async function runGenerationStep(options: StepOptions): Promise<StepResul
   // ------------------------------------------------------------------ done --
   // Terminal pass after the stages: target check, then leftover queues (never
   // discard work the run already spent requests on), then the next cycle.
-  if (cursor.counters.matched >= filters.limit) {
+  if (targetReached()) {
     return finish(
       "target-reached",
       `Found ${cursor.counters.matched} matching leads for “${filters.keyword}”.`,

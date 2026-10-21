@@ -113,3 +113,16 @@ export function validateLimit(input: unknown): ValidationResult<number> {
   }
   return { ok: true, value: rounded };
 }
+
+/**
+ * A boolean switch. Anything that is not exactly `true` is off — a form
+ * that sends "on", 1 or "true" as a string must not silently switch a mode
+ * on that the operator did not intend.
+ */
+export function validateBoolean(input: unknown): ValidationResult<boolean> {
+  if (input === undefined || input === null) return { ok: true, value: false };
+  if (typeof input !== "boolean") {
+    return { ok: false, error: "This option must be either on or off." };
+  }
+  return { ok: true, value: input };
+}

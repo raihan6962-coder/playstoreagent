@@ -25,6 +25,8 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { emptyPool, parsePool, type HarvestPool } from "@/lib/playstore/harvest";
+import { loadKnownApps, saveKnownApps } from "@/lib/server/known";
+import { type KnownApps } from "@/lib/playstore/known";
 import { buildPlanQueries, HARVEST_TARGET, planSize } from "@/lib/playstore/queryPlan";
 import { mutateJson, readJson, StoreError, writeJson } from "@/lib/server/stateStore";
 import { notifyTelegram, notifyTime } from "@/lib/server/telegram";
@@ -183,6 +185,7 @@ function emptyStats(filters: LeadFilters, cursor: SessionCursor): GenerationStat
     wave: cursor.wave,
     poolSize: 0,
     harvestTarget: HARVEST_TARGET,
+    newAppsOnly: filters.newAppsOnly === true,
     elapsedMs: 0,
   };
 }
@@ -380,6 +383,12 @@ export async function executeTick(
    * unchanged 300KB pool every 10s would be pure waste.
    */
   const pool: HarvestPool = emptyPool(state.cursor.keyword, state.cursor.keywordIndex ?? 0);
+  /**
+   * The keyword's cross-run memory. Loaded once the tick starts and written
+   * back on every checkpoint, so the memory never lags behind the cursor
+   * that says which apps were already judged.
+   */
+  let known: KnownApps | null = null;
   let savedPool = { keyword: "", keywordIndex: -1, count: -1 };
   const poolChanged = (): boolean =>
     pool.cards.length !== savedPool.count ||
@@ -415,6 +424,10 @@ export async function executeTick(
       // the cycle is in, so a crash between the two must never leave the
       // cursor claiming a filter stage over a pool that was never saved.
       if (poolChanged()) await savePool();
+      // The keyword's memory travels with the cursor it describes: an app the
+      // cursor counts as judged must already be in the memory, or the next
+      // run would offer it again.
+      if (known) await saveKnownApps(known);
       state.version += 1;
       state.seq += 1;
       state.updatedAt = Date.now();
@@ -446,6 +459,13 @@ export async function executeTick(
     pool.collected = parsed.collected;
     pool.cards = parsed.cards;
 
+    // The keyword's cross-run memory: every app this keyword has already
+    // produced. The "new apps only" mode reads it to skip them, and every
+    // run writes to it — a keyword's memory has to reflect all of its runs,
+    // or switching the mode on later would re-offer what earlier runs judged.
+    const knownApps = await loadKnownApps(state.keyword);
+    known = knownApps;
+
     // Start checkpointing before the Groq prime call: it is not abortable, so
     // it needs keepalive writes (and Stop visibility) of its own.
     checkpointTimer = setInterval(() => {
@@ -454,7 +474,9 @@ export async function executeTick(
 
     // Round one of the keyword-generation loop, once per run (the crawler
     // fires rounds 2..MAX itself whenever the plan runs dry mid-step).
-    if (!state.cursor.secondaryTried) {
+    // "New apps only" mode never leaves the keyword it was given, so it
+    // skips the generation round entirely.
+    if (!state.cursor.secondaryTried && state.filters.newAppsOnly !== true) {
       appendLog(state, "phase", `Generating related search keywords for “${state.keyword}”…`);
       const prime = await primeRoundOne(state.cursor);
       if (prime.generated > 0) {
@@ -518,6 +540,7 @@ export async function executeTick(
       filters: state.filters,
       cursor: state.cursor,
       pool,
+      known: knownApps,
       budgetMs: TICK_BUDGET_MS,
       emit,
       generateSecondary: generateSecondaryKeywords,
@@ -528,6 +551,11 @@ export async function executeTick(
     if (checkpointTimer) clearInterval(checkpointTimer);
     checkpointTimer = null;
     await checkpointWrites;
+
+    // The keyword's memory is written before the state file: the state file
+    // says the run has judged those apps, so a crash between the two must
+    // never leave the cursor claiming more progress than the memory knows.
+    await saveKnownApps(known);
 
     state.cursor = result.cursor ?? state.cursor;
     state.stats = withElapsed(result.stats, state);

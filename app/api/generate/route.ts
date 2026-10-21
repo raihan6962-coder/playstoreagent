@@ -1,10 +1,12 @@
 import { generateSecondaryKeywords, primeRoundOne } from "@/lib/keywords/secondary";
+import { loadKnownApps, saveKnownApps } from "@/lib/server/known";
 import { createInitialCursor, runGenerationStep } from "@/lib/playstore/crawler";
 import { buildPlanQueries, HARVEST_TARGET, planSize } from "@/lib/playstore/queryPlan";
 import { allowRequest, clientIp } from "@/lib/server/rateLimit";
 import { sanitizeCursor } from "@/lib/validation/cursor";
 import {
   parseInstallInput,
+  validateBoolean,
   validateCountry,
   validateKeyword,
   validateLimit,
@@ -58,6 +60,9 @@ function parseRequest(input: unknown, fallbackCountry: string | null): ParsedReq
   const limit = validateLimit(body.limit);
   if (!limit.ok) return { ok: false, error: limit.error };
 
+  const newAppsOnly = validateBoolean(body.newAppsOnly);
+  if (!newAppsOnly.ok) return { ok: false, error: newAppsOnly.error };
+
   // The country decides which storefront's ratings the table shows. Prefer the
   // form value, then Vercel's geo header, then the default.
   const country = validateCountry(body.country ?? fallbackCountry ?? undefined);
@@ -70,6 +75,7 @@ function parseRequest(input: unknown, fallbackCountry: string | null): ParsedReq
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
       limit: limit.value,
+      newAppsOnly: newAppsOnly.value,
       country: country.value,
     },
     cursor: sanitizeCursor(body.cursor, keyword.value),
@@ -89,6 +95,7 @@ function initialStats(cursor: SessionCursor, filters: LeadFilters): GenerationSt
     wave: cursor.wave,
     poolSize: 0,
     harvestTarget: HARVEST_TARGET,
+    newAppsOnly: filters.newAppsOnly === true,
     elapsedMs: 0,
   };
 }
@@ -171,14 +178,22 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
+        // The keyword's cross-run memory: the "new apps only" mode reads it
+        // to skip the apps this keyword already produced, and every run
+        // writes the apps it judged back into it.
+        const known = await loadKnownApps(filters.keyword);
+
         await runGenerationStep({
           filters,
           cursor,
+          known,
           budgetMs,
           emit: send,
           aborted: () => cancelled,
           generateSecondary: generateSecondaryKeywords,
         });
+
+        await saveKnownApps(known);
       } catch (error) {
         send({
           type: "error",

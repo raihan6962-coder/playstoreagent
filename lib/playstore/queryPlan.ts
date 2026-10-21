@@ -50,6 +50,24 @@ export const MAX_EXTRA_TAIL = 3_000;
  */
 export const HARVEST_TARGET = 1_000;
 /**
+ * Harvest floor used by the "new apps only" mode. Much lower than
+ * {@link HARVEST_TARGET} on purpose: that mode's pool only fills with apps
+ * the keyword has never produced, so a thousand may never arrive — and
+ * waiting for it would delay the first lead for hours. A low floor opens the
+ * filter stage early, and the cycle then alternates collect → filter →
+ * collect until the keyword's new-app supply is exhausted.
+ */
+export const SOLO_HARVEST_TARGET = 200;
+/**
+ * Per-cycle query cap for the "new apps only" mode. Higher than
+ * {@link MAX_CYCLE_QUERIES} because that mode has exactly one keyword to
+ * work with: rotating to a fresh keyword is not an option, so the only way
+ * to keep finding new apps is to search the same neighbourhood harder. The
+ * run-level query budget, the stagnation guard and the drought guard still
+ * bound the run.
+ */
+export const SOLO_MAX_CYCLE_QUERIES = 20_000;
+/**
  * Hard cap on one keyword cycle's harvest pool, sized above
  * {@link HARVEST_TARGET} so a batch that overshoots the target still lands
  * whole (the pool stops growing once the target is reached, so this only

@@ -56,6 +56,7 @@ export function Dashboard() {
     maxRating: "4",
     maxInstalls: "5000000",
     limit: "1000",
+    newAppsOnly: false,
   });
   const [errors, setErrors] = useState<Partial<Record<keyof SearchValues, string>>>({});
   const [attached, setAttached] = useState<AttachedRun | null>(null);
@@ -304,6 +305,7 @@ export function Dashboard() {
         maxRating: parsed.maxRating,
         maxInstalls: parsed.maxInstalls,
         limit: parsed.limit,
+        newAppsOnly: values.newAppsOnly,
       });
       setAttached(run);
       applyStatus("running");

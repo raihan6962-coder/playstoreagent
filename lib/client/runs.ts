@@ -59,6 +59,8 @@ export interface CreateRunInput {
   maxRating: number;
   maxInstalls: number;
   limit: number;
+  /** "New apps only": one keyword, no lead cap, no app the keyword already produced. */
+  newAppsOnly?: boolean;
 }
 
 async function readError(response: Response): Promise<RunRequestError> {

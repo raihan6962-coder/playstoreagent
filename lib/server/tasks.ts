@@ -25,7 +25,13 @@ import {
 } from "@/lib/server/runs";
 import { mutateJson, readJson } from "@/lib/server/stateStore";
 import { notifyTelegram, notifyTime } from "@/lib/server/telegram";
-import { parseInstallInput, validateKeyword, validateLimit, validateMaxRating } from "@/lib/validation/input";
+import {
+  parseInstallInput,
+  validateBoolean,
+  validateKeyword,
+  validateLimit,
+  validateMaxRating,
+} from "@/lib/validation/input";
 import type { DoneReason, Lead } from "@/types/lead";
 import type { AutomationTask } from "@/types/automation";
 
@@ -71,6 +77,8 @@ export async function validateTask(raw: Record<string, unknown>): Promise<TaskVa
   if (!maxInstalls.ok) return { ok: false, error: maxInstalls.error };
   const limit = validateLimit(raw.limit);
   if (!limit.ok) return { ok: false, error: limit.error };
+  const newAppsOnly = validateBoolean(raw.newAppsOnly);
+  if (!newAppsOnly.ok) return { ok: false, error: newAppsOnly.error };
 
   const startAt = typeof raw.startAt === "string" ? Number(raw.startAt) : raw.startAt;
   if (typeof startAt !== "number" || !Number.isFinite(startAt)) {
@@ -117,6 +125,7 @@ export async function validateTask(raw: Record<string, unknown>): Promise<TaskVa
       maxRating: maxRating.value,
       maxInstalls: maxInstalls.value,
       limit: limit.value,
+      newAppsOnly: newAppsOnly.value,
       startAt,
       mailboxIds,
       templateSubject,
@@ -312,6 +321,7 @@ async function claimAndStart(
       maxRating: planned.maxRating,
       maxInstalls: planned.maxInstalls,
       limit: planned.limit,
+      newAppsOnly: planned.newAppsOnly === true,
       country: country && /^[A-Z]{2}$/.test(country) ? country : "BD",
     });
     await mutateJson<AutomationTask[]>(
@@ -330,7 +340,9 @@ async function claimAndStart(
     await kickTick(origin, created.runId, created.token);
     await notifyTelegram(
       `🚀 Automation started — "${planned.keyword}"\n` +
-        `Target ${planned.limit} leads · rating ≤ ${planned.maxRating} · installs ≤ ${planned.maxInstalls}\n` +
+        (planned.newAppsOnly
+          ? `New apps only · every lead this keyword has left to give\n`
+          : `Target ${planned.limit} leads · rating ≤ ${planned.maxRating} · installs ≤ ${planned.maxInstalls}\n`) +
         `Started ${notifyTime(Date.now())}`,
     );
     return true;

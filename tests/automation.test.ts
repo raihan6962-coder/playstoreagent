@@ -90,6 +90,7 @@ function seedTask(partial: Partial<AutomationTask> = {}): AutomationTask {
     maxRating: 3.5,
     maxInstalls: 500_000,
     limit: 100,
+    newAppsOnly: false,
     startAt: now + 60_000,
     mailboxIds: [],
     templateSubject: "About {{app}}",
@@ -292,6 +293,32 @@ describe("automation: task validation & CRUD", () => {
     expect(isValidTaskId("../../../etc")).toBe(false);
     expect(await listTasks()).toHaveLength(1);
     expect(storedTasks(mock.files)[0].id).toBe(task.id);
+  });
+
+  it("carries the new-apps-only switch on the task", async () => {
+    const mailbox = await addMailbox({ label: "box", webAppUrl: APPS_URL, dailyQuota: 100 });
+
+    // Off unless asked for.
+    const plain = await validateTask(validPayload({ mailboxIds: [mailbox.id] }));
+    if (!plain.ok) throw new Error("expected valid payload");
+    expect(plain.value.newAppsOnly).toBe(false);
+
+    // On when the form sends it.
+    const solo = await validateTask(
+      validPayload({ mailboxIds: [mailbox.id], newAppsOnly: true }),
+    );
+    if (!solo.ok) throw new Error("expected valid payload");
+    expect(solo.value.newAppsOnly).toBe(true);
+
+    const task = await createTask(solo.value);
+    expect(task.newAppsOnly).toBe(true);
+    expect((await listTasks())[0].newAppsOnly).toBe(true);
+
+    // A non-boolean is refused rather than silently switching the mode on.
+    const bad = await validateTask(
+      validPayload({ mailboxIds: [mailbox.id], newAppsOnly: "on" }),
+    );
+    expect(bad.ok).toBe(false);
   });
 
   it("edits only while scheduled and deletes with confirmation", async () => {

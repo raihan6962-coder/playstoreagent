@@ -55,6 +55,14 @@ export interface LeadFilters {
    * sees on play.google.com.
    */
   country: string;
+  /**
+   * "New apps only": the run stays on this one keyword and ignores every
+   * package it has already judged for it, so the harvest pool fills with
+   * apps the keyword has never produced before. The lead target is ignored
+   * too — the run keeps going until the keyword's supply of new apps runs
+   * out, because "as many as possible" is the point of the mode.
+   */
+  newAppsOnly?: boolean;
 }
 
 export type SessionPhase = "suggest" | "collect" | "filter" | "enrich" | "done";
@@ -94,6 +102,12 @@ export interface SessionCounters {
   evaluated: number;
   matched: number;
   duplicates: number;
+  /**
+   * Cards skipped because this keyword already produced them in an earlier
+   * run (the "new apps only" mode). Not a duplicate in the run's own sense:
+   * these are known, not re-encountered.
+   */
+  knownSkipped: number;
   queriesRun: number;
   pagesFetched: number;
   requests: number;
@@ -185,6 +199,8 @@ export interface GenerationStats extends SessionCounters {
   poolSize: number;
   /** How many cards a keyword must harvest before filtering starts. */
   harvestTarget: number;
+  /** The run is in "new apps only" mode: one keyword, no lead cap. */
+  newAppsOnly: boolean;
   elapsedMs: number;
 }
 
@@ -409,6 +425,8 @@ export interface GenerateRequest {
   maxRating: number;
   maxInstalls: number;
   limit: number;
+  /** "New apps only": one keyword, no lead cap, no app the keyword has already produced. */
+  newAppsOnly?: boolean;
   /** Two-letter Play Store country; defaults to the requester's region. */
   country?: string;
   cursor?: SessionCursor | null;

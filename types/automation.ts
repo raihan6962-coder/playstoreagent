@@ -43,6 +43,12 @@ export interface AutomationTask {
   maxInstalls: number;
   /** Lead target for the generation phase. */
   limit: number;
+  /**
+   * "New apps only": the run stays on this keyword and ignores every app it
+   * has already produced, and the lead target is ignored too — the run
+   * collects every new lead the keyword can still give.
+   */
+  newAppsOnly: boolean;
   /** Epoch ms when the task must start (the browser's picked instant). */
   startAt: number;
   /** Connected mailbox ids selected for this task. */

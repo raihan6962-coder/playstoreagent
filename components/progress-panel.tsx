@@ -81,7 +81,9 @@ export function ProgressPanel({
         </div>
         {stats && (
           <span className="font-mono text-xs text-zinc-400">
-            {matched}/{target} leads
+            {stats.newAppsOnly
+              ? `${matched} new leads`
+              : `${matched}/${target} leads`}
           </span>
         )}
       </div>
@@ -97,7 +99,10 @@ export function ProgressPanel({
         <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
           <Stat label="Apps discovered" value={String(stats.discovered)} />
           <Stat label="Apps evaluated" value={String(stats.evaluated)} />
-          <Stat label="Duplicates skipped" value={String(stats.duplicates)} />
+          <Stat
+            label={stats.newAppsOnly ? "Already known, skipped" : "Duplicates skipped"}
+            value={String(stats.newAppsOnly ? stats.knownSkipped : stats.duplicates)}
+          />
           <Stat label="Queries run" value={queries} />
           <Stat label="Pages fetched" value={String(stats.pagesFetched)} />
           <Stat

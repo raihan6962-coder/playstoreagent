@@ -5,6 +5,8 @@ export interface SearchValues {
   maxRating: string;
   maxInstalls: string;
   limit: string;
+  /** "New apps only": one keyword, no lead cap, no app the keyword already produced. */
+  newAppsOnly: boolean;
 }
 
 interface SearchFormProps {
@@ -57,11 +59,17 @@ export function SearchForm({
   onResume,
   onReset,
 }: SearchFormProps) {
-  const set = (key: keyof SearchValues) => (event: React.ChangeEvent<HTMLInputElement>) =>
-    onChange({
-      ...values,
-      [key]: event.target.value,
-    });
+  const set =
+    (key: "keyword" | "maxRating" | "maxInstalls" | "limit") =>
+    (event: React.ChangeEvent<HTMLInputElement>) =>
+      onChange({
+        ...values,
+        [key]: event.target.value,
+      });
+
+  const toggleNewAppsOnly = (event: React.ChangeEvent<HTMLInputElement>): void => {
+    onChange({ ...values, newAppsOnly: event.target.checked });
+  };
 
   return (
     <form
@@ -105,16 +113,42 @@ export function SearchForm({
           />
         </Field>
 
-        <Field label="Number of leads" error={errors.limit} hint="1 – 1,000, generation stops early once reached">
+        <Field
+          label="Number of leads"
+          error={errors.limit}
+          hint={
+            values.newAppsOnly
+              ? "Ignored in new-apps-only mode — the run takes every lead the keyword has left"
+              : "1 – 1,000, generation stops early once reached"
+          }
+        >
           <input
             className={fieldClass}
             value={values.limit}
             onChange={set("limit")}
             inputMode="numeric"
             placeholder="10"
+            disabled={values.newAppsOnly}
           />
         </Field>
       </div>
+
+      <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 transition hover:border-emerald-400/40">
+        <input
+          type="checkbox"
+          checked={values.newAppsOnly}
+          onChange={toggleNewAppsOnly}
+          className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
+        />
+        <span className="flex flex-col gap-0.5">
+          <span className="text-sm font-medium text-zinc-100">New apps only</span>
+          <span className="text-xs leading-relaxed text-zinc-500">
+            Stay on this one keyword and skip every app it has already produced in an earlier
+            run. The lead target is ignored — the run collects every new lead the keyword can
+            still give.
+          </span>
+        </span>
+      </label>
 
       <div className="flex flex-wrap items-center gap-3">
         <button

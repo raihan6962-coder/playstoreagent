@@ -28,6 +28,8 @@ interface FormValues {
   templateSubject: string;
   templateBody: string;
   intervalSeconds: string;
+  /** "New apps only": one keyword, no lead cap, no app the keyword already produced. */
+  newAppsOnly: boolean;
 }
 
 function pad(value: number): string {
@@ -53,6 +55,7 @@ function emptyForm(): FormValues {
     templateSubject: "",
     templateBody: "",
     intervalSeconds: "30",
+    newAppsOnly: false,
   };
 }
 
@@ -168,6 +171,7 @@ export function AutomationSettingsPage() {
       templateSubject: task.templateSubject,
       templateBody: task.templateBody,
       intervalSeconds: String(task.intervalSeconds),
+      newAppsOnly: task.newAppsOnly === true,
     });
     setFormError("");
     setFormOpen(true);
@@ -202,6 +206,7 @@ export function AutomationSettingsPage() {
       templateSubject: values.templateSubject,
       templateBody: values.templateBody,
       intervalSeconds: Number(values.intervalSeconds),
+      newAppsOnly: values.newAppsOnly,
     };
 
     setSaving(true);
@@ -339,13 +344,21 @@ export function AutomationSettingsPage() {
                 placeholder="500000"
               />
             </Field>
-            <Field label="Lead target" hint="1 – 1,000">
+            <Field
+              label="Lead target"
+              hint={
+                values.newAppsOnly
+                  ? "Ignored in new-apps-only mode — the task takes every lead the keyword has left"
+                  : "1 – 1,000"
+              }
+            >
               <input
                 className={fieldClass}
                 value={values.limit}
                 onChange={(event) => set("limit", event.target.value)}
                 inputMode="numeric"
                 placeholder="100"
+                disabled={values.newAppsOnly}
               />
             </Field>
             <Field label="Starting time" wide hint="Your local date + time — the task starts then (± a minute while the tab is closed)">
@@ -356,6 +369,25 @@ export function AutomationSettingsPage() {
                 onChange={(event) => set("startAt", event.target.value)}
               />
             </Field>
+
+            <div className="sm:col-span-2 lg:col-span-3">
+              <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 transition hover:border-emerald-400/40">
+                <input
+                  type="checkbox"
+                  checked={values.newAppsOnly}
+                  onChange={(event) => set("newAppsOnly", event.target.checked)}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
+                />
+                <span className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium text-zinc-100">New apps only</span>
+                  <span className="text-xs leading-relaxed text-zinc-500">
+                    Stay on this one keyword and skip every app it has already produced in an
+                    earlier run. The lead target is ignored — the task collects every new lead
+                    the keyword can still give.
+                  </span>
+                </span>
+              </label>
+            </div>
 
             <div className="sm:col-span-2 lg:col-span-3">
               <span className="text-xs font-medium uppercase tracking-wide text-zinc-400">
@@ -475,11 +507,19 @@ export function AutomationSettingsPage() {
                     >
                       {task.status.replace("-", " ")}
                     </span>
+                    {task.newAppsOnly === true && (
+                      <span className="rounded-full border border-sky-400/40 bg-sky-400/10 px-2 py-0.5 text-[11px] uppercase tracking-wide text-sky-300">
+                        new apps only
+                      </span>
+                    )}
                   </div>
                   <p className="mt-1 text-xs text-zinc-500">
-                    {new Date(task.startAt).toLocaleString()} · target {task.limit} leads · rating ≤{" "}
-                    {task.maxRating} · installs ≤ {task.maxInstalls.toLocaleString("en-US")} · every{" "}
-                    {task.intervalSeconds}s
+                    {new Date(task.startAt).toLocaleString()} ·{" "}
+                    {task.newAppsOnly === true
+                      ? "every new lead the keyword has left"
+                      : `target ${task.limit} leads`}{" "}
+                    · rating ≤ {task.maxRating} · installs ≤{" "}
+                    {task.maxInstalls.toLocaleString("en-US")} · every {task.intervalSeconds}s
                   </p>
                   <p className="mt-0.5 text-xs text-zinc-500">
                     {task.mailboxIds.length} mailbox{task.mailboxIds.length === 1 ? "" : "es"} ·{" "}

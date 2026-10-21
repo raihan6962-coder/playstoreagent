@@ -17,8 +17,12 @@ export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const LOGIN_FAILURE_LIMIT = 5;
 export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 
-/** The only account that may sign in unless ADMIN_EMAILS overrides it. */
-const DEFAULT_ADMIN_EMAIL = "revnexa0@gmail.com";
+/**
+ * Accounts that may sign in unless ADMIN_EMAILS overrides them. Kept in code
+ * rather than env because the owner's Vercel org blocks env edits via API
+ * (SAML), so the allowlist is only changeable through a commit.
+ */
+const DEFAULT_ADMIN_EMAILS = ["revnexa0@gmail.com", "raihan6962@gmail.com"];
 
 const encoder = new TextEncoder();
 
@@ -33,7 +37,7 @@ export function adminEmails(): string[] {
     .split(",")
     .map((entry) => entry.trim().toLowerCase())
     .filter(Boolean);
-  return list.length > 0 ? list : [DEFAULT_ADMIN_EMAIL];
+  return list.length > 0 ? list : [...DEFAULT_ADMIN_EMAILS];
 }
 
 export function isAdminEmail(email: string | null | undefined): boolean {

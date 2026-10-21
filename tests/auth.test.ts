@@ -26,9 +26,11 @@ afterEach(() => {
 });
 
 describe("admin allowlist", () => {
-  it("accepts the one admin account, case-insensitively", () => {
+  it("accepts every default admin account, case-insensitively", () => {
     expect(isAdminEmail("revnexa0@gmail.com")).toBe(true);
     expect(isAdminEmail("  Revnexa0@Gmail.Com  ")).toBe(true);
+    expect(isAdminEmail("raihan6962@gmail.com")).toBe(true);
+    expect(isAdminEmail("Raihan6962@Gmail.com")).toBe(true);
     expect(isAdminEmail("someone.else@gmail.com")).toBe(false);
     expect(isAdminEmail("revnexa0@gmail.com.evil.com")).toBe(false);
     expect(isAdminEmail("")).toBe(false);
